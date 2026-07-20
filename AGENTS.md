@@ -16,7 +16,7 @@
 - Install frontend dependencies once with `cd frontend; npm install`.
 - Run the application with `npm start`.
 - Validate with `npm run check`, `npm test`, and `npm run build`.
-- Create the Windows NSIS installer with `npm run dist`.
+- Create both the Windows NSIS installer and portable ZIP with `npm run dist`.
 
 ## Safety
 
@@ -27,7 +27,7 @@
 
 ## Build cleanup
 
-- After a successful build, retain the user-facing NSIS installer under `installer/`.
+- After a successful release build, retain the NSIS installer and portable ZIP under `installer/`.
 - Remove re-creatable build output before handing off work: `target/`, `dist/`, and `gen/`.
 - Do not remove `frontend/node_modules`, because it is required by the npm scripts.
 - Remove obsolete temporary files, old runtime artifacts, and unused platform icons when they are not required by the Windows build.

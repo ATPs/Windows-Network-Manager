@@ -59,13 +59,15 @@ npm run build
 
 ## Packaging
 
-Build the NSIS installer with:
+Build the NSIS installer and portable ZIP with:
 
 ```powershell
 npm run dist
 ```
 
-The installer is per-user, does not require an elevated installation, and uses the bundled Tauri configuration. User configurations remain in the Windows application-data directory and are never packaged with the application. Code signing is not configured, so Windows may show a SmartScreen warning.
+The installer is per-user and does not require an elevated installation. Installing under the current user's profile does not prevent the application from requesting administrator privileges later through standard Windows UAC. The portable ZIP can be extracted anywhere and run directly. Both packages use the system WebView2 runtime.
+
+User configurations remain in the Windows application-data directory and are never packaged with the application. Code signing is not configured, so Windows may show a SmartScreen warning. The release script removes re-creatable `target`, `dist`, and `gen` output after copying both packages to `installer/`.
 
 ## Stored data and recovery
 

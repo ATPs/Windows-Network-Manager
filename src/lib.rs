@@ -4,12 +4,14 @@ use encoding_rs::GBK;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::{BTreeMap, HashMap}, fs, path::{Path, PathBuf}, process::Command, sync::Mutex, time::{Duration, Instant}};
+use std::{collections::{BTreeMap, HashMap}, ffi::OsStr, fs, os::windows::{ffi::OsStrExt, process::CommandExt}, path::{Path, PathBuf}, process::Command, ptr, sync::Mutex, time::{Duration, Instant}};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
+use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
 
 const CONFIG_FILE: &str = "network-profiles.json";
 const MAX_IMPORT_BYTES: u64 = 2 * 1024 * 1024;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -82,11 +84,19 @@ pub fn run() {
     .expect("error while running Windows Network Manager");
 }
 
+fn hidden_command(program: &str) -> Command {
+  let mut command = Command::new(program);
+  command.creation_flags(CREATE_NO_WINDOW);
+  command
+}
+
+fn wide_null(value: &OsStr) -> Vec<u16> { value.encode_wide().chain(Some(0)).collect() }
+
 fn run_powershell_json(script: &str, input: Option<&Value>) -> AppResult<Value> {
   let prefix = "$ErrorActionPreference='Stop';[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);$OutputEncoding=[Console]::OutputEncoding;$InputData=$null;if($env:WNM_INPUT_BASE64){$InputData=([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:WNM_INPUT_BASE64))|ConvertFrom-Json);}";
   let encoded = BASE64.encode(format!("{}\n{}", prefix, script).encode_utf16().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>());
-  let mut command = Command::new("powershell.exe");
-  command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded]);
+  let mut command = hidden_command("powershell.exe");
+  command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", &encoded]);
   if let Some(payload) = input { command.env("WNM_INPUT_BASE64", BASE64.encode(serde_json::to_vec(payload).map_err(|_| err("SERIALIZE_ERROR", "Cannot serialize command input."))?)); }
   let output = command.output().map_err(|e| err_with("COMMAND_FAILED", "PowerShell could not start.", json!({"reason":e.to_string()})))?;
   if !output.status.success() { return Err(err_with("COMMAND_FAILED", "Windows command failed.", json!({"stderr":sanitize(&String::from_utf8_lossy(&output.stderr)),"exitCode":output.status.code()}))); }
@@ -96,7 +106,7 @@ fn run_powershell_json(script: &str, input: Option<&Value>) -> AppResult<Value> 
 }
 
 fn run_netsh(args: &[String]) -> AppResult<String> {
-  let output = Command::new("netsh.exe").args(args).output().map_err(|e| err_with("COMMAND_FAILED", "netsh could not start.", json!({"reason":e.to_string()})))?;
+  let output = hidden_command("netsh.exe").args(args).output().map_err(|e| err_with("COMMAND_FAILED", "netsh could not start.", json!({"reason":e.to_string()})))?;
   let stdout = decode_windows(&output.stdout);
   if !output.status.success() { return Err(err_with("COMMAND_FAILED", "netsh command failed.", json!({"stderr":sanitize(&decode_windows(&output.stderr)),"stdout":sanitize(&stdout)}))); }
   Ok(stdout)
@@ -250,7 +260,14 @@ fn import_configuration(state:State<AppState>,path:String)->AppResult<Value>{let
 #[tauri::command]
 fn get_diagnostics(state:State<AppState>)->AppResult<Value>{let overview=get_network_overview()?;let routes=get_routes()?;let cfg=config(&state);let os=run_powershell_json("Get-CimInstance Win32_OperatingSystem|Select-Object Caption,Version,BuildNumber,OSArchitecture|ConvertTo-Json -Compress",None).unwrap_or(Value::Null);let changes=arrays(overview.get("interfaces")).into_iter().filter(|x|x.pointer("/deviations/manualIpv4Metric").and_then(Value::as_bool).unwrap_or(false)||x.pointer("/deviations/manualIpv6Metric").and_then(Value::as_bool).unwrap_or(false)||x.pointer("/deviations/adapterDisabled").and_then(Value::as_bool).unwrap_or(false)).collect::<Vec<_>>();let static_routes=arrays(routes.get("routes")).into_iter().filter(|x|x.get("persistent").and_then(Value::as_bool).unwrap_or(false)||field_string(x,"protocol")=="NetMgmt").collect::<Vec<_>>();Ok(json!({"generatedAt":Utc::now().to_rfc3339(),"os":os,"privilege":{"isAdmin":is_admin()},"changes":{"interfaces":changes,"staticRoutes":static_routes},"overview":overview,"routes":routes,"app":{"schemaVersion":cfg.schema_version,"recentSnapshots":cfg.recent_snapshots.len()}}))}
 #[tauri::command]
-fn restart_as_administrator(app:AppHandle)->AppResult<Value>{let exe=std::env::current_exe().map_err(|_|err("COMMAND_FAILED","Cannot locate the application executable."))?;let payload=json!({"filePath":exe,"arguments":std::env::args().skip(1).collect::<Vec<_>>()});let script=r#"Start-Process -FilePath ([string]$InputData.filePath) -ArgumentList @($InputData.arguments) -Verb RunAs -ErrorAction Stop;[PSCustomObject]@{started=$true}|ConvertTo-Json -Compress"#;let result=run_powershell_json(script,Some(&payload))?;if result.get("started").and_then(Value::as_bool).unwrap_or(false){app.exit(0)};Ok(result)}
+fn restart_as_administrator(app:AppHandle)->AppResult<Value>{
+  if is_admin(){return Ok(json!({"started":false,"alreadyAdmin":true}))}
+  let exe=std::env::current_exe().map_err(|_|err("COMMAND_FAILED","Cannot locate the application executable."))?;
+  let verb=wide_null(OsStr::new("runas")); let executable=wide_null(exe.as_os_str());
+  let result=unsafe{ShellExecuteW(ptr::null_mut(),verb.as_ptr(),executable.as_ptr(),ptr::null(),ptr::null(),SW_SHOWNORMAL)};
+  if result as isize<=32{return Err(err_with("ELEVATION_FAILED","Windows could not restart the application as administrator.",json!({"shellExecuteCode":result as isize,"hint":"Accept the Windows UAC prompt. Installation in a user folder is supported."})))}
+  app.exit(0); Ok(json!({"started":true}))
+}
 
 #[cfg(test)]
 mod tests {

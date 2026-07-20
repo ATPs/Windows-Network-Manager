@@ -33,6 +33,8 @@ pnpm-debug.log*
 .tmp/
 temp/
 tmp/
+installer/
+
 
 # Code-signing certificates
 *.p12

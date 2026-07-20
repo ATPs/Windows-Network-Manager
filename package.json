@@ -1,6 +1,6 @@
 {
   "name": "windows-network-manager",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "description": "Windows network interface, metric, route and profile manager",
   "scripts": {
     "start": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& frontend\\node_modules\\.bin\\tauri dev",
@@ -9,7 +9,8 @@
     "tauri": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& frontend\\node_modules\\.bin\\tauri",
     "test": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& cargo test",
     "check": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& cargo check",
-    "dist": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& frontend\\node_modules\\.bin\\tauri build --bundles nsis"
+    "dist:build": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& frontend\\node_modules\\.bin\\tauri build --bundles nsis",
+    "dist": "npm run dist:build && powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File scripts\\package-release.ps1"
   },
   "keywords": [],
   "author": "",
