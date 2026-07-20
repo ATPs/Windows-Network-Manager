@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::{BTreeMap, HashMap}, ffi::OsStr, fs, os::windows::{ffi::OsStrExt, process::CommandExt}, path::{Path, PathBuf}, process::Command, ptr, sync::Mutex, time::{Duration, Instant}};
 use tauri::{AppHandle, Manager, State};
 use uuid::Uuid;
-use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+use windows_sys::Win32::UI::{Shell::{IsUserAnAdmin, ShellExecuteW}, WindowsAndMessaging::SW_SHOWNORMAL};
 
 const CONFIG_FILE: &str = "network-profiles.json";
 const MAX_IMPORT_BYTES: u64 = 2 * 1024 * 1024;
@@ -23,9 +23,10 @@ fn err_with(code: &str, message: impl Into<String>, details: Value) -> PublicErr
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct Settings { #[serde(default = "default_language")] language: String, #[serde(default)] show_system_interfaces: bool, #[serde(default)] show_all_routes: bool }
+struct Settings { #[serde(default = "default_language")] language: String, #[serde(default = "default_theme")] theme: String, #[serde(default)] show_system_interfaces: bool, #[serde(default)] show_all_routes: bool }
 fn default_language() -> String { "en".into() }
-impl Default for Settings { fn default() -> Self { Self { language: default_language(), show_system_interfaces: false, show_all_routes: false } } }
+fn default_theme() -> String { "system".into() }
+impl Default for Settings { fn default() -> Self { Self { language: default_language(), theme: default_theme(), show_system_interfaces: false, show_all_routes: false } } }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -66,7 +67,8 @@ const ROUTES_SCRIPT: &str = r#"
 function Convert-Route($Route, $Store) { [PSCustomObject]@{ addressFamily=[string]$Route.AddressFamily; destinationPrefix=[string]$Route.DestinationPrefix; nextHop=[string]$Route.NextHop; interfaceAlias=[string]$Route.InterfaceAlias; interfaceIndex=[int]$Route.InterfaceIndex; routeMetric=[long]$Route.RouteMetric; protocol=[string]$Route.Protocol; policyStore=$Store; state=[string]$Route.State; publish=[string]$Route.Publish; validLifetime=[string]$Route.ValidLifetime; preferredLifetime=[string]$Route.PreferredLifetime } }
 $Active=@(Get-NetRoute -PolicyStore ActiveStore | ForEach-Object { Convert-Route $_ 'ActiveStore' })
 $Persistent=@(Get-NetRoute -PolicyStore PersistentStore | ForEach-Object { Convert-Route $_ 'PersistentStore' })
-[PSCustomObject]@{active=$Active;persistent=$Persistent}|ConvertTo-Json -Compress -Depth 5
+$Metrics=@(Get-NetIPInterface | ForEach-Object { [PSCustomObject]@{ addressFamily=[string]$_.AddressFamily; interfaceIndex=[int]$_.InterfaceIndex; interfaceMetric=[long]$_.InterfaceMetric } })
+[PSCustomObject]@{active=$Active;persistent=$Persistent;metrics=$Metrics}|ConvertTo-Json -Compress -Depth 5
 "#;
 
 pub fn run() {
@@ -79,7 +81,7 @@ pub fn run() {
       app.manage(AppState { config_path, confirmations: Mutex::new(HashMap::new()) });
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![get_network_overview, get_routes, get_privilege_status, get_app_config, save_profile, delete_profile, restore_profile_preview, restore_profile_apply, set_language, preview_metric_change, apply_metric_change, preview_add_route, add_route, preview_remove_route, remove_route, connect_wifi, disconnect_wifi, capture_recent_snapshot, restore_recent_preview, restore_recent_apply, reset_preview, reset_apply, windows_defaults_preview, windows_defaults_apply, import_configuration, export_configuration, get_diagnostics, restart_as_administrator])
+    .invoke_handler(tauri::generate_handler![get_network_overview, get_wifi_profiles, get_routes, get_privilege_status, get_app_config, save_profile, delete_profile, restore_profile_preview, restore_profile_apply, set_language, set_theme, preview_metric_change, apply_metric_change, preview_add_route, add_route, preview_remove_route, remove_route, connect_wifi, disconnect_wifi, capture_recent_snapshot, restore_recent_preview, restore_recent_apply, reset_preview, reset_apply, windows_defaults_preview, windows_defaults_apply, import_configuration, export_configuration, get_diagnostics, restart_as_administrator])
     .run(tauri::generate_context!())
     .expect("error while running Windows Network Manager");
 }
@@ -150,7 +152,9 @@ fn parse_wifi_interfaces(output: &str) -> Vec<Value> {
 
 fn parse_wifi_profiles(output: &str) -> Vec<String> { let mut profiles=vec![]; for line in output.lines(){let Some((key,value))=line.split_once(':').or_else(||line.split_once('：'))else{continue};let lower=key.to_lowercase();if lower.contains("profile")||key.contains("配置文件"){let value=value.trim().to_string();if !value.is_empty()&&!profiles.contains(&value){profiles.push(value)}}} profiles }
 
-fn wifi_overview() -> AppResult<Vec<Value>> { let output=run_netsh(&["wlan".into(),"show".into(),"interfaces".into()])?; let mut interfaces=parse_wifi_interfaces(&output); for item in &mut interfaces { let alias=field_string(item,"alias"); let profiles=run_netsh(&["wlan".into(),"show".into(),"profiles".into(),format!("interface={alias}")]).map(|x|parse_wifi_profiles(&x)).unwrap_or_default(); item.as_object_mut().unwrap().insert("profiles".into(),json!(profiles)); } Ok(interfaces) }
+fn wifi_overview() -> AppResult<Vec<Value>> { let output=run_netsh(&["wlan".into(),"show".into(),"interfaces".into()])?; let mut interfaces=parse_wifi_interfaces(&output); for item in &mut interfaces { item.as_object_mut().unwrap().insert("profiles".into(),json!([])); item.as_object_mut().unwrap().insert("profilesLoaded".into(),json!(false)); } Ok(interfaces) }
+fn valid_interface_name(value:&str)->AppResult<String>{let name=value.trim();if name.is_empty()||name.len()>256||name.chars().any(|c|c=='\0'||c=='\r'||c=='\n'||c.is_control()){Err(err("VALIDATION_ERROR","Invalid Wi-Fi interface name."))}else{Ok(name.to_string())}}
+fn valid_theme(value:&str)->AppResult<&str>{if ["system","light","dark"].contains(&value){Ok(value)}else{Err(err("VALIDATION_ERROR","Unsupported theme."))}}
 
 fn config_from_path(path: &Path) -> AppConfig { match fs::read_to_string(path) { Ok(text)=>match serde_json::from_str::<AppConfig>(&text){Ok(config)=>config,Err(_)=>{let backup=path.with_extension(format!("corrupt-{}.json",Utc::now().format("%Y%m%d%H%M%S")));let _=fs::rename(path,backup);AppConfig::default()}},Err(_)=>AppConfig::default() } }
 fn save_config(path: &Path, config: &AppConfig) -> AppResult<()> { let text=serde_json::to_string_pretty(config).map_err(|_|err("SERIALIZE_ERROR","Cannot save configuration."))?; let temp=path.with_extension("tmp"); fs::write(&temp,format!("{text}\n")).map_err(|e|err_with("CONFIG_WRITE_FAILED","Cannot write configuration.",json!({"reason":e.to_string()})))?; fs::rename(temp,path).map_err(|e|err_with("CONFIG_WRITE_FAILED","Cannot replace configuration.",json!({"reason":e.to_string()}))) }
@@ -161,7 +165,7 @@ fn canonical(value:&Value)->String { match value { Value::Object(map)=>{let mut 
 fn fingerprint(value:&Value)->String { format!("{:x}",Sha256::digest(canonical(value).as_bytes())) }
 fn issue_confirmation(state:&State<AppState>,kind:&str,payload:&Value)->AppResult<String>{let token=Uuid::new_v4().to_string();state.confirmations.lock().map_err(|_|err("STATE_ERROR","Cannot create confirmation."))?.insert(token.clone(),Confirmation{kind:kind.into(),hash:fingerprint(payload),expires_at:Instant::now()+Duration::from_secs(120)});Ok(token)}
 fn consume_confirmation(state:&State<AppState>,token:&str,kind:&str,payload:&Value)->AppResult<()> { let record=state.confirmations.lock().map_err(|_|err("STATE_ERROR","Cannot validate confirmation."))?.remove(token); match record { Some(item) if item.kind==kind&&item.hash==fingerprint(payload)&&item.expires_at>Instant::now()=>Ok(()),_=>Err(err("CONFIRMATION_EXPIRED","Confirmation expired. Preview the operation again.")) } }
-fn is_admin()->bool { run_powershell_json("$p=[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent());[PSCustomObject]@{isAdmin=$p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)}|ConvertTo-Json -Compress",None).ok().and_then(|x|x.get("isAdmin").and_then(Value::as_bool)).unwrap_or(false) }
+fn is_admin()->bool { unsafe{IsUserAnAdmin()!=0} }
 fn require_admin()->AppResult<()> { if is_admin(){Ok(())}else{Err(err("PERMISSION_REQUIRED","This operation requires administrator privileges."))} }
 fn valid_index(value:&Value)->AppResult<i64>{value.as_i64().or_else(||value.as_str().and_then(|x|x.parse().ok())).filter(|x|*x>0).ok_or_else(||err("VALIDATION_ERROR","InterfaceIndex must be a positive integer."))}
 fn valid_metric(value:&Value)->AppResult<i64>{value.as_i64().or_else(||value.as_str().and_then(|x|x.parse().ok())).filter(|x|*x>=1&&*x<=9999).ok_or_else(||err("VALIDATION_ERROR","Metric must be an integer from 1 to 9999."))}
@@ -173,7 +177,9 @@ fn get_privilege_status()->Value{json!({"isAdmin":is_admin()})}
 #[tauri::command]
 fn get_network_overview()->AppResult<Value>{let raw=run_powershell_json(OVERVIEW_SCRIPT,None)?;let wifi=wifi_overview().unwrap_or_default();Ok(normalize_overview(raw,wifi))}
 #[tauri::command]
-fn get_routes()->AppResult<Value>{let raw=run_powershell_json(ROUTES_SCRIPT,None)?;let overview=get_network_overview()?;let mut metrics=HashMap::new();for item in arrays(overview.get("interfaces")){let index=field_i64(&item,"interfaceIndex");if let Some(m)=item.pointer("/metrics/ipv4/interfaceMetric").and_then(Value::as_i64){metrics.insert(format!("IPv4:{index}"),m);}if let Some(m)=item.pointer("/metrics/ipv6/interfaceMetric").and_then(Value::as_i64){metrics.insert(format!("IPv6:{index}"),m);}}
+fn get_wifi_profiles(interface_name:String)->AppResult<Value>{let alias=valid_interface_name(&interface_name)?;let output=run_netsh(&["wlan".into(),"show".into(),"profiles".into(),format!("interface={alias}")])?;Ok(json!({"interfaceName":alias,"profiles":parse_wifi_profiles(&output),"profilesLoaded":true}))}
+#[tauri::command]
+fn get_routes()->AppResult<Value>{let raw=run_powershell_json(ROUTES_SCRIPT,None)?;let mut metrics=HashMap::new();for item in arrays(raw.get("metrics")){let family=field_string(&item,"addressFamily");let index=field_i64(&item,"interfaceIndex");metrics.insert(format!("{family}:{index}"),field_i64(&item,"interfaceMetric"));}
  let mut routes:BTreeMap<String,Value>=BTreeMap::new();let persistent=arrays(raw.get("persistent"));let persistent_keys=persistent.iter().map(route_key).collect::<Vec<_>>();for route in arrays(raw.get("active")).into_iter().chain(persistent){let key=route_key(&route);let old=routes.remove(&key);let mut stores=arrays(old.as_ref().and_then(|x|x.get("policyStores")));let store=field_string(&route,"policyStore");if !stores.iter().any(|x|x.as_str()==Some(&store)){stores.push(json!(store));}let family=field_string(&route,"addressFamily");let index=field_i64(&route,"interfaceIndex");let metric=metrics.get(&format!("{family}:{index}")).copied();let next=field_string(&route,"nextHop");let dest=field_string(&route,"destinationPrefix");let is_persistent=persistent_keys.contains(&key);let protocol=field_string(&route,"protocol");let default_route=dest=="0.0.0.0/0"||dest=="::/0";let on_link=next=="0.0.0.0"||next=="::";let multicast=dest=="224.0.0.0/4"||dest.to_lowercase()=="ff00::/8";let managed=is_persistent||protocol=="NetMgmt";routes.insert(key,json!({"addressFamily":family,"destinationPrefix":dest,"nextHop":next,"interfaceAlias":field_string(&route,"interfaceAlias"),"interfaceIndex":index,"routeMetric":field_i64(&route,"routeMetric"),"interfaceMetric":metric,"effectiveMetric":metric.map(|m|m+field_i64(&route,"routeMetric")),"protocol":protocol,"policyStores":stores,"persistent":is_persistent,"temporary":!is_persistent,"state":field_string(&route,"state"),"publish":field_string(&route,"publish"),"validLifetime":field_string(&route,"validLifetime"),"preferredLifetime":field_string(&route,"preferredLifetime"),"defaultRoute":default_route,"onLink":on_link,"systemManaged":!managed,"removable":managed&&!multicast,"hiddenByDefault":multicast||(on_link&&!default_route&&!managed)}));}Ok(json!({"routes":routes.into_values().collect::<Vec<_>>(),"refreshedAt":Utc::now().to_rfc3339()}))}
 fn route_key(route:&Value)->String{format!("{}|{}|{}|{}",field_string(route,"addressFamily"),field_string(route,"destinationPrefix"),field_string(route,"nextHop"),field_i64(route,"interfaceIndex"))}
 
@@ -204,6 +210,8 @@ fn disconnect_wifi(state:State<AppState>,input:Value)->AppResult<Value>{let alia
 fn get_app_config(state:State<AppState>)->Value{let cfg=config(&state);json!({"settings":cfg.settings,"profiles":cfg.profiles,"recentSnapshots":cfg.recent_snapshots,"hasBaseline":cfg.baseline.is_some()})}
 #[tauri::command]
 fn set_language(state:State<AppState>,language:String)->AppResult<Settings>{if language!="en"&&language!="zh-CN"{return Err(err("VALIDATION_ERROR","Unsupported language."))}let mut cfg=config(&state);cfg.settings.language=language;persist(&state,&cfg)?;Ok(cfg.settings)}
+#[tauri::command]
+fn set_theme(state:State<AppState>,theme:String)->AppResult<Settings>{let theme=valid_theme(&theme)?.to_string();let mut cfg=config(&state);cfg.settings.theme=theme;persist(&state,&cfg)?;Ok(cfg.settings)}
 #[tauri::command]
 fn save_profile(state:State<AppState>,profile:Value)->AppResult<Value>{let name=profile.get("name").and_then(Value::as_str).map(str::trim).filter(|x|!x.is_empty()&&x.len()<=100).ok_or_else(||err("VALIDATION_ERROR","Configuration name is required."))?;let mut saved=profile.clone();let now=Utc::now().to_rfc3339();let id=saved.get("id").and_then(Value::as_str).filter(|x|!x.is_empty()).unwrap_or("").to_string();if id.is_empty(){saved.as_object_mut().unwrap().insert("id".into(),json!(Uuid::new_v4().to_string()));saved.as_object_mut().unwrap().insert("createdAt".into(),json!(now));}saved.as_object_mut().unwrap().insert("name".into(),json!(name));saved.as_object_mut().unwrap().insert("updatedAt".into(),json!(now));let id=field_string(&saved,"id");let mut cfg=config(&state);if let Some(item)=cfg.profiles.iter_mut().find(|item|field_string(item,"id")==id){*item=saved.clone()}else{cfg.profiles.push(saved.clone())}persist(&state,&cfg)?;Ok(saved)}
 #[tauri::command]
@@ -274,6 +282,7 @@ mod tests {
   use super::*;
   #[test] fn cidr_is_normalized(){assert_eq!(normalize_cidr("172.31.9.10/12").unwrap(),"172.16.0.0/12");}
   #[test] fn invalid_metric_is_rejected(){assert!(valid_metric(&json!(0)).is_err());assert_eq!(valid_metric(&json!(5)).unwrap(),5);}
+  #[test] fn theme_and_interface_validation_are_strict(){assert_eq!(valid_theme("dark").unwrap(),"dark");assert!(valid_theme("blue").is_err());assert!(valid_interface_name("Wi-Fi\nname").is_err());assert_eq!(Settings::default().theme,"system");}
   #[test] fn canonical_hash_ignores_object_order(){assert_eq!(fingerprint(&json!({"a":1,"b":2})),fingerprint(&json!({"b":2,"a":1})));}
   #[test] fn wifi_parser_handles_chinese(){let items=parse_wifi_interfaces("名称 : WLAN\n状态 : 已连接\nSSID : 测试网络\n");assert_eq!(items[0]["alias"],"WLAN");assert_eq!(items[0]["connected"],true);}
 }

@@ -1,6 +1,6 @@
 {
   "name": "windows-network-manager",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Windows network interface, metric, route and profile manager",
   "scripts": {
     "start": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& frontend\\node_modules\\.bin\\tauri dev",

@@ -5,6 +5,8 @@ Windows Network Manager is a Windows 11 desktop application for inspecting and c
 ## What it does
 
 - Lists Wi-Fi, Ethernet, VPN, tunnel, virtual, disconnected, and optionally system interfaces.
+- Uses progressive loading: interface status appears first, while routes and saved Wi-Fi profiles load independently.
+- Supports System, Light, and Dark color themes; the first launch follows Windows and the choice is saved.
 - Shows addresses, gateways, DNS servers, DHCP, link speed, interface index, connection status, and separate IPv4/IPv6 metrics.
 - Lists saved Wi-Fi profiles per wireless adapter and can request a connect or disconnect without reading, storing, or creating Wi-Fi passwords.
 - Displays IPv4 and IPv6 routes with filtering and a concise summary of manual metrics, static routes, and disabled adapters.
