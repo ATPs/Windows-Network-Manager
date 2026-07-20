@@ -1,9 +1,11 @@
 # Dependencies
 node_modules/
 
-# Electron build output
-release/
+# Frontend and Tauri build output
 dist/
+target/
+.tauri/
+release/
 out/
 *.blockmap
 

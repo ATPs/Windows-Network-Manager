@@ -1,55 +1,20 @@
 {
-  "name": "wifi-manager",
+  "name": "windows-network-manager",
   "version": "1.0.0",
   "description": "Windows network interface, metric, route and profile manager",
-  "main": "main.js",
   "scripts": {
-    "start": "electron .",
-    "test": "node --test",
-    "check": "node scripts/check-syntax.js",
-    "dist": "electron-builder --win nsis"
+    "start": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& frontend\\node_modules\\.bin\\tauri dev",
+    "dev": "frontend\\node_modules\\.bin\\vite --config frontend/vite.config.js",
+    "build": "frontend\\node_modules\\.bin\\vite build --config frontend/vite.config.js",
+    "tauri": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& frontend\\node_modules\\.bin\\tauri",
+    "test": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& cargo test",
+    "check": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& cargo check",
+    "dist": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& frontend\\node_modules\\.bin\\tauri build --bundles nsis"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "commonjs",
-  "dependencies": {
-    "iconv-lite": "^0.7.0"
-  },
-  "devDependencies": {
-    "electron": "^43.1.1",
-    "electron-builder": "^26.0.12"
-  },
-  "build": {
-    "appId": "com.atps.wifimanager",
-    "productName": "Windows Network Manager",
-    "directories": {
-      "output": "release"
-    },
-    "files": [
-      "main.js",
-      "preload.js",
-      "renderer.js",
-      "index.html",
-      "styles.css",
-      "src/**/*",
-      "package.json"
-    ],
-    "win": {
-      "target": [
-        {
-          "target": "nsis",
-          "arch": [
-            "x64"
-          ]
-        }
-      ]
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
-    }
-  }
+  "type": "module",
+  "dependencies": {},
+  "devDependencies": {}
 }

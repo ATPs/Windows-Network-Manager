@@ -1,78 +1,74 @@
 # Windows Network Manager
 
-Windows Network Manager 是一个 Windows 10/11 Electron 桌面工具，用来统一查看和管理 Wi-Fi、有线、VPN、Tunnel 与虚拟网络接口。
+Windows Network Manager is a Windows 11 desktop application for inspecting and carefully managing network interfaces. It is built with Tauri 2, Rust, Vite, and plain HTML/CSS/JavaScript.
 
-## 第一版功能
+## What it does
 
-- 查看全部网络接口、IPv4/IPv6 地址、网关、DNS、DHCP、LinkSpeed 和网络类别。
-- 分别查看和设置 IPv4/IPv6 AutomaticMetric 与 InterfaceMetric。
-- 管理任意数量的 Wi-Fi 网卡，只使用 Windows 已保存的 Wi-Fi profile，不读取或保存密码。
-- 查看、搜索和筛选 IPv4/IPv6 路由，添加 IPv4 临时/持久化路由，精确删除允许删除的静态路由。
-- 保存多个网络方案，预览后按顺序应用 Wi-Fi、Metric 和受管理路由，并显示部分成功结果。
-- 对明确可操作的网络适配器提供受保护的启用/禁用功能。
-- 检测管理员权限，并提供 Windows 标准 UAC“以管理员身份重启”按钮。
+- Lists Wi-Fi, Ethernet, VPN, tunnel, virtual, disconnected, and optionally system interfaces.
+- Shows addresses, gateways, DNS servers, DHCP, link speed, interface index, connection status, and separate IPv4/IPv6 metrics.
+- Lists saved Wi-Fi profiles per wireless adapter and can request a connect or disconnect without reading, storing, or creating Wi-Fi passwords.
+- Displays IPv4 and IPv6 routes with filtering and a concise summary of manual metrics, static routes, and disabled adapters.
+- Safely previews and applies IPv4 route and Metric changes after explicit confirmation.
+- Stores a pre-change baseline, ten de-duplicated recent snapshots, named configuration data, and JSON import/export data in the Tauri application-data directory.
+- Offers both **Reset to pre-change baseline** and **Restore Windows defaults**. Windows defaults enables AutomaticMetric and removes only routes this application recorded as managed; it does not reset Winsock, reinstall network components, or remove unknown system routes.
+- Includes English and Chinese UI languages, safe diagnostics, and a standard Windows UAC restart-as-administrator option.
 
-本版本不会修改静态 IP、网关、DNS、代理、防火墙、驱动或注册表，也不实现带宽叠加、负载均衡或按应用分流。
+The interface is designed for Windows 11 and only invokes structured PowerShell networking cmdlets and `netsh.exe` from Rust. The web frontend receives narrow Tauri commands only; it cannot invoke arbitrary PowerShell, shell commands, Node.js, or filesystem APIs.
 
-## 开发环境
+## Scope and safety
 
-项目使用 CommonJS、Electron 43、原生 HTML/CSS/JavaScript。Node.js 与 npm 位于：
+The first version does not edit static IP addresses, gateway addresses, DNS, proxy settings, firewall rules, drivers, credentials, or adapter binding order. It does not implement bandwidth aggregation, load balancing, app-based routing, hotspots, or Internet Connection Sharing.
 
-```text
-C:\P\miniforge3
-```
+Network writes can interrupt connectivity. Wi-Fi operations, Metric changes, route edits, baseline restoration, and Windows-default restoration always require a user action and confirmation. Metric and route operations also require an elevated process. The application never automatically performs network writes during startup, refresh, diagnostics, development, or tests.
 
-PowerShell 中安装和启动：
+The UAC button restarts the application using the normal Windows elevation prompt. It does not bypass UAC or store administrator credentials.
+
+## Prerequisites
+
+- Windows 11 x64
+- Node.js (current LTS or newer)
+- Rust stable with the MSVC target
+- Visual Studio Build Tools with the **Desktop development with C++** / MSVC build-tools workload
+- Microsoft Edge WebView2 Evergreen Runtime
+
+## Development
+
+Install the frontend dependencies once:
 
 ```powershell
-& C:\P\miniforge3\npm.cmd install
-$env:ELECTRON_RUN_AS_NODE = $null
-& C:\P\miniforge3\npm.cmd start
+cd frontend
+npm install
+cd ..
 ```
 
-CMD 中可以先执行：
+Then run:
 
-```cmd
-set "PATH=C:\P\miniforge3;%PATH%"
-set ELECTRON_RUN_AS_NODE=
+```powershell
 npm start
 ```
 
-## 测试与检查
+Useful checks:
 
 ```powershell
-& C:\P\miniforge3\npm.cmd run check
-& C:\P\miniforge3\npm.cmd test
+npm run check
+npm test
+npm run build
 ```
 
-测试使用 `node:test`、fixture 和 mock。自动测试不会连接/断开 Wi-Fi、修改 Metric、增删路由、禁用网卡或触发 UAC。
+`npm test` runs Rust unit tests only. No test invokes a Wi-Fi connection, changes Metric, adds/removes a route, disables an adapter, or triggers UAC.
 
-## 管理员权限与安全警告
+## Packaging
 
-普通权限可以查看全部状态、操作 Wi-Fi 和管理应用内方案。以下操作需要管理员权限：
-
-- 修改 IPv4/IPv6 Metric。
-- 添加或删除路由。
-- 启用或禁用网络适配器。
-
-点击顶部“以管理员身份重启”后，Windows 会显示标准 UAC 提示。应用不绕过 UAC，也不保存管理员凭据。
-
-修改默认出口 Metric、默认路由或禁用承载当前网络的接口可能导致断网。应用会先生成预览和警告，并要求明确确认，但无法可靠判断所有远程连接依赖关系。
-
-## 用户配置
-
-网络方案、界面设置和路由备注保存在 Electron `app.getPath("userData")` 下的 `network-profiles.json`，不会写入源码目录，也不会打入安装包。配置损坏时，应用会在同一 userData 目录备份损坏文件并以空配置启动。
-
-## 打包
+Build the NSIS installer with:
 
 ```powershell
-& C:\P\miniforge3\npm.cmd run dist
+npm run dist
 ```
 
-NSIS 安装程序和未打包版本生成到 `release`。应用名称为 `Windows Network Manager`，不强制管理员启动，当前使用默认 Electron 图标且不进行代码签名，因此 Windows SmartScreen 可能显示提示。
+The installer is per-user, does not require an elevated installation, and uses the bundled Tauri configuration. User configurations remain in the Windows application-data directory and are never packaged with the application. Code signing is not configured, so Windows may show a SmartScreen warning.
 
-## 依赖说明
+## Stored data and recovery
 
-- `electron`：桌面运行环境。
-- `iconv-lite`：兼容 UTF-8、GBK/CP936 等 Windows `netsh` 输出编码。
-- `electron-builder`：构建 Windows NSIS 安装程序。
+Configuration is stored as `network-profiles.json` under the Tauri application-data directory, not in the repository. The file contains UI preferences, named configurations, the last ten unique snapshots, one pre-change baseline, and identifiers of app-managed routes. It never contains Wi-Fi passwords, VPN passwords, or Windows credentials.
+
+Snapshots are normalized and hashed. Saving an identical snapshot moves the existing record to the top instead of creating a duplicate. Restoring a snapshot applies the captured Metric state, the recorded Wi-Fi connection state, and only routes tracked as application-managed; it reports individual success, failure, and skipped results.
