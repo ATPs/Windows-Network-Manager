@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'" />
+    <title>Windows Network Manager</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div><p class="eyebrow">Windows 网络管理工具</p><h1>Windows Network Manager</h1></div>
+      <div class="header-actions">
+        <span id="admin-status" class="badge muted">权限检查中</span>
+        <button id="restart-admin" class="button secondary" type="button">以管理员身份重启</button>
+        <button id="global-refresh" class="button primary" type="button">全部刷新</button>
+      </div>
+      <p id="last-refresh" class="last-refresh">尚未刷新</p>
+    </header>
+
+    <nav class="section-nav" aria-label="页面区域">
+      <a href="#interfaces">网络接口</a><a href="#routes">路由表</a><a href="#profiles">网络方案</a><a href="#logs">操作日志</a>
+    </nav>
+
+    <main class="app-shell">
+      <p id="global-status" class="status info" aria-live="polite">正在读取网络状态…</p>
+
+      <section id="interfaces" class="panel">
+        <div class="section-heading"><div><p class="eyebrow">Interfaces</p><h2>网络接口</h2></div><label class="toggle"><input id="show-system-interfaces" type="checkbox" /> 显示系统接口</label></div>
+        <div id="interface-summary" class="summary-strip"></div>
+        <div id="interface-list" class="card-grid"></div>
+      </section>
+
+      <section id="routes" class="panel">
+        <div class="section-heading"><div><p class="eyebrow">Routes</p><h2>路由表</h2></div><button id="refresh-routes" class="button secondary" type="button">刷新路由</button></div>
+        <div class="filters">
+          <label>地址族<select id="route-family"><option value="IPv4">IPv4</option><option value="IPv6">IPv6</option><option value="all">全部</option></select></label>
+          <label>接口<select id="route-interface"><option value="all">全部接口</option></select></label>
+          <label>持久化<select id="route-persistence"><option value="all">全部</option><option value="persistent">持久化</option><option value="temporary">临时</option></select></label>
+          <label>目标/搜索<input id="route-search" type="search" placeholder="前缀、网关或接口" /></label>
+          <label class="toggle"><input id="show-all-routes" type="checkbox" /> 显示所有路由</label>
+        </div>
+        <div class="table-wrap"><table><thead><tr><th>族</th><th>目标</th><th>下一跳</th><th>接口</th><th>Route</th><th>Interface</th><th>总 Metric</th><th>类型</th><th>操作</th></tr></thead><tbody id="route-table-body"></tbody></table></div>
+
+        <form id="add-route-form" class="form-card">
+          <h3>添加 IPv4 静态路由</h3>
+          <div class="form-grid">
+            <label>目标 CIDR<input name="destinationPrefix" required placeholder="172.16.0.0/12" /></label>
+            <label>下一跳<input name="nextHop" required placeholder="192.168.3.1" /></label>
+            <label>接口<select name="interfaceIndex" required></select></label>
+            <label>Route Metric<input name="routeMetric" type="number" min="1" max="9999" value="5" required /></label>
+            <label class="toggle"><input name="persistent" type="checkbox" /> 持久化</label>
+            <label>备注<input name="note" maxlength="500" placeholder="仅保存到应用配置" /></label>
+          </div>
+          <button class="button primary admin-write" type="submit">预览并添加</button><span class="admin-hint"></span>
+        </form>
+      </section>
+
+      <section id="profiles" class="panel">
+        <div class="section-heading"><div><p class="eyebrow">Profiles</p><h2>网络方案</h2></div><button id="new-profile" class="button primary" type="button">新建方案</button></div>
+        <p id="profile-warning" class="inline-warning hidden"></p>
+        <div id="profile-list" class="profile-list"></div>
+      </section>
+
+      <section id="logs" class="panel">
+        <div class="section-heading"><div><p class="eyebrow">Activity</p><h2>操作日志</h2></div><button id="clear-logs" class="button secondary" type="button">清空</button></div>
+        <div class="table-wrap"><table><thead><tr><th>时间</th><th>操作</th><th>目标</th><th>结果</th><th>信息</th></tr></thead><tbody id="log-body"></tbody></table></div>
+      </section>
+    </main>
+
+    <dialog id="confirm-dialog"><form method="dialog" class="dialog-card"><h2 id="confirm-title">确认操作</h2><pre id="confirm-details"></pre><div class="dialog-actions"><button value="cancel" class="button secondary">取消</button><button value="confirm" class="button danger">确认</button></div></form></dialog>
+    <dialog id="profile-dialog"><form id="profile-form" class="dialog-card profile-editor"><div class="section-heading"><h2 id="profile-dialog-title">编辑网络方案</h2><button id="close-profile-dialog" class="icon-button" type="button" aria-label="关闭">×</button></div><div class="form-grid"><label>方案名称<input name="name" maxlength="100" required /></label><label>备注<input name="note" maxlength="1000" /></label></div><h3>接口操作</h3><div id="profile-interface-actions"></div><h3>受管理路由</h3><div id="profile-route-actions"></div><div class="profile-route-builder form-grid"><label>目标 CIDR<input id="profile-route-destination" placeholder="172.16.0.0/12" /></label><label>下一跳<input id="profile-route-next-hop" placeholder="192.168.3.1" /></label><label>接口<select id="profile-route-interface"></select></label><label>Metric<input id="profile-route-metric" type="number" min="1" max="9999" value="5" /></label><label>期望状态<select id="profile-route-state"><option value="present">应存在</option><option value="absent">应删除</option></select></label><label class="toggle"><input id="profile-route-persistent" type="checkbox" /> 持久化</label></div><button id="add-profile-route" class="button secondary" type="button">添加方案路由</button><div class="dialog-actions"><button id="cancel-profile" class="button secondary" type="button">取消</button><button class="button primary" type="submit">保存方案</button></div></form></dialog>
+    <script type="module" src="renderer.js"></script>
+  </body>
+</html>

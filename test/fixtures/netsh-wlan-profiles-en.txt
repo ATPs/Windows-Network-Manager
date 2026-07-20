@@ -1,0 +1,4 @@
+Profiles on interface Wi-Fi Main:
+    All User Profile     : Office WiFi 5G
+    All User Profile     : Home WiFi
+    All User Profile     : Office WiFi 5G
