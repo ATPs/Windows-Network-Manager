@@ -11,6 +11,7 @@ Windows Network Manager is a Windows 11 desktop application for inspecting and c
 - Lists saved Wi-Fi profiles per wireless adapter and can request a connect or disconnect without reading, storing, or creating Wi-Fi passwords.
 - Displays IPv4 and IPv6 routes with filtering and a concise summary of manual metrics, static routes, and disabled adapters.
 - Safely previews and applies IPv4 route and Metric changes after explicit confirmation.
+- Lets administrators edit app-managed static routes and enable or disable eligible non-system adapters after an explicit confirmation.
 - Stores a pre-change baseline, ten de-duplicated recent snapshots, named configuration data, and JSON import/export data in the Tauri application-data directory.
 - Offers both **Reset to pre-change baseline** and **Restore Windows defaults**. Windows defaults enables AutomaticMetric and removes only routes this application recorded as managed; it does not reset Winsock, reinstall network components, or remove unknown system routes.
 - Includes English and Chinese UI languages, safe diagnostics, and a standard Windows UAC restart-as-administrator option.

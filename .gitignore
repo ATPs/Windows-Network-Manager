@@ -4,6 +4,7 @@ node_modules/
 # Frontend and Tauri build output
 dist/
 target/
+gen/
 .tauri/
 release/
 out/
