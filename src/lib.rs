@@ -37,7 +37,6 @@ use windows_sys::Win32::{
 
 const CONFIG_FILE: &str = "network-profiles.json";
 const CACHE_FILE: &str = "network-state-cache.json";
-const MAX_IMPORT_BYTES: u64 = 2 * 1024 * 1024;
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(5);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -188,7 +187,6 @@ $Metrics=@(Get-NetIPInterface | ForEach-Object { [PSCustomObject]@{ addressFamil
 
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
             fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
@@ -203,11 +201,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            get_app_version,
-            get_network_overview,
             get_wifi_profiles,
-            get_routes,
-            get_privilege_status,
             get_app_config,
             get_bootstrap_state,
             refresh_network_state,
@@ -216,14 +210,10 @@ pub fn run() {
             delete_profile,
             restore_profile_preview,
             restore_profile_apply,
-            set_language,
-            set_theme,
             preview_metric_change,
             apply_metric_change,
             preview_add_route,
             add_route,
-            preview_edit_route,
-            apply_edit_route,
             preview_remove_route,
             remove_route,
             preview_adapter_control,
@@ -237,8 +227,6 @@ pub fn run() {
             reset_apply,
             windows_defaults_preview,
             windows_defaults_apply,
-            import_configuration,
-            export_configuration,
             get_diagnostics,
             restart_as_administrator
         ])
@@ -983,15 +971,6 @@ fn normalize_cidr(value: &str) -> AppResult<String> {
     ))
 }
 
-#[tauri::command]
-fn get_privilege_status() -> Value {
-    json!({"isAdmin":is_admin()})
-}
-#[tauri::command]
-fn get_app_version() -> Value {
-    json!({"version":env!("CARGO_PKG_VERSION")})
-}
-#[tauri::command]
 fn get_network_overview() -> AppResult<Value> {
     let raw = run_powershell_json(OVERVIEW_SCRIPT, None)?;
     let wifi = wifi_overview().unwrap_or_default();
@@ -1008,7 +987,6 @@ fn get_wifi_profiles(interface_name: String) -> AppResult<Value> {
     ])?;
     Ok(json!({"interfaceName":alias,"profiles":parse_wifi_profiles(&output),"profilesLoaded":true}))
 }
-#[tauri::command]
 fn get_routes() -> AppResult<Value> {
     let raw = run_powershell_json(ROUTES_SCRIPT, None)?;
     let mut metrics = HashMap::new();
@@ -1059,19 +1037,6 @@ fn route_key(route: &Value) -> String {
         field_i64(route, "interfaceIndex")
     )
 }
-fn is_app_managed_route(state: &State<AppState>, route: &Value) -> bool {
-    let key = route_key(route);
-    config(state)
-        .managed_routes
-        .iter()
-        .any(|item| route_key(item) == key)
-}
-fn is_identity_editable_route(route: &Value) -> bool {
-    route
-        .get("identityEditable")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
 fn is_removable_route(route: &Value) -> bool {
     route
         .get("removable")
@@ -1081,55 +1046,6 @@ fn is_removable_route(route: &Value) -> bool {
 fn route_remove_payload(route: &Value) -> Value {
     json!({"addressFamily":field_string(route,"addressFamily"),"destinationPrefix":field_string(route,"destinationPrefix"),"nextHop":field_string(route,"nextHop"),"interfaceIndex":field_i64(route,"interfaceIndex"),"routeMetric":field_i64(route,"routeMetric"),"persistent":route.get("persistent").and_then(Value::as_bool).unwrap_or(false),"policyStores":route.get("policyStores").cloned().unwrap_or(json!(["ActiveStore"]))})
 }
-fn edit_route_payload(target: &Value, input: &Value) -> AppResult<Value> {
-    let metric = valid_metric(input.get("routeMetric").unwrap_or(&Value::Null))?;
-    let destination = input
-        .get("destinationPrefix")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            target
-                .get("destinationPrefix")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-        });
-    let next_hop = input
-        .get("nextHop")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| target.get("nextHop").and_then(Value::as_str).unwrap_or(""));
-    let index = valid_index(input.get("interfaceIndex").unwrap_or(&Value::Null))?;
-    let persistent = input
-        .get("persistent")
-        .and_then(Value::as_bool)
-        .unwrap_or_else(|| {
-            target
-                .get("persistent")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        });
-    let identity_changed = destination != field_string(target, "destinationPrefix")
-        || next_hop != field_string(target, "nextHop")
-        || index != field_i64(target, "interfaceIndex")
-        || persistent
-            != target
-                .get("persistent")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-    if identity_changed && !is_identity_editable_route(target) {
-        return Err(err(
-            "VALIDATION_ERROR",
-            "This Windows-managed route only supports Route Metric editing.",
-        ));
-    }
-    let route = if identity_changed {
-        route_payload(input)?
-    } else {
-        json!({"addressFamily":field_string(target,"addressFamily"),"destinationPrefix":field_string(target,"destinationPrefix"),"nextHop":field_string(target,"nextHop"),"interfaceIndex":field_i64(target,"interfaceIndex"),"routeMetric":metric,"persistent":target.get("persistent").and_then(Value::as_bool).unwrap_or(false)})
-    };
-    Ok(
-        json!({"mode":if identity_changed{"replace"}else{"metric"},"oldRoute":route_remove_payload(target),"route":route}),
-    )
-}
-
 fn metric_payload(input: &Value) -> AppResult<Value> {
     let index = valid_index(input.get("interfaceIndex").unwrap_or(&Value::Null))?;
     let family = input
@@ -1298,142 +1214,6 @@ fn add_route(state: State<AppState>, input: Value) -> AppResult<Value> {
     }
     persist(&state, &cfg)?;
     Ok(result)
-}
-#[tauri::command]
-fn preview_edit_route(state: State<AppState>, input: Value) -> AppResult<Value> {
-    let old = input
-        .get("oldRoute")
-        .ok_or_else(|| err("VALIDATION_ERROR", "Original route is required."))?;
-    let routes = get_routes()?;
-    let target = arrays(routes.get("routes"))
-        .into_iter()
-        .find(|route| route_key(route) == route_key(old))
-        .ok_or_else(|| err("NOT_FOUND", "Route no longer exists."))?;
-    let payload = edit_route_payload(&target, input.get("route").unwrap_or(&Value::Null))?;
-    let new_route = payload.get("route").cloned().unwrap_or(Value::Null);
-    let conflicts = if field_string(&payload, "mode") == "replace" {
-        arrays(routes.get("routes"))
-            .into_iter()
-            .filter(|route| {
-                route_key(route) != route_key(&target)
-                    && field_string(route, "destinationPrefix")
-                        == field_string(&new_route, "destinationPrefix")
-            })
-            .collect::<Vec<_>>()
-    } else {
-        vec![]
-    };
-    let mut warnings = vec![];
-    if target
-        .get("defaultRoute")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        warnings.push(
-            "This is a default route. Changing it can immediately interrupt network connectivity."
-                .to_string(),
-        );
-    }
-    if target
-        .get("systemManaged")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || target
-            .get("onLink")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    {
-        warnings.push(
-            "Windows or the owning network software may recreate or overwrite this route."
-                .to_string(),
-        );
-    }
-    if field_string(&payload, "mode") == "replace" {
-        warnings.push("The route identity will be replaced. Route selection may change while the operation is applied.".to_string());
-    }
-    if !conflicts.is_empty() {
-        warnings.push("Routes with the same destination prefix already exist.".into());
-    }
-    warnings.push("If connectivity is affected, reopen the app as administrator and use Reset to pre-change baseline.".into());
-    Ok(
-        json!({"oldRoute":target,"route":new_route,"mode":payload["mode"],"conflicts":conflicts,"warnings":warnings,"confirmationToken":issue_confirmation(&state,"edit-route",&payload)?}),
-    )
-}
-#[tauri::command]
-fn apply_edit_route(state: State<AppState>, input: Value) -> AppResult<Value> {
-    let raw_old = input
-        .get("oldRoute")
-        .ok_or_else(|| err("VALIDATION_ERROR", "Original route is required."))?;
-    let routes = get_routes()?;
-    let target = arrays(routes.get("routes"))
-        .into_iter()
-        .find(|route| route_key(route) == route_key(raw_old))
-        .ok_or_else(|| err("NOT_FOUND", "Route no longer exists."))?;
-    let was_app_managed = is_app_managed_route(&state, &target);
-    let payload = edit_route_payload(&target, input.get("route").unwrap_or(&Value::Null))?;
-    consume_confirmation(
-        &state,
-        input
-            .get("confirmationToken")
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-        "edit-route",
-        &payload,
-    )?;
-    require_admin()?;
-    capture_baseline(
-        &state,
-        json!({"editRoute":{"oldRoute":target,"mode":payload["mode"],"route":payload["route"]}}),
-    )?;
-    let old = payload.get("oldRoute").cloned().unwrap_or(Value::Null);
-    let new_route = payload.get("route").cloned().unwrap_or(Value::Null);
-    if field_string(&payload, "mode") == "metric" {
-        let mut update = old.clone();
-        update
-            .as_object_mut()
-            .ok_or_else(|| err("VALIDATION_ERROR", "Invalid route record."))?
-            .insert(
-                "routeMetric".into(),
-                new_route.get("routeMetric").cloned().unwrap_or(Value::Null),
-            );
-        let result = update_route_metric_record(&update)?;
-        let completed = arrays(Some(&result))
-            .iter()
-            .all(|item| field_string(item, "status") == "success");
-        return Ok(json!({"updated":result,"completed":completed}));
-    }
-    let same_key = route_key(&old) == route_key(&new_route);
-    let (added, removed) = if same_key {
-        let removed = remove_route_record(&old)?;
-        let removed_ok = arrays(Some(&removed))
-            .iter()
-            .all(|item| field_string(item, "status") == "success");
-        if !removed_ok {
-            return Ok(json!({"removed":removed,"completed":false}));
-        }
-        match add_route_record(&new_route) {
-            Ok(added) => (added, removed),
-            Err(error) => {
-                let _ = add_route_record(&old);
-                return Err(error);
-            }
-        }
-    } else {
-        let added = add_route_record(&new_route)?;
-        let removed = remove_route_record(&old)?;
-        (added, removed)
-    };
-    let removed_ok = arrays(Some(&removed))
-        .iter()
-        .all(|item| field_string(item, "status") == "success");
-    if removed_ok && was_app_managed {
-        let mut cfg = config(&state);
-        let old_key = route_key(&old);
-        cfg.managed_routes.retain(|item| route_key(item) != old_key);
-        cfg.managed_routes.push(json!({"addressFamily":"IPv4","destinationPrefix":field_string(&new_route,"destinationPrefix"),"nextHop":field_string(&new_route,"nextHop"),"interfaceIndex":field_i64(&new_route,"interfaceIndex")}));
-        persist(&state, &cfg)?;
-    }
-    Ok(json!({"added":added,"removed":removed,"completed":removed_ok}))
 }
 #[tauri::command]
 fn preview_remove_route(state: State<AppState>, route: Value) -> AppResult<Value> {
@@ -1640,24 +1420,6 @@ fn update_settings(state: State<AppState>, settings: Settings) -> AppResult<Sett
         show_system_interfaces: settings.show_system_interfaces,
         show_all_routes: settings.show_all_routes,
     };
-    persist(&state, &cfg)?;
-    Ok(cfg.settings)
-}
-#[tauri::command]
-fn set_language(state: State<AppState>, language: String) -> AppResult<Settings> {
-    if language != "en" && language != "zh-CN" {
-        return Err(err("VALIDATION_ERROR", "Unsupported language."));
-    }
-    let mut cfg = config(&state);
-    cfg.settings.language = language;
-    persist(&state, &cfg)?;
-    Ok(cfg.settings)
-}
-#[tauri::command]
-fn set_theme(state: State<AppState>, theme: String) -> AppResult<Settings> {
-    let theme = valid_theme(&theme)?.to_string();
-    let mut cfg = config(&state);
-    cfg.settings.theme = theme;
     persist(&state, &cfg)?;
     Ok(cfg.settings)
 }
@@ -2164,105 +1926,6 @@ fn windows_defaults_apply(state: State<AppState>, input: Value) -> AppResult<Val
     )
 }
 
-fn safe_config_path(path: &str) -> AppResult<PathBuf> {
-    let result = PathBuf::from(path);
-    if result
-        .extension()
-        .and_then(|x| x.to_str())
-        .map(|x| x.eq_ignore_ascii_case("json"))
-        .unwrap_or(false)
-    {
-        Ok(result)
-    } else {
-        Err(err(
-            "VALIDATION_ERROR",
-            "Configuration files must use the .json extension.",
-        ))
-    }
-}
-#[tauri::command]
-fn export_configuration(
-    state: State<AppState>,
-    path: String,
-    mode: String,
-    id: Option<String>,
-) -> AppResult<Value> {
-    let path = safe_config_path(&path)?;
-    let cfg = config(&state);
-    let content = match mode.as_str() {
-        "profile" => {
-            json!({"format":"wnm-config","version":2,"profiles":cfg.profiles.into_iter().filter(|x|Some(field_string(x,"id"))==id).collect::<Vec<_>>() })
-        }
-        "recent" => {
-            json!({"format":"wnm-config","version":2,"recentSnapshots":cfg.recent_snapshots.into_iter().filter(|x|Some(x.id.clone())==id).collect::<Vec<_>>() })
-        }
-        _ => {
-            json!({"format":"wnm-config","version":2,"settings":cfg.settings,"profiles":cfg.profiles,"recentSnapshots":cfg.recent_snapshots})
-        }
-    };
-    fs::write(
-        &path,
-        serde_json::to_string_pretty(&content)
-            .map_err(|_| err("SERIALIZE_ERROR", "Cannot export configuration."))?,
-    )
-    .map_err(|e| {
-        err_with(
-            "EXPORT_FAILED",
-            "Cannot write export file.",
-            json!({"reason":e.to_string()}),
-        )
-    })?;
-    Ok(json!({"exported":true,"path":path}))
-}
-#[tauri::command]
-fn import_configuration(state: State<AppState>, path: String) -> AppResult<Value> {
-    let path = safe_config_path(&path)?;
-    let meta =
-        fs::metadata(&path).map_err(|_| err("IMPORT_FAILED", "Cannot access import file."))?;
-    if meta.len() > MAX_IMPORT_BYTES {
-        return Err(err("VALIDATION_ERROR", "Import file is too large."));
-    }
-    let value: Value = serde_json::from_str(
-        &fs::read_to_string(&path).map_err(|_| err("IMPORT_FAILED", "Cannot read import file."))?,
-    )
-    .map_err(|_| err("VALIDATION_ERROR", "Import file is not valid JSON."))?;
-    if value.get("format").and_then(Value::as_str) != Some("wnm-config") {
-        return Err(err("VALIDATION_ERROR", "Unsupported configuration format."));
-    }
-    let mut cfg = config(&state);
-    let mut added = 0;
-    for mut profile in arrays(value.get("profiles")) {
-        let hash = fingerprint(&profile);
-        if cfg.profiles.iter().any(|x| fingerprint(x) == hash) {
-            continue;
-        }
-        let name = field_string(&profile, "name");
-        if cfg.profiles.iter().any(|x| field_string(x, "name") == name) {
-            profile
-                .as_object_mut()
-                .unwrap()
-                .insert("name".into(), json!(format!("{} (Imported)", name)));
-        }
-        profile
-            .as_object_mut()
-            .unwrap()
-            .insert("id".into(), json!(Uuid::new_v4().to_string()));
-        cfg.profiles.push(profile);
-        added += 1;
-    }
-    for snapshot in arrays(value.get("recentSnapshots")) {
-        if let Ok(item) = serde_json::from_value::<Snapshot>(snapshot) {
-            if !cfg.recent_snapshots.iter().any(|x| x.hash == item.hash) {
-                cfg.recent_snapshots.push(item)
-            }
-        }
-    }
-    cfg.recent_snapshots
-        .sort_by(|a, b| b.last_used_at.cmp(&a.last_used_at));
-    cfg.recent_snapshots.truncate(10);
-    persist(&state, &cfg)?;
-    Ok(json!({"imported":added,"recentSnapshots":cfg.recent_snapshots.len()}))
-}
 #[tauri::command]
 fn get_diagnostics(state: State<AppState>) -> AppResult<Value> {
     let overview = get_network_overview()?;
@@ -2360,19 +2023,6 @@ mod tests {
         );
         assert!(adapter_control_payload(&json!({"interfaceIndex":0,"action":"disable"})).is_err());
         assert!(adapter_control_payload(&json!({"interfaceIndex":7,"action":"restart"})).is_err());
-    }
-    #[test]
-    fn route_editing_allows_metric_but_protects_system_identity() {
-        let system = json!({"addressFamily":"IPv6","destinationPrefix":"::/0","nextHop":"fe80::1","interfaceIndex":7,"routeMetric":25,"persistent":false,"policyStores":["ActiveStore"],"editable":true,"identityEditable":false,"removable":false});
-        let metric=edit_route_payload(&system,&json!({"destinationPrefix":"::/0","nextHop":"fe80::1","interfaceIndex":7,"routeMetric":30,"persistent":false})).unwrap();
-        assert_eq!(field_string(&metric, "mode"), "metric");
-        assert!(edit_route_payload(&system,&json!({"destinationPrefix":"2001:db8::/32","nextHop":"fe80::1","interfaceIndex":7,"routeMetric":30,"persistent":false})).is_err());
-    }
-    #[test]
-    fn existing_static_route_can_be_fully_edited() {
-        let route = json!({"addressFamily":"IPv4","destinationPrefix":"172.16.0.0/12","nextHop":"192.168.3.1","interfaceIndex":24,"routeMetric":40,"persistent":true,"policyStores":["ActiveStore","PersistentStore"],"editable":true,"identityEditable":true,"removable":true});
-        let edit=edit_route_payload(&route,&json!({"destinationPrefix":"172.16.0.0/12","nextHop":"192.168.3.254","interfaceIndex":24,"routeMetric":20,"persistent":true})).unwrap();
-        assert_eq!(field_string(&edit, "mode"), "replace");
     }
     #[test]
     fn ui_contains_sidebar_and_operation_feedback() {

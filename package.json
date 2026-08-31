@@ -16,8 +16,5 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "module",
-  "devDependencies": {
-    "prettier": "^3.9.6"
-  }
+  "type": "module"
 }
