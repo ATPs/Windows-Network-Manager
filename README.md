@@ -1,11 +1,13 @@
 # Windows Network Manager
 
-Windows Network Manager is a Windows 11 desktop application for inspecting and carefully managing network interfaces. It is built with Tauri 2, Rust, Vite, and plain HTML/CSS/JavaScript.
+Windows Network Manager is a Windows 11 desktop application for inspecting and carefully managing network interfaces. It is built with Tauri 2, Rust, Vite, and Lit.
 
 ## What it does
 
 - Lists Wi-Fi, Ethernet, VPN, tunnel, virtual, disconnected, and optionally system interfaces.
-- Uses progressive loading: interface status appears first, while routes and saved Wi-Fi profiles load independently.
+- Uses a Windows 11-inspired sidebar with dedicated Overview, Adapters, Routes, Profiles, Diagnostics, and Maintenance views.
+- Shows the last successful read-only network state immediately, clearly labels it as cached, then refreshes it in the background.
+- Uses per-operation progress, confirmation, result, and error feedback so slow Windows networking operations never look unresponsive or accept duplicate clicks.
 - Supports System, Light, and Dark color themes; the first launch follows Windows and the choice is saved.
 - Shows addresses, gateways, DNS servers, DHCP, link speed, interface index, connection status, and separate IPv4/IPv6 metrics.
 - Lists saved Wi-Fi profiles per wireless adapter and can request a connect or disconnect without reading, storing, or creating Wi-Fi passwords.
@@ -55,10 +57,11 @@ Useful checks:
 ```powershell
 npm run check
 npm test
+npm run test:frontend
 npm run build
 ```
 
-`npm test` runs Rust unit tests only. No test invokes a Wi-Fi connection, changes Metric, adds/removes a route, disables an adapter, or triggers UAC.
+`npm test` runs Rust unit tests and `npm run test:frontend` runs frontend unit tests. No test invokes a Wi-Fi connection, changes Metric, adds/removes a route, disables an adapter, or triggers UAC.
 
 ## Packaging
 

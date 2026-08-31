@@ -1,7 +1,8 @@
 $ErrorActionPreference = 'Stop'
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$version = '1.1.3'
+$tauriConfig = Get-Content -LiteralPath (Join-Path $root 'tauri.conf.json') -Raw | ConvertFrom-Json
+$version = [string]$tauriConfig.version
 $installerDir = Join-Path $root 'installer'
 $releaseExe = Join-Path $root 'target\release\windows-network-manager.exe'
 $nsisSource = Join-Path $root "target\release\bundle\nsis\Windows Network Manager_${version}_x64-setup.exe"

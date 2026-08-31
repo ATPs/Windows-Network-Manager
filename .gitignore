@@ -13,6 +13,10 @@ out/
 # Test coverage
 coverage/
 .nyc_output/
+test-results/
+playwright-report/
+frontend/.vite/
+frontend/.vitest/
 
 # Logs
 logs/
@@ -34,6 +38,7 @@ pnpm-debug.log*
 .tmp/
 temp/
 tmp/
+*.tmp
 installer/
 
 
