@@ -269,7 +269,7 @@ export class NetworkManagerApp extends LitElement {
     return html`<aside class="sidebar">
       <div class="brand">
         <span class="brand-mark">N</span>
-        <div><strong>Windows Network Manager</strong><small>v2.1.0</small></div>
+        <div><strong>Windows Network Manager</strong><small>v2.1.1</small></div>
       </div>
       <nav aria-label="Primary navigation">
         ${views.map(
@@ -321,6 +321,7 @@ export class NetworkManagerApp extends LitElement {
           class="status-pill ${this.privilege.isAdmin ? "success" : "neutral"}"
           >${this.privilege.isAdmin ? this.t("administrator") : this.t("standardUser")}</span
         >
+        ${!this.privilege.isAdmin ? html`<button class="secondary" ?disabled=${this.isBusy("elevation")} @click=${() => this.restartAsAdmin()}>${this.isBusy("elevation") ? this.t("working") : this.t("restartAdmin")}</button>` : nothing}
         <button
           class="primary"
           ?disabled=${this.isBusy(refreshKey)}
