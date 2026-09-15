@@ -1,13 +1,13 @@
 {
   "name": "windows-network-manager",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Windows network interface, metric, route and profile manager",
   "scripts": {
     "start": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& frontend\\node_modules\\.bin\\tauri dev",
     "dev": "frontend\\node_modules\\.bin\\vite --config frontend/vite.config.js",
     "build": "frontend\\node_modules\\.bin\\vite build --config frontend/vite.config.js",
     "tauri": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& frontend\\node_modules\\.bin\\tauri",
-    "test": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& cargo test",
+    "test": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& cargo test && npm run test:frontend",
     "test:frontend": "npm --prefix frontend test",
     "check": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& cargo check",
     "dist:build": "set \"PATH=%USERPROFILE%\\.cargo\\bin;%PATH%\"&& frontend\\node_modules\\.bin\\tauri build --bundles nsis",

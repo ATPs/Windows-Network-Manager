@@ -27,8 +27,11 @@ export const api = {
   applyAdapter: (adapter, confirmationToken) =>
     call("apply_adapter_control", { input: { adapter, confirmationToken } }),
   wifiProfiles: (interfaceName) => call("get_wifi_profiles", { interfaceName }),
-  connectWifi: (input) => call("connect_wifi", { input }),
-  disconnectWifi: (input) => call("disconnect_wifi", { input }),
+  previewWifi: (input) => call("preview_wifi_change", { input }),
+  connectWifi: (input, confirmationToken) =>
+    call("connect_wifi", { input: { ...input, confirmationToken } }),
+  disconnectWifi: (input, confirmationToken) =>
+    call("disconnect_wifi", { input: { ...input, confirmationToken } }),
   profiles: () => call("get_app_config"),
   saveProfile: (profile) => call("save_profile", { profile }),
   deleteProfile: (id) => call("delete_profile", { id }),

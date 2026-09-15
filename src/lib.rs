@@ -135,12 +135,12 @@ struct AppConfig {
     route_notes: BTreeMap<String, String>,
 }
 fn schema_version() -> u32 {
-    2
+    3
 }
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 3,
             settings: Settings::default(),
             profiles: vec![],
             recent_snapshots: vec![],
@@ -218,6 +218,7 @@ pub fn run() {
             remove_route,
             preview_adapter_control,
             apply_adapter_control,
+            preview_wifi_change,
             connect_wifi,
             disconnect_wifi,
             capture_recent_snapshot,
@@ -636,7 +637,17 @@ fn native_network_overview() -> AppResult<Value> {
                 let ipv6_metric = native_metric(index, AF_INET6);
                 let admin_status = native_admin_status(index);
                 let adapter_disabled = admin_status.eq_ignore_ascii_case("down");
-                interfaces.push(json!({"interfaceIndex":index,"alias":alias,"description":description,"guid":"","macAddress":mac,"type":kind,"hardwareInterface":interface_type==6,"virtual":(["VPN","Tunnel"].contains(&kind)),"systemInterface":system,"adminStatus":admin_status,"operationalStatus":item.OperStatus,"mediaConnectionState":"unknown","linkSpeed":native_link_speed(item.TransmitLinkSpeed.max(item.ReceiveLinkSpeed)),"ipv4Addresses":ipv4,"ipv6Addresses":ipv6,"ipv4Gateways":gateways4,"ipv6Gateways":gateways6,"dnsServers":dns,"dhcpEnabled":Value::Null,"metrics":{"ipv4":ipv4_metric,"ipv6":ipv6_metric},"networkCategory":Value::Null,"defaultRoute":!gateways4.is_empty()||!gateways6.is_empty(),"wifi":wifi_item,"deviations":{"manualIpv4Metric":false,"manualIpv6Metric":false,"adapterDisabled":adapter_disabled}}));
+                let manual_ipv4 = ipv4_metric
+                    .get("automaticMetric")
+                    .and_then(Value::as_bool)
+                    .map(|automatic| !automatic)
+                    .unwrap_or(false);
+                let manual_ipv6 = ipv6_metric
+                    .get("automaticMetric")
+                    .and_then(Value::as_bool)
+                    .map(|automatic| !automatic)
+                    .unwrap_or(false);
+                interfaces.push(json!({"interfaceIndex":index,"alias":alias,"description":description,"guid":"","macAddress":mac,"type":kind,"hardwareInterface":interface_type==6,"virtual":(["VPN","Tunnel"].contains(&kind)),"systemInterface":system,"adminStatus":admin_status,"operationalStatus":item.OperStatus,"mediaConnectionState":"unknown","linkSpeed":native_link_speed(item.TransmitLinkSpeed.max(item.ReceiveLinkSpeed)),"ipv4Addresses":ipv4,"ipv6Addresses":ipv6,"ipv4Gateways":gateways4,"ipv6Gateways":gateways6,"dnsServers":dns,"dhcpEnabled":Value::Null,"metrics":{"ipv4":ipv4_metric,"ipv6":ipv6_metric},"networkCategory":Value::Null,"defaultRoute":!gateways4.is_empty()||!gateways6.is_empty(),"wifi":wifi_item,"deviations":{"manualIpv4Metric":manual_ipv4,"manualIpv6Metric":manual_ipv6,"adapterDisabled":adapter_disabled}}));
                 current = item.Next;
             }
         }
@@ -1024,8 +1035,19 @@ fn get_routes() -> AppResult<Value> {
         let removable = identity_editable && !default_route;
         routes.insert(key,json!({"addressFamily":family,"destinationPrefix":dest,"nextHop":next,"interfaceAlias":field_string(&route,"interfaceAlias"),"interfaceIndex":index,"routeMetric":field_i64(&route,"routeMetric"),"interfaceMetric":metric,"effectiveMetric":metric.map(|m|m+field_i64(&route,"routeMetric")),"protocol":protocol,"policyStores":stores,"persistent":is_persistent,"temporary":!is_persistent,"state":field_string(&route,"state"),"publish":field_string(&route,"publish"),"validLifetime":field_string(&route,"validLifetime"),"preferredLifetime":field_string(&route,"preferredLifetime"),"defaultRoute":default_route,"onLink":on_link,"systemManaged":!managed,"editable":true,"identityEditable":identity_editable,"removable":removable,"hiddenByDefault":multicast||(on_link&&!default_route&&!managed)}));
     }
+    let route_items = routes.into_values().collect::<Vec<_>>();
+    let default_candidates = route_items
+        .iter()
+        .filter(|route| {
+            route
+                .get("defaultRoute")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     Ok(
-        json!({"routes":routes.into_values().collect::<Vec<_>>(),"refreshedAt":Utc::now().to_rfc3339()}),
+        json!({"routes":route_items,"defaultCandidates":default_candidates,"refreshedAt":Utc::now().to_rfc3339()}),
     )
 }
 fn route_key(route: &Value) -> String {
@@ -1200,7 +1222,7 @@ fn add_route(state: State<AppState>, input: Value) -> AppResult<Value> {
         .ok_or_else(|| err("CONFIRMATION_EXPIRED", "Preview is required."))?;
     consume_confirmation(&state, token, "add-route", &payload)?;
     require_admin()?;
-    capture_baseline(&state, json!({"routes":[payload.clone()]}))?;
+    capture_baseline(&state, json!({"addRoute":payload.clone()}))?;
     let script = r#"$s=if($InputData.persistent){'PersistentStore'}else{'ActiveStore'};New-NetRoute -AddressFamily IPv4 -DestinationPrefix ([string]$InputData.destinationPrefix) -NextHop ([string]$InputData.nextHop) -InterfaceIndex ([int]$InputData.interfaceIndex) -RouteMetric ([int]$InputData.routeMetric) -PolicyStore $s -Confirm:$false -ErrorAction Stop;[PSCustomObject]@{created=$true;policyStore=$s}|ConvertTo-Json -Compress"#;
     let result = run_powershell_json(script, Some(&payload))?;
     let mut cfg = config(&state);
@@ -1265,8 +1287,7 @@ fn remove_route(state: State<AppState>, input: Value) -> AppResult<Value> {
     Ok(json!({"results":result,"completed":completed}))
 }
 
-#[tauri::command]
-fn connect_wifi(state: State<AppState>, input: Value) -> AppResult<Value> {
+fn wifi_payload(input: &Value, action: &str) -> AppResult<Value> {
     let alias = input
         .get("interfaceName")
         .and_then(Value::as_str)
@@ -1277,8 +1298,58 @@ fn connect_wifi(state: State<AppState>, input: Value) -> AppResult<Value> {
         .get("profileName")
         .and_then(Value::as_str)
         .filter(|x| !x.contains(['\r', '\n', '\0']))
-        .ok_or_else(|| err("VALIDATION_ERROR", "Invalid Wi-Fi profile name."))?
-        .to_string();
+        .map(str::to_string);
+    if action == "connect" && profile.as_deref().unwrap_or("").is_empty() {
+        return Err(err("VALIDATION_ERROR", "Invalid Wi-Fi profile name."));
+    }
+    Ok(json!({"interfaceName":alias,"profileName":profile,"action":action}))
+}
+#[tauri::command]
+fn preview_wifi_change(state: State<AppState>, input: Value) -> AppResult<Value> {
+    let action = input.get("action").and_then(Value::as_str).unwrap_or("");
+    if action != "connect" && action != "disconnect" {
+        return Err(err(
+            "VALIDATION_ERROR",
+            "Wi-Fi action must be connect or disconnect.",
+        ));
+    }
+    let payload = wifi_payload(&input, action)?;
+    let overview = get_network_overview()?;
+    let adapter = arrays(overview.get("interfaces"))
+        .into_iter()
+        .find(|item| {
+            field_string(item, "alias") == field_string(&payload, "interfaceName")
+                && item.get("wifi").is_some()
+        })
+        .ok_or_else(|| err("NOT_FOUND", "Wireless interface no longer exists."))?;
+    let mut warnings = vec![];
+    if adapter
+        .get("defaultRoute")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        warnings.push(
+            "This adapter currently has a default route; the change can interrupt connectivity.",
+        );
+    }
+    Ok(
+        json!({"wifi":payload,"warnings":warnings,"confirmationToken":issue_confirmation(&state,"wifi",&payload)?}),
+    )
+}
+#[tauri::command]
+fn connect_wifi(state: State<AppState>, input: Value) -> AppResult<Value> {
+    let payload = wifi_payload(input.get("wifi").unwrap_or(&input), "connect")?;
+    consume_confirmation(
+        &state,
+        input
+            .get("confirmationToken")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        "wifi",
+        &payload,
+    )?;
+    let alias = field_string(&payload, "interfaceName");
+    let profile = field_string(&payload, "profileName");
     capture_baseline(
         &state,
         json!({"wifi":[{"interfaceName":alias,"profileName":profile}]}),
@@ -1293,12 +1364,17 @@ fn connect_wifi(state: State<AppState>, input: Value) -> AppResult<Value> {
 }
 #[tauri::command]
 fn disconnect_wifi(state: State<AppState>, input: Value) -> AppResult<Value> {
-    let alias = input
-        .get("interfaceName")
-        .and_then(Value::as_str)
-        .filter(|x| !x.contains(['\r', '\n', '\0']))
-        .ok_or_else(|| err("VALIDATION_ERROR", "Invalid Wi-Fi interface name."))?
-        .to_string();
+    let payload = wifi_payload(input.get("wifi").unwrap_or(&input), "disconnect")?;
+    consume_confirmation(
+        &state,
+        input
+            .get("confirmationToken")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        "wifi",
+        &payload,
+    )?;
+    let alias = field_string(&payload, "interfaceName");
     capture_baseline(&state, json!({"wifi":[{"interfaceName":alias}]}))?;
     run_netsh(&[
         "wlan".into(),
@@ -1399,7 +1475,10 @@ fn refresh_network_state(
     let snapshot = if force.unwrap_or(false) {
         current_snapshot(&state)?
     } else {
-        recent_snapshot(&state).unwrap_or(current_snapshot(&state)?)
+        match recent_snapshot(&state) {
+            Some(snapshot) => snapshot,
+            None => current_snapshot(&state)?,
+        }
     };
     let interfaces = requested.iter().any(|scope| scope == "interfaces");
     let routes = requested.iter().any(|scope| scope == "routes");
@@ -1539,7 +1618,7 @@ fn restore_profile_apply(state: State<AppState>, input: Value) -> AppResult<Valu
         "Before saved configuration restore".into(),
         snapshot_current(&state)?,
     )?;
-    restore_snapshot(&state, &snapshot)
+    restore_snapshot(&state, &snapshot, &json!({"restoreProfile":id}))
 }
 
 fn snapshot_current(state: &State<AppState>) -> AppResult<Value> {
@@ -1574,6 +1653,17 @@ fn add_route_record(route: &Value) -> AppResult<Value> {
 }
 fn restore_route_scope(scope: &Value) -> AppResult<Value> {
     let current = get_routes()?;
+    if let Some(added) = scope.get("addRoute") {
+        if let Some(actual) = arrays(current.get("routes"))
+            .into_iter()
+            .find(|route| route_key(route) == route_key(added))
+        {
+            return remove_route_record(&route_remove_payload(&actual));
+        }
+        return Ok(
+            json!([{"status":"skipped","kind":"route","message":"The added route no longer exists."}]),
+        );
+    }
     if let Some(edit) = scope.get("editRoute") {
         let old = edit
             .get("oldRoute")
@@ -1628,13 +1718,36 @@ fn restore_route_scope(scope: &Value) -> AppResult<Value> {
     }
     Ok(json!([]))
 }
-fn restore_snapshot(state: &State<AppState>, snapshot: &Value) -> AppResult<Value> {
+fn scope_touches_interface(scope: &Value, target: &Value) -> bool {
+    let index = field_i64(target, "interfaceIndex");
+    let alias = field_string(target, "alias");
+    if scope.get("restoreProfile").is_some() || scope.get("restoreRecent").is_some() {
+        return true;
+    }
+    arrays(scope.get("metrics"))
+        .iter()
+        .any(|item| field_i64(item, "interfaceIndex") == index)
+        || scope
+            .get("adapterControl")
+            .map(|item| field_i64(item, "interfaceIndex") == index)
+            .unwrap_or(false)
+        || arrays(scope.get("wifi"))
+            .iter()
+            .any(|item| field_string(item, "interfaceName") == alias)
+        || arrays(scope.pointer("/windowsDefaults/interfaces"))
+            .iter()
+            .any(|item| field_i64(item, "interfaceIndex") == index)
+}
+fn restore_snapshot(state: &State<AppState>, snapshot: &Value, scope: &Value) -> AppResult<Value> {
     let target_interfaces = arrays(snapshot.pointer("/overview/interfaces"));
     let current = get_network_overview()?;
     let current_interfaces = arrays(current.get("interfaces"));
     let mut results = vec![];
     for target in target_interfaces {
         let index = field_i64(&target, "interfaceIndex");
+        if !scope_touches_interface(scope, &target) {
+            continue;
+        }
         if !current_interfaces
             .iter()
             .any(|item| field_i64(item, "interfaceIndex") == index)
@@ -1649,6 +1762,21 @@ fn restore_snapshot(state: &State<AppState>, snapshot: &Value) -> AppResult<Valu
                 }
                 let payload = json!({"interfaceIndex":index,"addressFamily":family,"automatic":metric.get("automaticMetric").and_then(Value::as_bool).unwrap_or(true),"metric":metric.get("interfaceMetric").and_then(Value::as_i64)});
                 match ps_set_metric(&payload){Ok(value)=>results.push(json!({"status":"success","kind":"metric","result":value})),Err(error)=>results.push(json!({"status":"failed","kind":"metric","interfaceIndex":index,"addressFamily":family,"error":error}))}
+            }
+        }
+        let target_disabled = field_string(&target, "adminStatus").eq_ignore_ascii_case("down");
+        if let Some(actual) = current_interfaces
+            .iter()
+            .find(|item| field_i64(item, "interfaceIndex") == index)
+        {
+            let actual_disabled = field_string(actual, "adminStatus").eq_ignore_ascii_case("down");
+            if target_disabled != actual_disabled && !field_bool(&target, "systemInterface") {
+                let action = if target_disabled { "disable" } else { "enable" };
+                let script = r#"$item=Get-NetAdapter -IncludeHidden -InterfaceIndex ([int]$InputData.interfaceIndex) -ErrorAction Stop;if($InputData.action -eq 'enable'){$item|Enable-NetAdapter -Confirm:$false -ErrorAction Stop}else{$item|Disable-NetAdapter -Confirm:$false -ErrorAction Stop};[PSCustomObject]@{interfaceIndex=[int]$InputData.interfaceIndex;status='success'}|ConvertTo-Json -Compress"#;
+                match run_powershell_json(script, Some(&json!({"interfaceIndex":index,"action":action}))) {
+                    Ok(value) => results.push(json!({"status":"success","kind":"adapter","result":value})),
+                    Err(error) => results.push(json!({"status":"failed","kind":"adapter","interfaceIndex":index,"error":error})),
+                }
             }
         }
         if let Some(wifi) = target.get("wifi") {
@@ -1680,6 +1808,9 @@ fn restore_snapshot(state: &State<AppState>, snapshot: &Value) -> AppResult<Valu
                     .push(json!({"status":"failed","kind":"wifi","interface":alias,"error":error})),
             }
         }
+    }
+    if scope.get("restoreProfile").is_none() && scope.get("restoreRecent").is_none() {
+        return Ok(json!({"restored":true,"results":results}));
     }
     let cfg = config(state);
     let current_routes = get_routes()?;
@@ -1715,6 +1846,17 @@ fn restore_snapshot(state: &State<AppState>, snapshot: &Value) -> AppResult<Valu
         }
     }
     Ok(json!({"restored":true,"results":results}))
+}
+
+fn has_failed_result(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.get("status").and_then(Value::as_str) == Some("failed")
+                || map.values().any(has_failed_result)
+        }
+        Value::Array(items) => items.iter().any(has_failed_result),
+        _ => false,
+    }
 }
 fn store_recent(state: &State<AppState>, name: String, snapshot: Value) -> AppResult<Snapshot> {
     let hash = fingerprint(&snapshot);
@@ -1793,7 +1935,7 @@ fn restore_recent_apply(state: State<AppState>, input: Value) -> AppResult<Value
         "Before recent restore".into(),
         snapshot_current(&state)?,
     )?;
-    restore_snapshot(&state, &item.state)
+    restore_snapshot(&state, &item.state, &json!({"restoreRecent":id}))
 }
 
 #[tauri::command]
@@ -1829,11 +1971,16 @@ fn reset_apply(state: State<AppState>, input: Value) -> AppResult<Value> {
         "Before baseline reset".into(),
         snapshot_current(&state)?,
     )?;
-    let result = restore_snapshot(&state, &baseline.snapshot.state)?;
+    let result = restore_snapshot(&state, &baseline.snapshot.state, &baseline.scope)?;
     let route_result = restore_route_scope(&baseline.scope)?;
-    cfg.baseline = None;
-    persist(&state, &cfg)?;
-    Ok(json!({"reset":true,"result":result,"routeResult":route_result}))
+    let complete = !has_failed_result(&result) && !has_failed_result(&route_result);
+    if complete {
+        cfg.baseline = None;
+        persist(&state, &cfg)?;
+    }
+    Ok(
+        json!({"reset":complete,"partial":!complete,"result":result,"routeResult":route_result,"message":if complete {"The last app change was undone."} else {"Undo was only partially completed. Recovery remains available."}}),
+    )
 }
 fn windows_defaults_payload(state: &State<AppState>, input: &Value) -> AppResult<Value> {
     let overview = get_network_overview()?;
@@ -1843,7 +1990,7 @@ fn windows_defaults_payload(state: &State<AppState>, input: &Value) -> AppResult
         .into_iter()
         .map(|item| valid_index(&item))
         .collect::<AppResult<Vec<_>>>()?;
-    let selected = if requested.is_empty() {
+    let selected = if input.get("interfaceIndexes").is_none() {
         eligible.clone()
     } else {
         eligible
@@ -1852,7 +1999,7 @@ fn windows_defaults_payload(state: &State<AppState>, input: &Value) -> AppResult
             .cloned()
             .collect::<Vec<_>>()
     };
-    if !requested.is_empty() && selected.len() != requested.len() {
+    if selected.len() != requested.len() {
         return Err(err(
             "VALIDATION_ERROR",
             "Only eligible adapters can be restored.",
@@ -1867,6 +2014,12 @@ fn windows_defaults_payload(state: &State<AppState>, input: &Value) -> AppResult
     } else {
         vec![]
     };
+    if selected.is_empty() && managed_routes.is_empty() {
+        return Err(err(
+            "VALIDATION_ERROR",
+            "Select at least one adapter or choose app-managed routes to restore.",
+        ));
+    }
     Ok(
         json!({"interfaces":selected,"managedRoutes":managed_routes,"removeManagedRoutes":remove_routes}),
     )
@@ -1891,7 +2044,7 @@ fn windows_defaults_apply(state: State<AppState>, input: Value) -> AppResult<Val
         &payload,
     )?;
     require_admin()?;
-    capture_baseline(&state, json!({"windowsDefaults":true}))?;
+    capture_baseline(&state, json!({"windowsDefaults":payload.clone()}))?;
     let script = r#"$results=@();foreach($i in @($InputData.interfaces)){foreach($family in @('IPv4','IPv6')){try{Set-NetIPInterface -InterfaceIndex ([int]$i.interfaceIndex) -AddressFamily $family -AutomaticMetric Enabled -Confirm:$false -ErrorAction Stop;$results+=[PSCustomObject]@{interfaceIndex=$i.interfaceIndex;addressFamily=$family;status='success'}}catch{$results+=[PSCustomObject]@{interfaceIndex=$i.interfaceIndex;addressFamily=$family;status='skipped'}}}};$results|ConvertTo-Json -Compress"#;
     let metric_results = run_powershell_json(script, Some(&payload))?;
     let current_routes = get_routes()?;
@@ -2047,6 +2200,31 @@ mod tests {
             fingerprint(&json!({"a":1,"b":2})),
             fingerprint(&json!({"b":2,"a":1}))
         );
+    }
+    #[test]
+    fn recovery_keeps_failed_steps_visible() {
+        assert!(has_failed_result(
+            &json!({"results":[{"status":"success"},{"status":"failed"}]})
+        ));
+        assert!(!has_failed_result(
+            &json!({"results":[{"status":"success"},{"status":"skipped"}]})
+        ));
+    }
+    #[test]
+    fn scoped_undo_only_touches_affected_adapter() {
+        let target = json!({"interfaceIndex":7,"alias":"Wi-Fi"});
+        assert!(scope_touches_interface(
+            &json!({"metrics":[{"interfaceIndex":7}]}),
+            &target
+        ));
+        assert!(!scope_touches_interface(
+            &json!({"metrics":[{"interfaceIndex":8}]}),
+            &target
+        ));
+        assert!(scope_touches_interface(
+            &json!({"restoreProfile":"profile"}),
+            &target
+        ));
     }
     #[test]
     fn wifi_parser_handles_chinese() {

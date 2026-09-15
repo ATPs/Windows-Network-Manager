@@ -50,11 +50,29 @@ export class NetworkManagerApp extends LitElement {
     this.routeSearch = "";
     this.routeFamily = "IPv4";
     this.diagnostics = null;
+    this.operationResult = null;
+    this.adapterSearch = "";
+    this.refreshTimer = null;
+    this.onVisibilityChange = () => this.scheduleRefresh();
+    this.onKeydown = (event) => {
+      if (event.key === "Escape" && (this.confirmation || this.nameDialog)) {
+        this.closeConfirmation();
+        this.closeNameDialog();
+      }
+    };
   }
 
   connectedCallback() {
     super.connectedCallback();
+    document.addEventListener("visibilitychange", this.onVisibilityChange);
+    document.addEventListener("keydown", this.onKeydown);
     this.initialize();
+  }
+  disconnectedCallback() {
+    super.disconnectedCallback();
+    document.removeEventListener("visibilitychange", this.onVisibilityChange);
+    document.removeEventListener("keydown", this.onKeydown);
+    clearTimeout(this.refreshTimer);
   }
 
   t(key) {
@@ -79,6 +97,7 @@ export class NetworkManagerApp extends LitElement {
       this.applyTheme();
       this.requestUpdate();
       await this.refresh(["interfaces", "routes"]);
+      this.scheduleRefresh();
     } catch (error) {
       this.notify(errorMessage(error), "error");
     }
@@ -105,13 +124,23 @@ export class NetworkManagerApp extends LitElement {
     };
   }
 
-  async refresh(scopes = ["interfaces", "routes"], force = false) {
+  scheduleRefresh() {
+    clearTimeout(this.refreshTimer);
+    if (document.hidden) return;
+    this.refreshTimer = setTimeout(async () => {
+      await this.refresh(["interfaces", "routes"], false, true);
+      this.scheduleRefresh();
+    }, 15_000);
+  }
+
+  async refresh(scopes = ["interfaces", "routes"], force = false, quiet = false) {
     const key = `refresh:${scopes.sort().join(",")}`;
     if (this.isBusy(key)) return;
     this.setBusy(key, true);
     try {
       this.applyNetwork(await api.refresh(scopes, force));
-      this.message = { text: this.t("ready"), kind: "success" };
+      if (!quiet && !this.operationResult)
+        this.message = { text: this.t("ready"), kind: "success" };
       this.loadWifiProfiles();
     } catch (error) {
       this.notify(errorMessage(error), "error");
@@ -154,6 +183,14 @@ export class NetworkManagerApp extends LitElement {
     }
   }
 
+  async refreshConfig() {
+    this.config = { ...this.config, ...(await api.profiles()) };
+    this.requestUpdate();
+  }
+  async restartAsAdmin() {
+    await this.run("elevation", () => api.restartAsAdmin(), []);
+  }
+
   notify(text, kind = "info") {
     this.message = { text, kind };
     this.requestUpdate();
@@ -168,11 +205,14 @@ export class NetworkManagerApp extends LitElement {
     this.setBusy(key, true);
     try {
       const result = await task();
+      const failed = JSON.stringify(result || {}).includes('"status":"failed"') || result?.partial;
+      this.operationResult = result || { message: this.t("operationComplete") };
       this.notify(
-        result?.message || result?.summary || this.t("operationComplete"),
-        "success",
+        result?.message || result?.summary || (failed ? this.t("operationPartial") : this.t("operationComplete")),
+        failed ? "warning" : "success",
       );
-      if (scopes.length) await this.refresh(scopes, true);
+      if (scopes.length) await this.refresh(scopes, true, true);
+      await this.refreshConfig().catch(() => {});
       return result;
     } catch (error) {
       this.notify(errorMessage(error), "error");
@@ -222,14 +262,14 @@ export class NetworkManagerApp extends LitElement {
       return this.t("disabled");
     return item.wifi?.connected || item.defaultRoute
       ? this.t("connected")
-      : this.t("disconnected");
+      : this.t("available");
   }
 
   renderNav() {
     return html`<aside class="sidebar">
       <div class="brand">
         <span class="brand-mark">N</span>
-        <div><strong>Windows Network Manager</strong><small>v2.0</small></div>
+        <div><strong>Windows Network Manager</strong><small>v2.1.0</small></div>
       </div>
       <nav aria-label="Primary navigation">
         ${views.map(
@@ -281,7 +321,6 @@ export class NetworkManagerApp extends LitElement {
           class="status-pill ${this.privilege.isAdmin ? "success" : "neutral"}"
           >${this.privilege.isAdmin ? this.t("administrator") : this.t("standardUser")}</span
         >
-        ${!this.privilege.isAdmin ? html`<button class="secondary" @click=${() => api.restartAsAdmin()}>${this.t("restartAdmin")}</button>` : nothing}
         <button
           class="primary"
           ?disabled=${this.isBusy(refreshKey)}
@@ -289,13 +328,14 @@ export class NetworkManagerApp extends LitElement {
         >
           ${this.isBusy(refreshKey) ? this.t("refreshing") : this.t("refresh")}
         </button>
+        <details class="settings-menu"><summary>${this.t("settings")}</summary><label>${this.t("theme")}<select .value=${this.settings.theme} @change=${(event) => this.updateSettings({ theme: event.target.value })}><option value="system">${this.t("system")}</option><option value="light">${this.t("light")}</option><option value="dark">${this.t("dark")}</option></select></label><label>${this.t("language")}<select .value=${this.settings.language} @change=${(event) => this.updateSettings({ language: event.target.value })}><option value="en">English</option><option value="zh-CN">中文</option></select></label></details>
       </div>
     </header>`;
   }
 
   renderOverview() {
     const adapters = this.interfaces();
-    const active = adapters.find((item) => item.defaultRoute);
+    const active = adapters.find((item) => item.defaultRoute && String(item.adminStatus).toLowerCase() !== "down");
     const routes = this.network.routes?.routes || [];
     const manual = adapters.filter(
       (item) =>
@@ -312,7 +352,7 @@ export class NetworkManagerApp extends LitElement {
         <div>
           <p class="eyebrow">${this.t("activePath")}</p>
           <h2>${active ? active.alias : this.t("noActivePath")}</h2>
-          <p>${active?.wifi?.ssid || active?.description || "—"}</p>
+          <p>${active?.wifi?.ssid || active?.description || this.t("noActivePath")}</p>
         </div>
         <div class="hero-meta">
           <span class="status-pill ${active ? "success" : "neutral"}"
@@ -360,9 +400,10 @@ export class NetworkManagerApp extends LitElement {
           </button>
         </div>
         <div class="adapter-preview">
-          ${adapters.slice(0, 3).map((item) => html`<div><span class="status-dot ${item.defaultRoute || item.wifi?.connected ? "online" : ""}"></span><strong>${item.alias}</strong><span>${item.type} · ${this.connectionLabel(item)}</span></div>`)}
+          ${adapters.slice(0, 4).map((item) => html`<div><span class="status-dot ${item.defaultRoute || item.wifi?.connected ? "online" : ""}"></span><strong>${item.alias}</strong><span>${item.type} · ${this.connectionLabel(item)}</span></div>`)}
         </div>
       </section>
+      ${this.operationResult ? html`<section class="panel operation-result" aria-live="polite"><div class="section-heading"><div><p class="eyebrow">${this.t("lastOperation")}</p><h2>${this.operationResult.message || this.t("operationComplete")}</h2></div><button class="secondary compact" @click=${() => { this.operationResult = null; this.requestUpdate(); }}>${this.t("close")}</button></div><details><summary>${this.t("technicalDetails")}</summary><pre>${JSON.stringify(this.operationResult, null, 2)}</pre></details></section>` : nothing}
     </section>`;
   }
 
@@ -472,15 +513,9 @@ export class NetworkManagerApp extends LitElement {
                   const profileName = this.querySelector(
                     `#wifi-${item.interfaceIndex}`,
                   ).value;
-                  this.run(
-                    `wifi:${item.interfaceIndex}`,
-                    () =>
-                      api.connectWifi({
-                        interfaceName: item.alias,
-                        profileName,
-                      }),
-                    ["interfaces"],
-                  );
+                  this.run(`wifi-preview:${item.interfaceIndex}`, () => api.previewWifi({ interfaceName: item.alias, profileName, action: "connect" }), []).then((preview) => {
+                    if (preview) this.requestConfirmation([`${item.alias} · ${profileName}`, this.t("wifiConnectWarning"), ...(preview.warnings || [])], () => this.run(`wifi:${item.interfaceIndex}`, () => api.connectWifi(preview.wifi, preview.confirmationToken), ["interfaces"],), false);
+                  });
                 }}
               >
                 ${this.t("connect")}</button
@@ -488,21 +523,9 @@ export class NetworkManagerApp extends LitElement {
                 class="danger"
                 ?disabled=${!item.wifi.connected || this.isBusy(`wifi:${item.interfaceIndex}`)}
                 @click=${() => {
-                  const action = () =>
-                    this.run(
-                      `wifi:${item.interfaceIndex}`,
-                      () => api.disconnectWifi({ interfaceName: item.alias }),
-                      ["interfaces"],
-                    );
-                  if (item.defaultRoute)
-                    this.requestConfirmation(
-                      [
-                        `${item.alias} ${this.t("disconnect")}`,
-                        this.t("activePath"),
-                      ],
-                      action,
-                    );
-                  else action();
+                  this.run(`wifi-preview:${item.interfaceIndex}`, () => api.previewWifi({ interfaceName: item.alias, action: "disconnect" }), []).then((preview) => {
+                    if (preview) this.requestConfirmation([`${item.alias} ${this.t("disconnect")}`, ...(preview.warnings || [])], () => this.run(`wifi:${item.interfaceIndex}`, () => api.disconnectWifi(preview.wifi, preview.confirmationToken), ["interfaces"]));
+                  });
                 }}
               >
                 ${this.t("disconnect")}
@@ -524,7 +547,7 @@ export class NetworkManagerApp extends LitElement {
         <div class="metrics">
           ${this.renderMetric(item, "IPv4", "ipv4")}${this.renderMetric(item, "IPv6", "ipv6")}
         </div>
-        ${!item.systemInterface ? html`<div class="inline-controls"><span>${!this.privilege.isAdmin ? this.t("permissionHelp") : ""}</span><button class="secondary" ?disabled=${!this.privilege.isAdmin || !disabled || this.isBusy(adapterBusy)} @click=${() => this.adapterAction(item, "enable")}>${this.t("enable")}</button><button class="danger" ?disabled=${!this.privilege.isAdmin || disabled || this.isBusy(adapterBusy)} @click=${() => this.adapterAction(item, "disable")}>${this.t("disable")}</button></div>` : nothing}
+        ${!item.systemInterface ? html`<div class="inline-controls">${!this.privilege.isAdmin ? html`<span class="permission-note">${this.t("permissionHelp")}</span><button class="secondary compact" @click=${this.restartAsAdmin}>${this.t("restartAdmin")}</button>` : nothing}<button class="secondary" ?disabled=${!this.privilege.isAdmin || !disabled || this.isBusy(adapterBusy)} @click=${() => this.adapterAction(item, "enable")}>${this.t("enable")}</button><button class="danger" ?disabled=${!this.privilege.isAdmin || disabled || this.isBusy(adapterBusy)} @click=${() => this.adapterAction(item, "disable")}>${this.t("disable")}</button></div>` : nothing}
       </details>
     </article>`;
   }
@@ -553,8 +576,14 @@ export class NetworkManagerApp extends LitElement {
   }
 
   renderAdapters() {
+    const adapters = this.interfaces().filter((item) =>
+      `${item.alias} ${item.description} ${item.type}`
+        .toLowerCase()
+        .includes(this.adapterSearch.toLowerCase()),
+    );
     return html`<section class="view-stack">
       <div class="toolbar">
+        <label>${this.t("searchAdapters")}<input type="search" .value=${this.adapterSearch} @input=${(event) => { this.adapterSearch = event.target.value; this.requestUpdate(); }} /></label>
         <label class="toggle"
           ><input
             type="checkbox"
@@ -566,7 +595,7 @@ export class NetworkManagerApp extends LitElement {
         </button>
       </div>
       <div class="adapter-grid">
-        ${this.interfaces().map((item) => this.renderAdapter(item))}
+        ${adapters.length ? adapters.map((item) => this.renderAdapter(item)) : html`<p class="empty">${this.t("noAdapters")}</p>`}
       </div>
     </section>`;
   }
@@ -845,7 +874,10 @@ export class NetworkManagerApp extends LitElement {
                           ${this.t("restore")}</button
                         ><button
                           class="danger"
-                          @click=${() => this.run(`delete:${item.id}`, () => api.deleteProfile(item.id), [])}
+                          @click=${async () => {
+                            await this.run(`delete:${item.id}`, () => api.deleteProfile(item.id), []);
+                            await this.refreshConfig().catch(() => {});
+                          }}
                         >
                           ${this.t("delete")}
                         </button>
@@ -887,6 +919,11 @@ export class NetworkManagerApp extends LitElement {
   }
 
   renderDiagnostics() {
+    const changes = this.diagnostics?.changes || {};
+    const findings = [
+      ...(changes.interfaces || []).map((item) => `${item.alias || item.interfaceIndex}: ${this.t("configurationChange")}`),
+      ...(changes.staticRoutes || []).map((route) => `${route.destinationPrefix}: ${this.t("staticRouteFound")}`),
+    ];
     return html`<section class="view-stack">
       <div class="toolbar">
         <button
@@ -917,15 +954,14 @@ export class NetworkManagerApp extends LitElement {
           ${this.t("copyReport")}
         </button>
       </div>
-      <pre class="diagnostics">
-${this.diagnostics ? JSON.stringify(this.diagnostics, null, 2) : this.t("diagnosticsIdle")}</pre>
+      ${this.diagnostics ? html`<section class="panel"><h2>${this.t("diagnosticSummary")}</h2>${findings.length ? html`<ul class="findings">${findings.map((finding) => html`<li>${finding}</li>`)}</ul>` : html`<p>${this.t("noChanges")}</p>`}<details><summary>${this.t("technicalDetails")}</summary><pre class="diagnostics">${JSON.stringify(this.diagnostics, null, 2)}</pre></details></section>` : html`<p class="empty">${this.t("diagnosticsIdle")}</p>`}
     </section>`;
   }
 
   renderMaintenance() {
     return html`<section class="view-stack">
       <section class="panel danger-zone">
-        <h2>${this.t("resetBaseline")}</h2>
+        <h2>${this.t("undoLastChange")}</h2>
         <p>
           ${this.config.hasBaseline ? this.t("changes") : this.t("noBaseline")}
         </p>
@@ -939,12 +975,12 @@ ${this.diagnostics ? JSON.stringify(this.diagnostics, null, 2) : this.t("diagnos
               [],
             );
             if (preview)
-              this.requestConfirmation([this.t("resetBaseline")], () =>
+              this.requestConfirmation([this.t("undoLastChange"), ...Object.keys(preview.scope || {}).map((key) => `${this.t("affected")}: ${key}`)], () =>
                 this.run("reset", () => api.reset(preview.confirmationToken)),
               );
           }}
         >
-          ${this.t("resetBaseline")}
+          ${this.t("undoLastChange")}
         </button>
       </section>
       <section class="panel danger-zone">

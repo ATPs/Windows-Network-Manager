@@ -337,11 +337,12 @@ main {
 }
 .adapter-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
-  gap: 1rem;
+  grid-template-columns: 1fr;
+  gap: 0.65rem;
 }
 .adapter-card {
-  padding: 1rem;
+  padding: 0.9rem 1rem;
+  box-shadow: none;
 }
 .adapter-top {
   display: flex;
@@ -379,6 +380,10 @@ main {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.6rem;
   margin: 1rem 0;
+}
+.adapter-card > .adapter-facts {
+  margin: 0.65rem 0 0;
+  grid-template-columns: minmax(12rem, 1.25fr) minmax(10rem, 1fr) auto;
 }
 .adapter-facts span,
 .details-grid span {
@@ -516,6 +521,44 @@ th {
   background: var(--surface);
   white-space: pre-wrap;
 }
+.findings {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0.8rem 0 1rem;
+  padding-left: 1.35rem;
+}
+.operation-result pre,
+.diagnostics {
+  font-size: 0.78rem;
+}
+.settings-menu {
+  position: relative;
+}
+.settings-menu summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 650;
+}
+.settings-menu[open] {
+  position: absolute;
+  z-index: 5;
+  right: 0;
+  top: 2.6rem;
+  display: grid;
+  gap: 0.5rem;
+  min-width: 12rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+.settings-menu label {
+  display: grid;
+  gap: 0.25rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
 .danger-zone {
   border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
   display: grid;
@@ -650,6 +693,9 @@ th {
     grid-template-columns: 1fr;
   }
   .adapter-facts {
+    grid-template-columns: 1fr;
+  }
+  .adapter-card > .adapter-facts {
     grid-template-columns: 1fr;
   }
   .inline-controls {

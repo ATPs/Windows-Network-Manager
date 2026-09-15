@@ -13,9 +13,9 @@ Windows Network Manager is a Windows 11 desktop application for inspecting and c
 - Lists saved Wi-Fi profiles per wireless adapter and can request a connect or disconnect without reading, storing, or creating Wi-Fi passwords.
 - Displays IPv4 and IPv6 routes with filtering and a concise summary of manual metrics, static routes, and disabled adapters.
 - Safely previews and applies IPv4 route and Metric changes after explicit confirmation.
-- Shows the application version in the header, lets administrators edit Route Metric on listed routes, fully edit eligible IPv4 static routes, and enable or disable eligible non-system adapters after an explicit confirmation.
-- Stores a pre-change baseline, ten de-duplicated recent snapshots, named configuration data, and JSON import/export data in the Tauri application-data directory.
-- Offers both **Reset to pre-change baseline** and **Restore Windows defaults**. Windows defaults enables AutomaticMetric and removes only routes this application recorded as managed; it does not reset Winsock, reinstall network components, or remove unknown system routes.
+- Shows the application version, default-route candidates, connection freshness, and compact expandable adapter details. Administrators can change interface Metric, add or remove eligible IPv4 routes, and enable or disable eligible non-system adapters after an explicit confirmation.
+- Stores one scoped **Undo last app change** recovery point, ten de-duplicated recent snapshots, and named configuration data in the Tauri application-data directory. Import/export and route editing are not currently available.
+- Offers both **Undo last app change** and **Restore Windows defaults**. Undo keeps its recovery point when one or more steps fail. Windows defaults enables AutomaticMetric only for explicitly selected adapters and removes only routes this application recorded as managed; it does not reset Winsock, reinstall network components, or remove unknown system routes.
 - Includes English and Chinese UI languages, safe diagnostics, and a standard Windows UAC restart-as-administrator option.
 
 The interface is designed for Windows 11 and only invokes structured PowerShell networking cmdlets and `netsh.exe` from Rust. The web frontend receives narrow Tauri commands only; it cannot invoke arbitrary PowerShell, shell commands, Node.js, or filesystem APIs.
@@ -24,7 +24,7 @@ The interface is designed for Windows 11 and only invokes structured PowerShell 
 
 The first version does not edit static IP addresses, gateway addresses, DNS, proxy settings, firewall rules, drivers, credentials, or adapter binding order. It does not implement bandwidth aggregation, load balancing, app-based routing, hotspots, or Internet Connection Sharing.
 
-Network writes can interrupt connectivity. Wi-Fi operations, Metric changes, route edits, baseline restoration, and Windows-default restoration always require a user action and confirmation. Metric and route operations also require an elevated process. The application never automatically performs network writes during startup, refresh, diagnostics, development, or tests.
+Network writes can interrupt connectivity. Wi-Fi operations, Metric changes, route changes, undo, and Windows-default restoration always require a user action and confirmation. Metric and route operations also require an elevated process. The application never automatically performs network writes during startup, refresh, diagnostics, development, or tests.
 
 The UAC button restarts the application using the normal Windows elevation prompt. It does not bypass UAC or store administrator credentials.
 
@@ -77,6 +77,6 @@ User configurations remain in the Windows application-data directory and are nev
 
 ## Stored data and recovery
 
-Configuration is stored as `network-profiles.json` under the Tauri application-data directory, not in the repository. The file contains UI preferences, named configurations, the last ten unique snapshots, one pre-change baseline, and identifiers of app-managed routes. It never contains Wi-Fi passwords, VPN passwords, or Windows credentials.
+Configuration is stored as `network-profiles.json` under the Tauri application-data directory, not in the repository. The file contains UI preferences, named configurations, the last ten unique snapshots, one scoped recovery point, and identifiers of app-managed routes. It never contains Wi-Fi passwords, VPN passwords, or Windows credentials.
 
 Snapshots are normalized and hashed. Saving an identical snapshot moves the existing record to the top instead of creating a duplicate. Restoring a snapshot applies the captured Metric state, the recorded Wi-Fi connection state, and only routes tracked as application-managed; it reports individual success, failure, and skipped results.
