@@ -1,4 +1,5 @@
 import { LitElement, html, nothing } from "lit";
+import { keyed } from "lit/directives/keyed.js";
 import { api } from "./api.js";
 import { copy } from "./i18n.js";
 
@@ -49,6 +50,7 @@ export class NetworkManagerApp extends LitElement {
     this.nameDialog = null;
     this.routeSearch = "";
     this.routeFamily = "IPv4";
+    this.editingRoute = null;
     this.diagnostics = null;
     this.operationResult = null;
     this.adapterSearch = "";
@@ -269,7 +271,7 @@ export class NetworkManagerApp extends LitElement {
     return html`<aside class="sidebar">
       <div class="brand">
         <span class="brand-mark">N</span>
-        <div><strong>Windows Network Manager</strong><small>v2.1.1</small></div>
+        <div><strong>Windows Network Manager</strong><small>v2.1.3</small></div>
       </div>
       <nav aria-label="Primary navigation">
         ${views.map(
@@ -613,26 +615,62 @@ export class NetworkManagerApp extends LitElement {
       routeMetric: data.get("routeMetric"),
       persistent: data.get("persistent") === "on",
     };
+    const original = this.editingRoute;
+    const key = original ? "route:edit" : "route:add";
     const preview = await this.run(
-      "route:add",
-      () => api.previewRoute(input),
+      key,
+      () => original ? api.previewEditRoute(original, input) : api.previewRoute(input),
       [],
     );
+    if (preview?.unchanged) return this.notify(this.t("routeUnchanged"));
     if (preview)
       this.requestConfirmation(
         [
-          `${preview.route.destinationPrefix} → ${preview.route.nextHop}`,
+          ...(original ? [this.routeDescription(preview.oldRoute)] : []),
+          this.routeDescription(preview.route),
           ...(preview.warnings || []),
         ],
-        () =>
-          this.run("route:add", () =>
-            api.addRoute(preview.route, preview.confirmationToken),
-          ),
+        async () => {
+          const result = await this.run(key, () => original
+            ? api.editRoute(preview.oldRoute, preview.route, preview.confirmationToken)
+            : api.addRoute(preview.route, preview.confirmationToken));
+          if (result && original) {
+            this.editingRoute = null;
+            this.requestUpdate();
+          }
+        },
+      );
+  }
+
+  routeDescription(route) {
+    return `${route.destinationPrefix} → ${route.nextHop} · #${route.interfaceIndex} · ${this.t("metric")} ${route.routeMetric} · ${route.persistent ? this.t("persistent") : "Temporary"}`;
+  }
+
+  routeBusy() {
+    return [...this.busy].some((key) => key.startsWith("route:"));
+  }
+
+  async startRouteEdit(route) {
+    this.editingRoute = { ...route };
+    this.requestUpdate();
+    await this.updateComplete;
+    this.querySelector(".route-form")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    this.querySelector('[name="destinationPrefix"]')?.focus({ preventScroll: true });
+  }
+
+  async makePersistent(route) {
+    const key = `route:persist:${route.destinationPrefix}:${route.interfaceIndex}:${route.nextHop}`;
+    const preview = await this.run(key, () => api.previewPersistRoute(route), []);
+    if (preview)
+      this.requestConfirmation(
+        [`${preview.route.destinationPrefix} → ${preview.route.nextHop}`, ...(preview.warnings || [])],
+        () => this.run(key, () => api.persistRoute(preview.route, preview.confirmationToken)),
       );
   }
 
   renderRoutes() {
     const rows = this.routeRows();
+    const routeInterfaces = this.interfaces().filter((item) => item.metrics?.ipv4);
     return html`<section class="view-stack">
       <div class="toolbar route-filters">
         <label
@@ -695,7 +733,9 @@ export class NetworkManagerApp extends LitElement {
                           ${route.persistent ? "Persistent" : "Temporary"}${route.systemManaged ? " / System" : ""}
                         </td>
                         <td>
-                          ${route.removable ? html`<button class="danger compact" ?disabled=${!this.privilege.isAdmin || this.isBusy(`route:remove:${route.destinationPrefix}`)} @click=${() => this.removeRoute(route)}>${this.t("remove")}</button>` : "—"}
+                          ${route.removable ? html`<button class="secondary compact" ?disabled=${!this.privilege.isAdmin || this.routeBusy()} @click=${() => this.startRouteEdit(route)}>${this.t("edit")}</button>` : nothing}
+                          ${route.removable && !route.persistent ? html`<button class="secondary compact" ?disabled=${!this.privilege.isAdmin || this.routeBusy()} @click=${() => this.makePersistent(route)}>${this.t("makePersistent")}</button>` : nothing}
+                          ${route.removable ? html`<button class="danger compact" ?disabled=${!this.privilege.isAdmin || this.routeBusy()} @click=${() => this.removeRoute(route)}>${this.t("remove")}</button>` : "—"}
                         </td>
                       </tr>`,
                   )
@@ -706,25 +746,29 @@ export class NetworkManagerApp extends LitElement {
           </tbody>
         </table>
       </div>
-      <form class="panel route-form" @submit=${this.addRoute}>
-        <h2>${this.t("addRoute")}</h2>
+      ${keyed(this.editingRoute, html`<form class="panel route-form" @submit=${this.addRoute}>
+        <h2>${this.t(this.editingRoute ? "editRoute" : "addRoute")}</h2>
         <label
           >${this.t("destination")}<input
             name="destinationPrefix"
+            .value=${this.editingRoute?.destinationPrefix || ""}
             placeholder="172.16.0.0/12"
             required /></label
         ><label
           >${this.t("nextHop")}<input
             name="nextHop"
+            .value=${this.editingRoute?.nextHop || ""}
             placeholder="192.168.3.1"
             required /></label
         ><label
           >${this.t("interface")}<select name="interfaceIndex">
-            ${this.interfaces()
-              .filter((item) => item.metrics?.ipv4)
+            ${this.editingRoute && !routeInterfaces.some((item) => item.interfaceIndex === this.editingRoute.interfaceIndex)
+              ? html`<option value=${this.editingRoute.interfaceIndex} selected>${this.editingRoute.interfaceAlias || this.t("interface")} (#${this.editingRoute.interfaceIndex})</option>`
+              : nothing}
+            ${routeInterfaces
               .map(
                 (item) =>
-                  html`<option value=${item.interfaceIndex}>
+                  html`<option value=${item.interfaceIndex} ?selected=${this.editingRoute?.interfaceIndex === item.interfaceIndex}>
                     ${item.alias} (#${item.interfaceIndex})
                   </option>`,
               )}
@@ -732,23 +776,26 @@ export class NetworkManagerApp extends LitElement {
         ><label
           >${this.t("metric")}<input
             name="routeMetric"
+            title=${this.t("routeMetricHelp")}
             type="number"
             min="1"
             max="9999"
-            value="5"
+            .value=${String(this.editingRoute?.routeMetric ?? 5)}
             required /></label
         ><label class="toggle"
           ><input
             name="persistent"
             type="checkbox"
+            .checked=${Boolean(this.editingRoute?.persistent)}
           />${this.t("persistent")}</label
         ><button
           class="primary"
-          ?disabled=${!this.privilege.isAdmin || this.isBusy("route:add")}
+          ?disabled=${!this.privilege.isAdmin || this.routeBusy()}
         >
-          ${this.isBusy("route:add") ? this.t("working") : this.t("addRoute")}</button
-        >${!this.privilege.isAdmin ? html`<p class="permission-note">${this.t("permissionHelp")}</p>` : nothing}
-      </form>
+          ${this.routeBusy() ? this.t("working") : this.t(this.editingRoute ? "saveRoute" : "addRoute")}</button
+        >${this.editingRoute ? html`<button type="button" class="secondary" ?disabled=${this.routeBusy()} @click=${() => { this.editingRoute = null; this.requestUpdate(); }}>${this.t("cancel")}</button>` : nothing}
+        ${!this.privilege.isAdmin ? html`<p class="permission-note">${this.t("permissionHelp")}</p>` : nothing}
+      </form>`)}
     </section>`;
   }
 

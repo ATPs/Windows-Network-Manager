@@ -20,6 +20,13 @@ export const api = {
   previewRoute: (input) => call("preview_add_route", { input }),
   addRoute: (route, confirmationToken) =>
     call("add_route", { input: { route, confirmationToken } }),
+  previewEditRoute: (originalRoute, route) =>
+    call("preview_edit_route", { input: { originalRoute, route } }),
+  editRoute: (originalRoute, route, confirmationToken) =>
+    call("edit_route", { input: { originalRoute, route, confirmationToken } }),
+  previewPersistRoute: (route) => call("preview_persist_route", { route }),
+  persistRoute: (route, confirmationToken) =>
+    call("persist_route", { input: { route, confirmationToken } }),
   previewRemoveRoute: (route) => call("preview_remove_route", { route }),
   removeRoute: (route, confirmationToken) =>
     call("remove_route", { input: { route, confirmationToken } }),

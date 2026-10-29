@@ -13,8 +13,10 @@ Windows Network Manager is a Windows 11 desktop application for inspecting and c
 - Lists saved Wi-Fi profiles per wireless adapter and can request a connect or disconnect without reading, storing, or creating Wi-Fi passwords.
 - Displays IPv4 and IPv6 routes with filtering and a concise summary of manual metrics, static routes, and disabled adapters.
 - Safely previews and applies IPv4 route and Metric changes after explicit confirmation.
+- Converts eligible temporary static IPv4 routes with **Make persistent** in the Routes table. Conversion briefly replaces the route, preserves its gateway/interface/Metric, and attempts to restore the temporary route on failure. **Undo last app change** restores the previous temporary route.
+- Offers **Edit** on eligible manual IPv4 routes. The form fills in the current destination, gateway, interface, route Metric, and persistence; saving previews the changes and records an undo point. Failed edits attempt to restore the original route.
 - Shows the application version, default-route candidates, connection freshness, and compact expandable adapter details. Administrators can change interface Metric, add or remove eligible IPv4 routes, and enable or disable eligible non-system adapters after an explicit confirmation.
-- Stores one scoped **Undo last app change** recovery point, ten de-duplicated recent snapshots, and named configuration data in the Tauri application-data directory. Import/export and route editing are not currently available.
+- Stores one scoped **Undo last app change** recovery point, ten de-duplicated recent snapshots, and named configuration data in the Tauri application-data directory. Import/export is not currently available.
 - Offers both **Undo last app change** and **Restore Windows defaults**. Undo keeps its recovery point when one or more steps fail. Windows defaults enables AutomaticMetric only for explicitly selected adapters and removes only routes this application recorded as managed; it does not reset Winsock, reinstall network components, or remove unknown system routes.
 - Includes English and Chinese UI languages, safe diagnostics, and a standard Windows UAC restart-as-administrator option.
 

@@ -185,6 +185,23 @@ $Metrics=@(Get-NetIPInterface | ForEach-Object { [PSCustomObject]@{ addressFamil
 [PSCustomObject]@{active=$Active;persistent=$Persistent;metrics=$Metrics}|ConvertTo-Json -Compress -Depth 5
 "#;
 
+// New-NetRoute defaults to both stores. Explicit PersistentStore is unsupported.
+const ADD_ROUTE_SCRIPT: &str = r#"
+$p=@{
+    AddressFamily='IPv4'
+    DestinationPrefix=[string]$InputData.destinationPrefix
+    NextHop=[string]$InputData.nextHop
+    InterfaceIndex=[int]$InputData.interfaceIndex
+    RouteMetric=[int]$InputData.routeMetric
+    Confirm=$false
+    ErrorAction='Stop'
+}
+$s='PersistentStore'
+if(-not $InputData.persistent){$p.PolicyStore='ActiveStore';$s='ActiveStore'}
+New-NetRoute @p | Out-Null
+[PSCustomObject]@{created=$true;policyStore=$s}|ConvertTo-Json -Compress
+"#;
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -214,6 +231,10 @@ pub fn run() {
             apply_metric_change,
             preview_add_route,
             add_route,
+            preview_edit_route,
+            edit_route,
+            preview_persist_route,
+            persist_route,
             preview_remove_route,
             remove_route,
             preview_adapter_control,
@@ -248,7 +269,7 @@ fn wide_null(value: &OsStr) -> Vec<u16> {
 fn run_powershell_json(script: &str, input: Option<&Value>) -> AppResult<Value> {
     let prefix = "$ErrorActionPreference='Stop';[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);$OutputEncoding=[Console]::OutputEncoding;$InputData=$null;if($env:WNM_INPUT_BASE64){$InputData=([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:WNM_INPUT_BASE64))|ConvertFrom-Json);}";
     let encoded = BASE64.encode(
-        format!("{}\n{}", prefix, script)
+        format!("{}\ntry {{\n{}\n}} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 1 }}", prefix, script)
             .encode_utf16()
             .flat_map(|x| x.to_le_bytes())
             .collect::<Vec<_>>(),
@@ -280,10 +301,15 @@ fn run_powershell_json(script: &str, input: Option<&Value>) -> AppResult<Value> 
         )
     })?;
     if !output.status.success() {
+        let reason = sanitize(&String::from_utf8_lossy(&output.stderr));
         return Err(err_with(
             "COMMAND_FAILED",
-            "Windows command failed.",
-            json!({"stderr":sanitize(&String::from_utf8_lossy(&output.stderr)),"exitCode":output.status.code()}),
+            if reason.is_empty() {
+                "Windows command failed.".to_string()
+            } else {
+                format!("Windows command failed: {reason}")
+            },
+            json!({"stderr":reason,"exitCode":output.status.code()}),
         ));
     }
     let text = String::from_utf8_lossy(&output.stdout)
@@ -1065,6 +1091,17 @@ fn is_removable_route(route: &Value) -> bool {
         .and_then(Value::as_bool)
         .unwrap_or(false)
 }
+fn persistable_route_payload(route: &Value) -> AppResult<Value> {
+    if !is_removable_route(route) || field_bool(route, "persistent") {
+        return Err(err(
+            "VALIDATION_ERROR",
+            "Only temporary static IPv4 routes can be made persistent.",
+        ));
+    }
+    let mut payload = route_payload(route)?;
+    payload["persistent"] = json!(true);
+    Ok(payload)
+}
 fn route_remove_payload(route: &Value) -> Value {
     json!({"addressFamily":field_string(route,"addressFamily"),"destinationPrefix":field_string(route,"destinationPrefix"),"nextHop":field_string(route,"nextHop"),"interfaceIndex":field_i64(route,"interfaceIndex"),"routeMetric":field_i64(route,"routeMetric"),"persistent":route.get("persistent").and_then(Value::as_bool).unwrap_or(false),"policyStores":route.get("policyStores").cloned().unwrap_or(json!(["ActiveStore"]))})
 }
@@ -1101,7 +1138,7 @@ fn route_payload(input: &Value) -> AppResult<Value> {
     let index = valid_index(input.get("interfaceIndex").unwrap_or(&Value::Null))?;
     let metric = valid_metric(input.get("routeMetric").unwrap_or(&Value::Null))?;
     Ok(
-        json!({"destinationPrefix":destination,"nextHop":next,"interfaceIndex":index,"routeMetric":metric,"persistent":input.get("persistent").and_then(Value::as_bool).unwrap_or(false),"note":input.get("note").and_then(Value::as_str).unwrap_or("")}),
+        json!({"addressFamily":"IPv4","destinationPrefix":destination,"nextHop":next,"interfaceIndex":index,"routeMetric":metric,"persistent":input.get("persistent").and_then(Value::as_bool).unwrap_or(false),"note":input.get("note").and_then(Value::as_str).unwrap_or("")}),
     )
 }
 fn capture_baseline(state: &State<AppState>, scope: Value) -> AppResult<()> {
@@ -1223,8 +1260,7 @@ fn add_route(state: State<AppState>, input: Value) -> AppResult<Value> {
     consume_confirmation(&state, token, "add-route", &payload)?;
     require_admin()?;
     capture_baseline(&state, json!({"addRoute":payload.clone()}))?;
-    let script = r#"$s=if($InputData.persistent){'PersistentStore'}else{'ActiveStore'};New-NetRoute -AddressFamily IPv4 -DestinationPrefix ([string]$InputData.destinationPrefix) -NextHop ([string]$InputData.nextHop) -InterfaceIndex ([int]$InputData.interfaceIndex) -RouteMetric ([int]$InputData.routeMetric) -PolicyStore $s -Confirm:$false -ErrorAction Stop;[PSCustomObject]@{created=$true;policyStore=$s}|ConvertTo-Json -Compress"#;
-    let result = run_powershell_json(script, Some(&payload))?;
+    let result = add_route_record(&payload)?;
     let mut cfg = config(&state);
     if payload
         .get("persistent")
@@ -1233,6 +1269,204 @@ fn add_route(state: State<AppState>, input: Value) -> AppResult<Value> {
         || true
     {
         cfg.managed_routes.push(json!({"addressFamily":"IPv4","destinationPrefix":field_string(&payload,"destinationPrefix"),"nextHop":field_string(&payload,"nextHop"),"interfaceIndex":field_i64(&payload,"interfaceIndex")}));
+    }
+    persist(&state, &cfg)?;
+    Ok(result)
+}
+fn prepare_route_edit(routes: &[Value], original: &Value, input: &Value) -> AppResult<Value> {
+    let target = routes
+        .iter()
+        .find(|r| route_key(r) == route_key(original))
+        .ok_or_else(|| {
+            err(
+                "NOT_FOUND",
+                "Route no longer exists. Refresh the route table.",
+            )
+        })?;
+    if !is_removable_route(target) {
+        return Err(err(
+            "VALIDATION_ERROR",
+            "Only manual non-default IPv4 routes can be edited.",
+        ));
+    }
+    let replacement = route_payload(input)?;
+    let destination = field_string(&replacement, "destinationPrefix");
+    let first_octet = destination
+        .split('.')
+        .next()
+        .and_then(|v| v.parse::<u8>().ok())
+        .unwrap_or(255);
+    if destination == "0.0.0.0/0"
+        || first_octet >= 224
+        || field_string(&replacement, "nextHop") == "0.0.0.0"
+    {
+        return Err(err(
+            "VALIDATION_ERROR",
+            "Editing into a default, on-link, or multicast route is not supported.",
+        ));
+    }
+    if route_key(target) != route_key(&replacement)
+        && routes
+            .iter()
+            .any(|r| route_key(r) == route_key(&replacement))
+    {
+        return Err(err(
+            "CONFLICT",
+            "Another route already uses this destination, gateway, and interface.",
+        ));
+    }
+    Ok(json!({"oldRoute":route_remove_payload(target),"route":replacement,"mode":"replace"}))
+}
+fn route_edit_unchanged(payload: &Value) -> bool {
+    let old = &payload["oldRoute"];
+    let new = &payload["route"];
+    route_key(old) == route_key(new)
+        && field_i64(old, "routeMetric") == field_i64(new, "routeMetric")
+        && field_bool(old, "persistent") == field_bool(new, "persistent")
+}
+fn edit_route_script() -> String {
+    format!(
+        r#"
+function Add-EditedRoute($record) {{
+    $InputData=$record
+    & {{ {ADD_ROUTE_SCRIPT} }} | Out-Null
+}}
+function Remove-EditedRoute($record, $stores) {{
+    foreach($store in $stores){{
+        $existing=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix ([string]$record.destinationPrefix) -NextHop ([string]$record.nextHop) -InterfaceIndex ([int]$record.interfaceIndex) -PolicyStore $store -ErrorAction SilentlyContinue)
+        if($existing.Count -gt 0){{
+            Remove-NetRoute -AddressFamily IPv4 -DestinationPrefix ([string]$record.destinationPrefix) -NextHop ([string]$record.nextHop) -InterfaceIndex ([int]$record.interfaceIndex) -PolicyStore $store -Confirm:$false -ErrorAction Stop
+        }}
+    }}
+}}
+$old=$InputData.oldRoute
+$new=$InputData.route
+try {{
+    Remove-EditedRoute $old @($old.policyStores)
+    Add-EditedRoute $new
+}} catch {{
+    $failure=$_.Exception.Message
+    try {{
+        Remove-EditedRoute $new @('PersistentStore','ActiveStore')
+        Remove-EditedRoute $old @('PersistentStore','ActiveStore')
+        Add-EditedRoute $old
+    }} catch {{ throw "Route edit failed: $failure. Restoring the original route also failed: $($_.Exception.Message). Use Undo last app change to recover." }}
+    throw "Route edit failed: $failure. The original route was restored."
+}}
+[PSCustomObject]@{{edited=$true}}|ConvertTo-Json -Compress
+"#
+    )
+}
+#[tauri::command]
+fn preview_edit_route(state: State<AppState>, input: Value) -> AppResult<Value> {
+    let routes = get_routes()?;
+    let payload = prepare_route_edit(
+        &arrays(routes.get("routes")),
+        &input["originalRoute"],
+        &input["route"],
+    )?;
+    let unchanged = route_edit_unchanged(&payload);
+    let token = if unchanged {
+        None
+    } else {
+        Some(issue_confirmation(&state, "edit-route", &payload)?)
+    };
+    Ok(
+        json!({"oldRoute":payload["oldRoute"],"route":payload["route"],"unchanged":unchanged,"warnings":["The old route will be briefly replaced. Connectivity may be interrupted. The app will try to restore the original route if the edit fails."],"confirmationToken":token}),
+    )
+}
+#[tauri::command]
+fn edit_route(state: State<AppState>, input: Value) -> AppResult<Value> {
+    let routes = get_routes()?;
+    let payload = prepare_route_edit(
+        &arrays(routes.get("routes")),
+        &input["originalRoute"],
+        &input["route"],
+    )?;
+    consume_confirmation(
+        &state,
+        input
+            .get("confirmationToken")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        "edit-route",
+        &payload,
+    )?;
+    require_admin()?;
+    capture_baseline(&state, json!({"editRoute":payload}))?;
+    let result = run_powershell_json(&edit_route_script(), Some(&payload))?;
+    let mut cfg = config(&state);
+    cfg.managed_routes.retain(|r| {
+        route_key(r) != route_key(&payload["oldRoute"])
+            && route_key(r) != route_key(&payload["route"])
+    });
+    cfg.managed_routes.push(payload["route"].clone());
+    persist(&state, &cfg)?;
+    Ok(result)
+}
+fn temporary_route(requested: &Value) -> AppResult<Value> {
+    let target = arrays(get_routes()?.get("routes"))
+        .into_iter()
+        .find(|r| route_key(r) == route_key(requested))
+        .ok_or_else(|| err("NOT_FOUND", "Route no longer exists."))?;
+    persistable_route_payload(&target)?;
+    Ok(target)
+}
+#[tauri::command]
+fn preview_persist_route(state: State<AppState>, route: Value) -> AppResult<Value> {
+    let target = temporary_route(&route)?;
+    let payload = persistable_route_payload(&target)?;
+    Ok(
+        json!({"route":payload,"warnings":["The route will be briefly replaced and saved across restarts. If creation fails, the app will try to restore the temporary route."],"confirmationToken":issue_confirmation(&state,"persist-route",&payload)?}),
+    )
+}
+fn persist_route_script() -> String {
+    // Recreate with the default stores; restore the active route on failure.
+    format!(
+        r#"
+Remove-NetRoute -AddressFamily IPv4 -DestinationPrefix ([string]$InputData.destinationPrefix) -NextHop ([string]$InputData.nextHop) -InterfaceIndex ([int]$InputData.interfaceIndex) -PolicyStore ActiveStore -Confirm:$false -ErrorAction Stop
+try {{
+{ADD_ROUTE_SCRIPT}
+}} catch {{
+    $failure=$_.Exception.Message
+    try {{
+        $active=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix ([string]$InputData.destinationPrefix) -NextHop ([string]$InputData.nextHop) -InterfaceIndex ([int]$InputData.interfaceIndex) -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
+        if($active.Count -eq 0){{
+            $InputData.persistent=$false
+            & {{ {ADD_ROUTE_SCRIPT} }} | Out-Null
+        }}
+    }} catch {{ throw "Could not make the route persistent: $failure. Restoring the temporary route also failed: $($_.Exception.Message). Use Reset to pre-change baseline." }}
+    throw "Could not make the route persistent: $failure. The temporary route remains active."
+}}
+"#
+    )
+}
+#[tauri::command]
+fn persist_route(state: State<AppState>, input: Value) -> AppResult<Value> {
+    let target = temporary_route(input.get("route").unwrap_or(&input))?;
+    let payload = persistable_route_payload(&target)?;
+    consume_confirmation(
+        &state,
+        input
+            .get("confirmationToken")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+        "persist-route",
+        &payload,
+    )?;
+    require_admin()?;
+    capture_baseline(
+        &state,
+        json!({"editRoute":{"oldRoute":target,"route":payload,"mode":"persistence"}}),
+    )?;
+    let result = run_powershell_json(&persist_route_script(), Some(&payload))?;
+    let mut cfg = config(&state);
+    if !cfg
+        .managed_routes
+        .iter()
+        .any(|r| route_key(r) == route_key(&target))
+    {
+        cfg.managed_routes.push(target);
     }
     persist(&state, &cfg)?;
     Ok(result)
@@ -1648,8 +1882,7 @@ fn update_route_metric_record(route: &Value) -> AppResult<Value> {
     run_powershell_json(script, Some(route))
 }
 fn add_route_record(route: &Value) -> AppResult<Value> {
-    let script = r#"$s=if($InputData.persistent){'PersistentStore'}else{'ActiveStore'};New-NetRoute -AddressFamily IPv4 -DestinationPrefix ([string]$InputData.destinationPrefix) -NextHop ([string]$InputData.nextHop) -InterfaceIndex ([int]$InputData.interfaceIndex) -RouteMetric ([int]$InputData.routeMetric) -PolicyStore $s -Confirm:$false -ErrorAction Stop;[PSCustomObject]@{created=$true;policyStore=$s}|ConvertTo-Json -Compress"#;
-    run_powershell_json(script, Some(route))
+    run_powershell_json(ADD_ROUTE_SCRIPT, Some(route))
 }
 fn restore_route_scope(scope: &Value) -> AppResult<Value> {
     let current = get_routes()?;
@@ -2149,6 +2382,228 @@ fn restart_as_administrator(app: AppHandle) -> AppResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn route_edit_validation_and_live_state_are_checked() {
+        let old = json!({"addressFamily":"IPv4","destinationPrefix":"172.16.0.0/12","nextHop":"192.168.3.1","interfaceIndex":26,"routeMetric":5,"persistent":false,"removable":true,"policyStores":["ActiveStore"]});
+        let routes = vec![old.clone()];
+        let unchanged = prepare_route_edit(&routes, &old, &old).unwrap();
+        assert!(route_edit_unchanged(&unchanged));
+        let mut changed = old.clone();
+        changed["destinationPrefix"] = json!("172.20.1.2/16");
+        changed["routeMetric"] = json!(9);
+        changed["persistent"] = json!(true);
+        let payload = prepare_route_edit(&routes, &old, &changed).unwrap();
+        assert_eq!(payload["route"]["destinationPrefix"], "172.20.0.0/16");
+        assert!(!route_edit_unchanged(&payload));
+        let mut live = old.clone();
+        live["routeMetric"] = json!(7);
+        assert_ne!(
+            fingerprint(&payload),
+            fingerprint(&prepare_route_edit(&[live], &old, &changed).unwrap())
+        );
+        let mut duplicate = payload["route"].clone();
+        duplicate["removable"] = json!(true);
+        assert!(prepare_route_edit(&[old.clone(), duplicate], &old, &changed).is_err());
+        assert!(prepare_route_edit(&[], &old, &changed).is_err());
+        let mut protected = old.clone();
+        protected["removable"] = json!(false);
+        assert!(prepare_route_edit(&[protected], &old, &changed).is_err());
+        for (field, value) in [
+            ("nextHop", json!("0.0.0.0")),
+            ("destinationPrefix", json!("0.0.0.0/0")),
+            ("destinationPrefix", json!("224.0.0.0/4")),
+            ("routeMetric", json!(0)),
+        ] {
+            let mut invalid = changed.clone();
+            invalid[field] = value;
+            assert!(prepare_route_edit(&routes, &old, &invalid).is_err());
+        }
+    }
+    #[test]
+    fn route_edits_roll_back_creation_and_partial_removal_failures() {
+        // All Windows networking cmdlets used by the script are shadowed.
+        let mock = r#"
+$script:failNew=[bool]$InputData.failNew
+$script:failRemove=[bool]$InputData.failRemove
+$script:failRestore=[bool]$InputData.failRestore
+$script:routes=@{}
+function Mock-Key($prefix,$hop,$idx,$store){"$prefix|$hop|$idx|$store"}
+foreach($store in $InputData.oldRoute.policyStores){
+    $script:routes[(Mock-Key $InputData.oldRoute.destinationPrefix $InputData.oldRoute.nextHop $InputData.oldRoute.interfaceIndex $store)]=[int]$InputData.oldRoute.routeMetric
+}
+function Mock-Snapshot { @($script:routes.GetEnumerator()|Sort-Object Key|ForEach-Object {"$($_.Key)=$($_.Value)"}) -join ';' }
+$script:original=Mock-Snapshot
+function Get-NetRoute {
+    [CmdletBinding()] param($AddressFamily,$DestinationPrefix,$NextHop,$InterfaceIndex,$PolicyStore)
+    $key=Mock-Key $DestinationPrefix $NextHop $InterfaceIndex $PolicyStore
+    if($script:routes.ContainsKey($key)){[PSCustomObject]@{RouteMetric=$script:routes[$key]}}
+}
+function Remove-NetRoute {
+    [CmdletBinding(SupportsShouldProcess=$true)] param($AddressFamily,$DestinationPrefix,$NextHop,$InterfaceIndex,$PolicyStore)
+    if($PolicyStore -eq 'PersistentStore' -and $script:failRemove){$script:failRemove=$false;throw 'Simulated removal failure'}
+    $script:routes.Remove((Mock-Key $DestinationPrefix $NextHop $InterfaceIndex $PolicyStore))
+}
+function New-NetRoute {
+    [CmdletBinding(SupportsShouldProcess=$true)] param($AddressFamily,$DestinationPrefix,$NextHop,$InterfaceIndex,$RouteMetric,$PolicyStore)
+    if($RouteMetric -eq 5 -and $script:failRestore){throw 'Simulated restoration failure'}
+    $script:routes[(Mock-Key $DestinationPrefix $NextHop $InterfaceIndex 'ActiveStore')]=[int]$RouteMetric
+    if($RouteMetric -eq 9 -and $script:failNew){throw 'Simulated creation failure after writing ActiveStore'}
+    if(-not $PolicyStore){$script:routes[(Mock-Key $DestinationPrefix $NextHop $InterfaceIndex 'PersistentStore')]=[int]$RouteMetric}
+    [PSCustomObject]@{RouteMetric=$RouteMetric}
+}
+"#;
+        for persistent in [false, true] {
+            for same_identity in [false, true] {
+                for failure in ["none", "create", "remove", "restore"] {
+                    if failure == "remove" && !persistent {
+                        continue;
+                    }
+                    let old = json!({"addressFamily":"IPv4","destinationPrefix":"172.16.0.0/12","nextHop":"192.168.3.1","interfaceIndex":26,"routeMetric":5,"persistent":persistent,"policyStores":if persistent {json!(["ActiveStore","PersistentStore"])} else {json!(["ActiveStore"])}});
+                    let mut new = old.clone();
+                    new["persistent"] = json!(!persistent);
+                    new["routeMetric"] = json!(9);
+                    if !same_identity {
+                        new["destinationPrefix"] = json!("172.20.0.0/16");
+                    }
+                    let input = json!({"oldRoute":old,"route":new,"failNew":failure=="create" || failure=="restore","failRemove":failure=="remove","failRestore":failure=="restore"});
+                    if failure == "restore" {
+                        let error = run_powershell_json(
+                            &format!("{mock}\n{}", edit_route_script()),
+                            Some(&input),
+                        )
+                        .unwrap_err();
+                        assert!(error
+                            .message
+                            .contains("Restoring the original route also failed"));
+                        assert!(error.message.contains("Undo last app change"));
+                        continue;
+                    }
+                    let script = if failure == "none" {
+                        format!(
+                            r#"{mock}
+{}
+if($script:routes.Count -ne $(if($InputData.route.persistent){{2}}else{{1}})){{throw 'Unexpected remaining route stores'}}
+foreach($entry in $script:routes.GetEnumerator()){{if($entry.Value -ne 9 -or -not $entry.Key.StartsWith([string]$InputData.route.destinationPrefix+'|')){{throw 'Original route remains after edit'}}}}
+"#,
+                            edit_route_script()
+                        )
+                    } else {
+                        format!(
+                            r#"{mock}
+$caught=$null
+try {{ & {{ {} }} | Out-Null }} catch {{ $caught=$_.Exception.Message }}
+if(-not $caught -or -not $caught.Contains('original route was restored')){{throw 'Expected a recoverable edit failure'}}
+if((Mock-Snapshot) -ne $script:original){{throw 'Rollback did not restore all original stores and metrics'}}
+[PSCustomObject]@{{restored=$true}}|ConvertTo-Json -Compress
+"#,
+                            edit_route_script()
+                        )
+                    };
+                    let result = run_powershell_json(&script, Some(&input)).unwrap_or_else(|e| panic!("persistent={persistent}, same_identity={same_identity}, failure={failure}: {e:?}"));
+                    assert_eq!(
+                        result[if failure == "none" {
+                            "edited"
+                        } else {
+                            "restored"
+                        }],
+                        true
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn route_persistence_conversion_and_rollback_use_mock_cmdlets() {
+        let mock = r#"
+$script:removed=$false
+$script:restored=$false
+function Remove-NetRoute { $script:removed=$true }
+function Get-NetRoute { }
+function New-NetRoute {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param($AddressFamily,$DestinationPrefix,$NextHop,$InterfaceIndex,$RouteMetric,$PolicyStore)
+    if(-not $script:removed){throw 'Must replace the active route first'}
+    if($InputData.persistent -and $InputData.fail){throw 'Simulated persistent creation failure'}
+    if(-not $InputData.persistent){
+        if($PolicyStore -ne 'ActiveStore'){throw 'Rollback must restore a temporary route'}
+        $script:restored=$true
+    }
+    [PSCustomObject]@{DestinationPrefix=$DestinationPrefix}
+}
+"#;
+        let payload = json!({"destinationPrefix":"172.16.0.0/12","nextHop":"192.168.3.1","interfaceIndex":26,"routeMetric":5,"persistent":true});
+        let script = format!("{mock}\n{}", persist_route_script());
+        let result = run_powershell_json(&script, Some(&payload)).unwrap();
+        assert_eq!(result["policyStore"], "PersistentStore");
+        let mut failure = payload;
+        failure["fail"] = json!(true);
+        let script = format!(
+            r#"{mock}
+try {{ {} }} catch {{
+    if(-not $script:restored){{throw 'Temporary route was not restored'}}
+    [PSCustomObject]@{{restored=$script:restored;message=$_.Exception.Message}}|ConvertTo-Json -Compress
+}}"#,
+            persist_route_script()
+        );
+        let result = run_powershell_json(&script, Some(&failure)).unwrap();
+        assert_eq!(result["restored"], true);
+        assert!(field_string(&result, "message").contains("Simulated persistent creation failure"));
+    }
+    #[test]
+    fn persistence_conversion_rejects_system_and_persistent_routes() {
+        let route = json!({"addressFamily":"IPv4","destinationPrefix":"172.16.0.0/12","nextHop":"192.168.3.1","interfaceIndex":26,"routeMetric":5,"persistent":false,"removable":true});
+        assert_eq!(
+            persistable_route_payload(&route).unwrap()["persistent"],
+            true
+        );
+        assert_eq!(
+            route_key(&persistable_route_payload(&route).unwrap()),
+            route_key(&route)
+        );
+        let mut protected = route.clone();
+        protected["removable"] = json!(false);
+        assert!(persistable_route_payload(&protected).is_err());
+        let mut persistent = route;
+        persistent["persistent"] = json!(true);
+        assert!(persistable_route_payload(&persistent).is_err());
+    }
+    #[test]
+    fn route_creation_uses_supported_stores_and_returns_clean_json() {
+        // Shadow the Windows cmdlet: never modify real routes during validation.
+        let mock = r#"
+function New-NetRoute {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([string]$AddressFamily,[string]$DestinationPrefix,[string]$NextHop,
+          [int]$InterfaceIndex,[int]$RouteMetric,[ValidateSet('ActiveStore')][string]$PolicyStore)
+    if($AddressFamily -ne 'IPv4' -or $DestinationPrefix -ne '172.16.0.0/12' -or
+       $NextHop -ne '192.168.3.1' -or $InterfaceIndex -ne 26 -or $RouteMetric -ne 5){throw 'Incorrect route arguments'}
+    if($InputData.persistent -and $PSBoundParameters.ContainsKey('PolicyStore')){throw 'Persistent routes must use the default stores'}
+    if(-not $InputData.persistent -and $PolicyStore -ne 'ActiveStore'){throw 'Temporary routes must use ActiveStore'}
+    [PSCustomObject]@{DestinationPrefix=$DestinationPrefix;RouteMetric=$RouteMetric}
+}
+"#;
+        for persistent in [true, false] {
+            let payload = route_payload(&json!({
+                "destinationPrefix":"172.16.0.0/12", "nextHop":"192.168.3.1",
+                "interfaceIndex":26, "routeMetric":5, "persistent":persistent
+            }))
+            .unwrap();
+            let result =
+                run_powershell_json(&format!("{mock}\n{ADD_ROUTE_SCRIPT}"), Some(&payload))
+                    .expect("mock route creation should return valid JSON");
+            assert_eq!(
+                result,
+                json!({"created":true,"policyStore":if persistent {"PersistentStore"} else {"ActiveStore"}})
+            );
+        }
+    }
+    #[test]
+    fn powershell_failure_exposes_the_windows_reason() {
+        let error = run_powershell_json("throw 'Route already exists: 测试'", None).unwrap_err();
+        assert_eq!(error.code, "COMMAND_FAILED");
+        assert!(error.message.contains("Route already exists: 测试"));
+        assert!(!error.message.contains("CLIXML"));
+    }
     #[test]
     fn cidr_is_normalized() {
         assert_eq!(normalize_cidr("172.31.9.10/12").unwrap(), "172.16.0.0/12");
