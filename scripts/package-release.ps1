@@ -36,9 +36,7 @@ if (Test-Path -LiteralPath $portableZip) {
 }
 Compress-Archive -Path (Join-Path $portableStage '*') -DestinationPath $portableZip -CompressionLevel Optimal
 
-Get-ChildItem -LiteralPath $installerDir -File |
-  Where-Object { $_.Name -like 'Windows Network Manager_*' -and $_.Name -notin @((Split-Path $nsisTarget -Leaf), (Split-Path $portableZip -Leaf)) } |
-  Remove-Item -Force
+# Keep previous installer and portable releases. They may be needed for rollback.
 
 foreach ($relativePath in @('target', 'dist', 'gen')) {
   $path = Join-Path $root $relativePath

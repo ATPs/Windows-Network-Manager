@@ -39,6 +39,14 @@ export const api = {
     call("connect_wifi", { input: { ...input, confirmationToken } }),
   disconnectWifi: (input, confirmationToken) =>
     call("disconnect_wifi", { input: { ...input, confirmationToken } }),
+  wifiAutoStatus: () => call("get_wifi_auto_connect_status"),
+  previewWifiAuto: (rule) => call("preview_wifi_auto_connect", { input: rule }),
+  saveWifiAuto: (rule, confirmationToken) =>
+    call("save_wifi_auto_connect", { input: { rule, confirmationToken } }),
+  disableWifiAuto: (adapterGuid) =>
+    call("disable_wifi_auto_connect", { adapterGuid }),
+  removeWifiAuto: (adapterGuid) =>
+    call("remove_wifi_auto_connect", { adapterGuid }),
   profiles: () => call("get_app_config"),
   saveProfile: (profile) => call("save_profile", { profile }),
   deleteProfile: (id) => call("delete_profile", { id }),
@@ -46,6 +54,7 @@ export const api = {
   profileRestore: (id, confirmationToken) =>
     call("restore_profile_apply", { input: { id, confirmationToken } }),
   recentSnapshot: (name) => call("capture_recent_snapshot", { name }),
+  deleteRecent: (id) => call("delete_recent_snapshot", { id }),
   recentPreview: (id) => call("restore_recent_preview", { id }),
   recentRestore: (id, confirmationToken) =>
     call("restore_recent_apply", { input: { id, confirmationToken } }),

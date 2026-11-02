@@ -1,24 +1,73 @@
 import { LitElement, html, nothing } from "lit";
-import { keyed } from "lit/directives/keyed.js";
 import { api } from "./api.js";
-import { copy } from "./i18n.js";
+import { copy, messages } from "./i18n.js";
+import {
+  autoGuidKey,
+  autoResultText,
+  compareRoutes,
+  errorMessage,
+  formatRelative,
+  formatTime,
+  interpolate,
+  isAdapterDisabled,
+  isAdapterOnline,
+  routeIdentity,
+} from "./format.js";
+import { icon } from "./icons.js";
+import { spinner } from "./ui.js";
+import { renderOverview } from "./views/overview.js";
+import { renderAdapters } from "./views/adapters.js";
+import { renderRoutes, renderRouteDrawer } from "./views/routes.js";
+import { renderProfiles } from "./views/profiles.js";
+import { renderDiagnostics } from "./views/diagnostics.js";
+import { renderMaintenance } from "./views/maintenance.js";
+import { renderSettings } from "./views/settings.js";
 
-const views = [
+export const views = [
   "overview",
   "adapters",
   "routes",
   "profiles",
   "diagnostics",
   "maintenance",
+  "settings",
 ];
-const formatTime = (value, language) =>
-  value
-    ? new Intl.DateTimeFormat(language, {
-        dateStyle: "medium",
-        timeStyle: "short",
-      }).format(new Date(value))
-    : "—";
-const errorMessage = (error) => error?.message || error?.code || String(error);
+const viewRenderers = {
+  overview: renderOverview,
+  adapters: renderAdapters,
+  routes: renderRoutes,
+  profiles: renderProfiles,
+  diagnostics: renderDiagnostics,
+  maintenance: renderMaintenance,
+  settings: renderSettings,
+};
+const TOAST_TIMEOUT = { success: 4000, info: 5000 };
+
+const readStorage = (key) => {
+  try {
+    return globalThis.localStorage?.getItem(key) ?? null;
+  } catch {
+    return null;
+  }
+};
+const writeStorage = (key, value) => {
+  try {
+    globalThis.localStorage?.setItem(key, value);
+  } catch {
+    // UI preferences are best effort.
+  }
+};
+const readJson = (key) => {
+  try {
+    return JSON.parse(readStorage(key) || "null");
+  } catch {
+    return null;
+  }
+};
+const isEditable = (target) =>
+  target instanceof Element &&
+  (target.isContentEditable ||
+    ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName));
 
 export class NetworkManagerApp extends LitElement {
   createRenderRoot() {
@@ -27,10 +76,13 @@ export class NetworkManagerApp extends LitElement {
 
   constructor() {
     super();
-    this.view = "overview";
+    const savedView = readStorage("wnm-view");
+    const routePrefs = readJson("wnm-route-filters") || {};
+    this.view = views.includes(savedView) ? savedView : "overview";
+    this.version = "";
     this.settings = {
       language: "en",
-      theme: localStorage.getItem("wnm-theme") || "system",
+      theme: readStorage("wnm-theme") || "system",
       showSystemInterfaces: false,
       showAllRoutes: false,
     };
@@ -41,33 +93,57 @@ export class NetworkManagerApp extends LitElement {
       source: "live",
       stale: false,
     };
-    this.config = { profiles: [], recentSnapshots: [], hasBaseline: false };
+    this.config = {
+      profiles: [],
+      recentSnapshots: [],
+      managedRoutes: [],
+      hasBaseline: false,
+    };
     this.privilege = { isAdmin: false };
     this.busy = new Set();
     this.wifiProfiles = new Map();
+    this.wifiAuto = { adapters: [], rules: [], statuses: [], discoveryError: null };
+    this.wifiAutoDrafts = new Map();
+    this.wifiAutoEditing = new Set();
+    this.wifiAutoLoading = null;
+    this.wifiAutoEventUnlisten = null;
     this.message = null;
+    this.toasts = [];
+    this.toastSeq = 0;
+    this.activity = [];
+    this.activitySeq = 0;
+    this.activityOpen = false;
     this.confirmation = null;
     this.nameDialog = null;
     this.routeSearch = "";
-    this.routeFamily = "IPv4";
+    this.routeFamily = ["IPv4", "IPv6", "all"].includes(routePrefs.family)
+      ? routePrefs.family
+      : "IPv4";
+    this.routeSort = routePrefs.sort?.key
+      ? routePrefs.sort
+      : { key: "destination", dir: 1 };
+    this.routeStaticOnly = false;
+    this.routeDrawerOpen = false;
+    this.routeFormVersion = 0;
+    this.routeDraft = null;
     this.editingRoute = null;
-    this.diagnostics = null;
-    this.operationResult = null;
     this.adapterSearch = "";
+    this.adapterFilter = "all";
+    this.expandedAdapters = new Set();
+    this.defaultsSelection = null;
+    this.defaultsRemoveRoutes = true;
+    this.diagnostics = null;
     this.refreshTimer = null;
+    this.clockTimer = null;
     this.onVisibilityChange = () => this.scheduleRefresh();
-    this.onKeydown = (event) => {
-      if (event.key === "Escape" && (this.confirmation || this.nameDialog)) {
-        this.closeConfirmation();
-        this.closeNameDialog();
-      }
-    };
+    this.onKeydown = (event) => this.handleShortcut(event);
   }
 
   connectedCallback() {
     super.connectedCallback();
     document.addEventListener("visibilitychange", this.onVisibilityChange);
     document.addEventListener("keydown", this.onKeydown);
+    this.clockTimer = setInterval(() => this.requestUpdate(), 10_000);
     this.initialize();
   }
   disconnectedCallback() {
@@ -75,13 +151,48 @@ export class NetworkManagerApp extends LitElement {
     document.removeEventListener("visibilitychange", this.onVisibilityChange);
     document.removeEventListener("keydown", this.onKeydown);
     clearTimeout(this.refreshTimer);
+    clearInterval(this.clockTimer);
+    if (this.wifiAutoEventUnlisten) {
+      this.wifiAutoEventUnlisten();
+      this.wifiAutoEventUnlisten = null;
+    }
   }
 
   t(key) {
     return copy[this.settings.language]?.[key] || copy.en[key] || key;
   }
+  /** Formats a translated template such as "Showing {shown} of {total}". */
+  tf(key, params) {
+    return interpolate(this.t(key), params);
+  }
+  /** Translates a backend notice `{code, params, text}`, falling back to its English text. */
+  msg(notice) {
+    if (!notice) return "";
+    if (typeof notice === "string") return notice;
+    const table = messages[this.settings.language] || {};
+    const params = { ...(notice.params || {}) };
+    const variant = params.mode || params.action;
+    const template = table[`${notice.code}:${variant}`] || table[notice.code];
+    if (!template) return notice.text || notice.code || "";
+    if (params.value === "automatic") params.value = this.t("automaticMetric");
+    return interpolate(template, params);
+  }
+  warningsOf(preview) {
+    if (Array.isArray(preview?.notices) && preview.notices.length)
+      return preview.notices.map((notice) => this.msg(notice));
+    return preview?.warnings || [];
+  }
+  summaryOf(result) {
+    if (!result) return "";
+    const code = result.summaryCode || result.messageCode;
+    if (code) return this.msg(code);
+    return result.message || result.summary || "";
+  }
   isBusy(key) {
     return this.busy.has(key);
+  }
+  isBusyPrefix(prefix) {
+    return [...this.busy].some((key) => key.startsWith(prefix));
   }
   setBusy(key, value) {
     value ? this.busy.add(key) : this.busy.delete(key);
@@ -90,6 +201,8 @@ export class NetworkManagerApp extends LitElement {
 
   async initialize() {
     try {
+      this.subscribeWifiAutoEvents();
+      this.loadVersion();
       const bootstrap = await api.bootstrap();
       this.settings = { ...this.settings, ...(bootstrap.settings || {}) };
       this.config = { ...this.config, ...(bootstrap.config || bootstrap) };
@@ -98,6 +211,7 @@ export class NetworkManagerApp extends LitElement {
         this.applyNetwork(bootstrap.cachedNetworkState);
       this.applyTheme();
       this.requestUpdate();
+      this.refreshConfig().catch(() => {});
       await this.refresh(["interfaces", "routes"]);
       this.scheduleRefresh();
     } catch (error) {
@@ -105,10 +219,21 @@ export class NetworkManagerApp extends LitElement {
     }
   }
 
+  async loadVersion() {
+    try {
+      const { getVersion } = await import("@tauri-apps/api/app");
+      const version = await getVersion();
+      if (typeof version === "string") this.version = version;
+      this.requestUpdate();
+    } catch {
+      // The version is unavailable outside the Tauri runtime.
+    }
+  }
+
   applyTheme() {
     document.documentElement.lang = this.settings.language;
     document.documentElement.dataset.theme = this.settings.theme;
-    localStorage.setItem("wnm-theme", this.settings.theme);
+    writeStorage("wnm-theme", this.settings.theme);
   }
 
   applyNetwork(result) {
@@ -135,17 +260,20 @@ export class NetworkManagerApp extends LitElement {
     }, 15_000);
   }
 
+  isRefreshing() {
+    return this.isBusyPrefix("refresh:");
+  }
+
   async refresh(scopes = ["interfaces", "routes"], force = false, quiet = false) {
     const key = `refresh:${scopes.sort().join(",")}`;
     if (this.isBusy(key)) return;
     this.setBusy(key, true);
     try {
       this.applyNetwork(await api.refresh(scopes, force));
-      if (!quiet && !this.operationResult)
-        this.message = { text: this.t("ready"), kind: "success" };
       this.loadWifiProfiles();
+      await this.loadWifiAutoStatus();
     } catch (error) {
-      this.notify(errorMessage(error), "error");
+      if (!quiet) this.notify(errorMessage(error), "error");
     } finally {
       this.setBusy(key, false);
     }
@@ -166,6 +294,43 @@ export class NetworkManagerApp extends LitElement {
       }
       this.requestUpdate();
     }
+  }
+
+  async subscribeWifiAutoEvents() {
+    if (this.wifiAutoEventUnlisten) return;
+    try {
+      const { listen } = await import("@tauri-apps/api/event");
+      this.wifiAutoEventUnlisten = await listen(
+        "wifi-auto-connect-updated",
+        () => this.loadWifiAutoStatus(),
+      );
+    } catch {
+      // The event bridge is unavailable in browser and unit-test environments.
+    }
+  }
+
+  async loadWifiAutoStatus() {
+    if (this.wifiAutoLoading) return this.wifiAutoLoading;
+    this.wifiAutoLoading = api
+      .wifiAutoStatus()
+      .then((status) => {
+        this.wifiAuto = {
+          adapters: status?.adapters || [],
+          rules: status?.rules || [],
+          statuses: status?.statuses || [],
+          discoveryError: status?.discoveryError || null,
+        };
+        this.requestUpdate();
+        return this.wifiAuto;
+      })
+      .catch(() => {
+        // Keep the last known status while the app is starting or the bridge is unavailable.
+        return this.wifiAuto;
+      })
+      .finally(() => {
+        this.wifiAutoLoading = null;
+      });
+    return this.wifiAutoLoading;
   }
 
   async updateSettings(patch) {
@@ -190,32 +355,108 @@ export class NetworkManagerApp extends LitElement {
     this.requestUpdate();
   }
   async restartAsAdmin() {
-    await this.run("elevation", () => api.restartAsAdmin(), []);
+    await this.run("elevation", () => api.restartAsAdmin(), [], this.t("restartAdmin"));
   }
+
+  // ---- Feedback -----------------------------------------------------------
 
   notify(text, kind = "info") {
     this.message = { text, kind };
+    const id = ++this.toastSeq;
+    this.toasts = [...this.toasts, { id, text, kind }].slice(-4);
+    if (TOAST_TIMEOUT[kind])
+      setTimeout(() => this.dismissToast(id), TOAST_TIMEOUT[kind]);
+    this.requestUpdate();
+  }
+  dismissToast(id) {
+    this.toasts = this.toasts.filter((toast) => toast.id !== id);
+    if (!this.toasts.length) this.message = null;
     this.requestUpdate();
   }
   dismissMessage() {
+    this.toasts = [];
     this.message = null;
     this.requestUpdate();
   }
 
-  async run(key, task, scopes = ["interfaces", "routes"]) {
+  async copyText(text) {
+    try {
+      await navigator.clipboard.writeText(String(text));
+      this.notify(this.t("copied"), "success");
+    } catch (error) {
+      this.notify(`${this.t("copyFailed")}: ${errorMessage(error)}`, "error");
+    }
+  }
+
+  activityLabel(key) {
+    const labels = [
+      ["route:add", "actRouteAdd"],
+      ["route:edit", "actRouteEdit"],
+      ["route:persist", "actRoutePersist"],
+      ["route:remove", "actRouteRemove"],
+      ["metric:", "actMetric"],
+      ["adapter:", "actAdapter"],
+      ["wifi-auto:", "wifiAutoConnect"],
+      ["wifi:", "actWifi"],
+      ["snapshot", "saveSnapshot"],
+      ["recent:", "actRestore"],
+      ["delete-recent:", "actDelete"],
+      ["delete:", "actDelete"],
+      ["profile:", "actRestore"],
+      ["profile", "saveProfile"],
+      ["reset", "undoLastChange"],
+      ["defaults", "restoreDefaults"],
+      ["elevation", "restartAdmin"],
+    ];
+    const match = labels.find(([prefix]) => key.startsWith(prefix));
+    return match ? this.t(match[1]) : key;
+  }
+
+  /** Runs a write operation: busy state, toast, activity entry and refresh. */
+  async run(key, task, scopes = ["interfaces", "routes"], label = null) {
     if (this.isBusy(key)) return;
     this.setBusy(key, true);
+    const entry = {
+      id: ++this.activitySeq,
+      label: label || this.activityLabel(key),
+      time: new Date().toISOString(),
+      status: "running",
+      message: "",
+      result: null,
+    };
+    this.activity = [entry, ...this.activity].slice(0, 50);
     try {
       const result = await task();
-      const failed = JSON.stringify(result || {}).includes('"status":"failed"') || result?.partial;
-      this.operationResult = result || { message: this.t("operationComplete") };
-      this.notify(
-        result?.message || result?.summary || (failed ? this.t("operationPartial") : this.t("operationComplete")),
-        failed ? "warning" : "success",
-      );
+      const failed =
+        JSON.stringify(result || {}).includes('"status":"failed"') ||
+        result?.partial;
+      const text =
+        this.summaryOf(result) ||
+        (failed ? this.t("operationPartial") : this.t("operationComplete"));
+      Object.assign(entry, {
+        status: failed ? "partial" : "success",
+        message: text,
+        result: result ?? null,
+      });
+      this.notify(text, failed ? "warning" : "success");
       if (scopes.length) await this.refresh(scopes, true, true);
       await this.refreshConfig().catch(() => {});
       return result;
+    } catch (error) {
+      Object.assign(entry, { status: "failed", message: errorMessage(error) });
+      this.notify(errorMessage(error), "error");
+      return null;
+    } finally {
+      this.setBusy(key, false);
+    }
+  }
+
+  /** Runs a read-only request (preview, diagnostics): busy state and error toast only. */
+  async preview(key, task) {
+    if (this.isBusy(key)) return null;
+    this.setBusy(key, true);
+    try {
+      return await task();
     } catch (error) {
       this.notify(errorMessage(error), "error");
       return null;
@@ -224,8 +465,16 @@ export class NetworkManagerApp extends LitElement {
     }
   }
 
-  requestConfirmation(lines, confirm, destructive = true) {
-    this.confirmation = { lines: lines.filter(Boolean), confirm, destructive };
+  requestConfirmation(lines, confirm, destructive = true, options = {}) {
+    this.confirmation = {
+      lines: lines.filter(Boolean),
+      confirm,
+      destructive,
+      title: options.title || this.t("confirm"),
+      rows: options.rows || [],
+      note: options.note || "",
+      confirmLabel: options.confirmLabel || this.t("confirm"),
+    };
     this.requestUpdate();
   }
 
@@ -239,6 +488,80 @@ export class NetworkManagerApp extends LitElement {
     if (action) await action();
   }
 
+  // ---- Navigation and shortcuts ------------------------------------------
+
+  setView(view) {
+    if (!views.includes(view)) return;
+    this.view = view;
+    writeStorage("wnm-view", view);
+    this.requestUpdate();
+    this.updateComplete.then(() =>
+      this.querySelector("main")?.scrollTo?.({ top: 0 }),
+    );
+  }
+
+  saveRoutePrefs() {
+    writeStorage(
+      "wnm-route-filters",
+      JSON.stringify({ family: this.routeFamily, sort: this.routeSort }),
+    );
+  }
+
+  anyDialogOpen() {
+    return Boolean(
+      this.confirmation || this.nameDialog || this.routeDrawerOpen || this.activityOpen,
+    );
+  }
+
+  handleShortcut(event) {
+    if (event.key === "F5" || (event.ctrlKey && event.key.toLowerCase() === "r")) {
+      event.preventDefault();
+      this.refresh(["interfaces", "routes"], true);
+      return;
+    }
+    if (this.anyDialogOpen()) return;
+    if (event.ctrlKey && !event.altKey && /^[1-7]$/.test(event.key)) {
+      event.preventDefault();
+      this.setView(views[Number(event.key) - 1]);
+      return;
+    }
+    if (event.key === "/" && !isEditable(event.target)) {
+      const search = this.querySelector("[data-page-search]");
+      if (search) {
+        event.preventDefault();
+        search.focus();
+      }
+    }
+  }
+
+  async goToAdapter(item) {
+    const key = String(item.interfaceIndex);
+    this.expandedAdapters.add(key);
+    this.adapterFilter = "all";
+    this.adapterSearch = "";
+    this.setView("adapters");
+    await this.updateComplete;
+    this.querySelector(`[data-adapter="${key}"]`)?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  }
+
+  goToAdapters(filter = "all") {
+    this.adapterFilter = filter;
+    this.adapterSearch = "";
+    this.setView("adapters");
+  }
+
+  goToRoutes({ staticOnly = false, search = "" } = {}) {
+    this.routeStaticOnly = staticOnly;
+    this.routeSearch = search;
+    if (staticOnly || search) this.routeFamily = "all";
+    this.setView("routes");
+  }
+
+  // ---- Data helpers -------------------------------------------------------
+
   interfaces() {
     const all = this.network.overview?.interfaces || [];
     return all.filter(
@@ -246,381 +569,389 @@ export class NetworkManagerApp extends LitElement {
     );
   }
 
-  routeRows() {
-    const routes = this.network.routes?.routes || [];
-    return routes.filter(
-      (route) =>
-        (this.routeFamily === "all" ||
-          route.addressFamily === this.routeFamily) &&
-        (this.settings.showAllRoutes || !route.hiddenByDefault) &&
-        `${route.destinationPrefix} ${route.nextHop} ${route.interfaceAlias}`
-          .toLowerCase()
-          .includes(this.routeSearch.toLowerCase()),
+  managedRouteKeys() {
+    return new Set(
+      (this.config.managedRoutes || []).map((route) =>
+        routeIdentity({ addressFamily: "IPv4", ...route }),
+      ),
     );
   }
 
-  connectionLabel(item) {
-    if (String(item.adminStatus).toLowerCase() === "down")
-      return this.t("disabled");
-    return item.wifi?.connected || item.defaultRoute
-      ? this.t("connected")
-      : this.t("available");
+  isStaticRoute(route) {
+    return Boolean(route.persistent || route.protocol === "NetMgmt");
   }
 
-  renderNav() {
-    return html`<aside class="sidebar">
-      <div class="brand">
-        <span class="brand-mark">N</span>
-        <div><strong>Windows Network Manager</strong><small>v2.1.3</small></div>
-      </div>
-      <nav aria-label="Primary navigation">
-        ${views.map(
-          (view) =>
-            html`<button
-              class="nav-item ${this.view === view ? "selected" : ""}"
-              @click=${() => {
-              this.view = view;
-              this.requestUpdate();
-            }}
-            >
-              ${this.t(view)}
-            </button>`,
-        )}
-      </nav>
-      <div class="sidebar-footer">
-        <label
-          >${this.t("theme")}<select
-            .value=${this.settings.theme}
-            @change=${(event) => this.updateSettings({ theme: event.target.value })}
-          >
-            <option value="system">${this.t("system")}</option>
-            <option value="light">${this.t("light")}</option>
-            <option value="dark">${this.t("dark")}</option>
-          </select></label
-        >
-        <label
-          >${this.t("language")}<select
-            .value=${this.settings.language}
-            @change=${(event) => this.updateSettings({ language: event.target.value })}
-          >
-            <option value="en">English</option>
-            <option value="zh-CN">中文</option>
-          </select></label
-        >
-      </div>
-    </aside>`;
-  }
-
-  renderHeader() {
-    const refreshKey = "refresh:interfaces,routes";
-    return html`<header class="app-header">
-      <div>
-        <p class="eyebrow">${this.t(this.view)}</p>
-        <h1>${this.t(this.view)}</h1>
-      </div>
-      <div class="header-actions">
-        <span
-          class="status-pill ${this.privilege.isAdmin ? "success" : "neutral"}"
-          >${this.privilege.isAdmin ? this.t("administrator") : this.t("standardUser")}</span
-        >
-        ${!this.privilege.isAdmin ? html`<button class="secondary" ?disabled=${this.isBusy("elevation")} @click=${() => this.restartAsAdmin()}>${this.isBusy("elevation") ? this.t("working") : this.t("restartAdmin")}</button>` : nothing}
-        <button
-          class="primary"
-          ?disabled=${this.isBusy(refreshKey)}
-          @click=${() => this.refresh(["interfaces", "routes"])}
-        >
-          ${this.isBusy(refreshKey) ? this.t("refreshing") : this.t("refresh")}
-        </button>
-        <details class="settings-menu"><summary>${this.t("settings")}</summary><label>${this.t("theme")}<select .value=${this.settings.theme} @change=${(event) => this.updateSettings({ theme: event.target.value })}><option value="system">${this.t("system")}</option><option value="light">${this.t("light")}</option><option value="dark">${this.t("dark")}</option></select></label><label>${this.t("language")}<select .value=${this.settings.language} @change=${(event) => this.updateSettings({ language: event.target.value })}><option value="en">English</option><option value="zh-CN">中文</option></select></label></details>
-      </div>
-    </header>`;
-  }
-
-  renderOverview() {
-    const adapters = this.interfaces();
-    const active = adapters.find((item) => item.defaultRoute && String(item.adminStatus).toLowerCase() !== "down");
+  routeRows() {
     const routes = this.network.routes?.routes || [];
-    const manual = adapters.filter(
-      (item) =>
-        item.deviations?.manualIpv4Metric || item.deviations?.manualIpv6Metric,
-    ).length;
-    const disabled = adapters.filter(
-      (item) => item.deviations?.adapterDisabled,
-    ).length;
-    const staticRoutes = routes.filter(
-      (route) => route.persistent || route.protocol === "NetMgmt",
-    ).length;
-    return html`<section class="view-stack">
-      <article class="hero-card">
-        <div>
-          <p class="eyebrow">${this.t("activePath")}</p>
-          <h2>${active ? active.alias : this.t("noActivePath")}</h2>
-          <p>${active?.wifi?.ssid || active?.description || this.t("noActivePath")}</p>
-        </div>
-        <div class="hero-meta">
-          <span class="status-pill ${active ? "success" : "neutral"}"
-            >${active ? this.connectionLabel(active) : "—"}</span
-          ><small
-            >${this.network.stale ? this.t("cached") : this.t("live")} ·
-            ${formatTime(this.network.refreshedAt, this.settings.language)}</small
-          >
-        </div>
-      </article>
-      <section class="panel">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">${this.t("changes")}</p>
-            <h2>${this.t("changes")}</h2>
-          </div>
-        </div>
-        <div class="summary-grid">
-          ${[
-            [this.t("manualMetrics"), manual],
-            [this.t("staticRoutes"), staticRoutes],
-            [this.t("disabledAdapters"), disabled],
-          ].map(
-            ([label, value]) =>
-              html`<div class="summary-tile">
-                <strong>${value}</strong><span>${label}</span>
-              </div>`,
-          )}
-        </div>
-      </section>
-      <section class="panel">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">${this.t("adapters")}</p>
-            <h2>${this.t("adapters")}</h2>
-          </div>
-          <button
-            class="secondary"
-            @click=${() => {
-              this.view = "adapters";
-              this.requestUpdate();
-            }}
-          >
-            ${this.t("adapters")}
-          </button>
-        </div>
-        <div class="adapter-preview">
-          ${adapters.slice(0, 4).map((item) => html`<div><span class="status-dot ${item.defaultRoute || item.wifi?.connected ? "online" : ""}"></span><strong>${item.alias}</strong><span>${item.type} · ${this.connectionLabel(item)}</span></div>`)}
-        </div>
-      </section>
-      ${this.operationResult ? html`<section class="panel operation-result" aria-live="polite"><div class="section-heading"><div><p class="eyebrow">${this.t("lastOperation")}</p><h2>${this.operationResult.message || this.t("operationComplete")}</h2></div><button class="secondary compact" @click=${() => { this.operationResult = null; this.requestUpdate(); }}>${this.t("close")}</button></div><details><summary>${this.t("technicalDetails")}</summary><pre>${JSON.stringify(this.operationResult, null, 2)}</pre></details></section>` : nothing}
-    </section>`;
+    const search = this.routeSearch.trim().toLowerCase();
+    const { key, dir } = this.routeSort;
+    return routes
+      .filter(
+        (route) =>
+          (this.routeFamily === "all" ||
+            route.addressFamily === this.routeFamily) &&
+          (this.settings.showAllRoutes || !route.hiddenByDefault) &&
+          (!this.routeStaticOnly || this.isStaticRoute(route)) &&
+          `${route.destinationPrefix} ${route.nextHop} ${route.interfaceAlias}`
+            .toLowerCase()
+            .includes(search),
+      )
+      .sort((a, b) => compareRoutes(a, b, key) * dir || compareRoutes(a, b, "destination"));
   }
 
-  renderMetric(item, family, key) {
-    const metric = item.metrics?.[key];
-    if (!metric) return nothing;
+  connectionLabel(item) {
+    if (isAdapterDisabled(item)) return this.t("disabled");
+    return isAdapterOnline(item) ? this.t("connected") : this.t("available");
+  }
+
+  connectivityInfo(item) {
+    const value = String(item?.ipv4Connectivity || item?.ipv6Connectivity || "");
+    const ipv6Internet = String(item?.ipv6Connectivity || "") === "Internet";
+    if (String(item?.ipv4Connectivity || "") === "Internet" || ipv6Internet)
+      return { kind: "success", text: this.t("connInternet"), icon: "globe" };
+    if (["LocalNetwork", "Subnet"].includes(value))
+      return { kind: "warning", text: this.t("connLocal"), icon: "warning" };
+    if (["NoTraffic", "Disconnected"].includes(value))
+      return { kind: "neutral", text: this.t("connNone"), icon: "info" };
+    return null;
+  }
+
+  // ---- Metric, Wi-Fi and adapter actions ---------------------------------
+
+  async applyMetric(item, family, key) {
     const id = `metric-${item.interfaceIndex}-${key}`;
     const busyKey = `metric:${item.interfaceIndex}:${family}`;
-    return html`<div class="metric-control">
-      <strong>${family}</strong
-      ><label
-        ><input
-          id=${`${id}-auto`}
-          type="checkbox"
-          .checked=${Boolean(metric.automaticMetric)}
-          @change=${(event) => {
-            const input = this.querySelector(`#${id}-value`);
-            input.disabled = event.target.checked;
-          }}
-        />
-        ${this.t("automaticMetric")}</label
-      ><input
-        id=${`${id}-value`}
-        type="number"
-        min="1"
-        max="9999"
-        .value=${String(metric.interfaceMetric)}
-        ?disabled=${Boolean(metric.automaticMetric)}
-      /><button
-        class="secondary"
-        ?disabled=${!this.privilege.isAdmin || this.isBusy(busyKey)}
-        @click=${async () => {
-          const automatic = this.querySelector(`#${id}-auto`).checked;
-          const value = this.querySelector(`#${id}-value`).value;
-          const input = {
-            interfaceIndex: item.interfaceIndex,
-            addressFamily: family,
-            automatic,
-            metric: value,
-          };
-          const preview = await this.run(
-            busyKey,
-            () => api.previewMetric(input),
-            [],
-          );
-          if (preview?.unchanged)
-            return this.notify(this.t("operationComplete"));
-          if (preview)
-            this.requestConfirmation(
-              [`${item.alias} · ${family}`, ...(preview.warnings || [])],
-              () =>
-                this.run(busyKey, () =>
-                  api.applyMetric(preview.input, preview.confirmationToken),
-                ),
-            );
-        }}
-      >
-        ${this.isBusy(busyKey) ? this.t("working") : this.t("applyMetric")}
-      </button>
-    </div>`;
+    const automatic = this.querySelector(`#${id}-auto`)?.checked;
+    const value = this.querySelector(`#${id}-value`)?.value;
+    const input = {
+      interfaceIndex: item.interfaceIndex,
+      addressFamily: family,
+      automatic,
+      metric: value,
+    };
+    const preview = await this.preview(busyKey, () => api.previewMetric(input));
+    if (!preview) return;
+    if (preview.unchanged) return this.notify(this.t("metricUnchanged"));
+    const current = item.metrics?.[key];
+    const describe = (auto, metric) =>
+      auto ? `${this.t("automaticMetric")} (${metric ?? "—"})` : String(metric);
+    this.requestConfirmation(
+      [`${item.alias} · ${family}`, ...this.warningsOf(preview)],
+      () =>
+        this.run(
+          busyKey,
+          () => api.applyMetric(preview.input, preview.confirmationToken),
+          ["interfaces", "routes"],
+          `${this.t("actMetric")} · ${item.alias} ${family}`,
+        ),
+      true,
+      {
+        title: this.t("confirmMetricTitle"),
+        rows: [
+          {
+            label: `${family} ${this.t("metric")}`,
+            before: describe(current?.automaticMetric, current?.interfaceMetric),
+            after: automatic ? this.t("automaticMetric") : String(value),
+          },
+        ],
+      },
+    );
   }
 
-  renderAdapter(item) {
-    const wifiProfiles = this.wifiProfiles.get(item.alias);
-    const adapterBusy = `adapter:${item.interfaceIndex}`;
-    const disabled = String(item.adminStatus).toLowerCase() === "down";
-    return html`<article class="adapter-card">
-      <div class="adapter-top">
-        <div>
-          <div class="title-line">
-            <span
-              class="status-dot ${item.defaultRoute || item.wifi?.connected ? "online" : ""}"
-            ></span>
-            <h3>${item.alias}</h3>
-            <span class="chip">${item.type}</span>
-          </div>
-          <p>${item.description || "—"}</p>
-        </div>
-        <span
-          class="status-pill ${disabled ? "danger" : item.defaultRoute || item.wifi?.connected ? "success" : "neutral"}"
-          >${this.connectionLabel(item)}</span
-        >
-      </div>
-      <div class="adapter-facts">
-        <span
-          ><small>IP</small
-          >${[...(item.ipv4Addresses || []), ...(item.ipv6Addresses || [])].map((ip) => `${ip.ipAddress}/${ip.prefixLength}`).join(", ") || "—"}</span
-        ><span
-          ><small>Gateway</small
-          >${[...(item.ipv4Gateways || []), ...(item.ipv6Gateways || [])].join(", ") || "—"}</span
-        ><span><small>Link</small>${item.linkSpeed || "—"}</span>
-      </div>
-      ${
-        item.wifi
-          ? html`<div class="inline-controls">
-              <span
-                >${item.wifi.ssid || "Wi-Fi"} · ${item.wifi.signal || "—"}</span
-              ><select
-                id=${`wifi-${item.interfaceIndex}`}
-                ?disabled=${wifiProfiles === null}
-              >
-                ${wifiProfiles === null ? html`<option>${this.t("profilesLoading")}</option>` : (wifiProfiles || []).map((profile) => html`<option value=${profile} ?selected=${profile === item.wifi.currentProfile}>${profile}</option>`)}</select
-              ><button
-                class="secondary"
-                ?disabled=${wifiProfiles === null || !(wifiProfiles || []).length || this.isBusy(`wifi:${item.interfaceIndex}`)}
-                @click=${() => {
-                  const profileName = this.querySelector(
-                    `#wifi-${item.interfaceIndex}`,
-                  ).value;
-                  this.run(`wifi-preview:${item.interfaceIndex}`, () => api.previewWifi({ interfaceName: item.alias, profileName, action: "connect" }), []).then((preview) => {
-                    if (preview) this.requestConfirmation([`${item.alias} · ${profileName}`, this.t("wifiConnectWarning"), ...(preview.warnings || [])], () => this.run(`wifi:${item.interfaceIndex}`, () => api.connectWifi(preview.wifi, preview.confirmationToken), ["interfaces"],), false);
-                  });
-                }}
-              >
-                ${this.t("connect")}</button
-              ><button
-                class="danger"
-                ?disabled=${!item.wifi.connected || this.isBusy(`wifi:${item.interfaceIndex}`)}
-                @click=${() => {
-                  this.run(`wifi-preview:${item.interfaceIndex}`, () => api.previewWifi({ interfaceName: item.alias, action: "disconnect" }), []).then((preview) => {
-                    if (preview) this.requestConfirmation([`${item.alias} ${this.t("disconnect")}`, ...(preview.warnings || [])], () => this.run(`wifi:${item.interfaceIndex}`, () => api.disconnectWifi(preview.wifi, preview.confirmationToken), ["interfaces"]));
-                  });
-                }}
-              >
-                ${this.t("disconnect")}
-              </button>
-            </div>`
-          : nothing
-      }
-      <details>
-        <summary>${this.t("technicalDetails")}</summary>
-        <div class="details-grid">
-          <span
-            ><small>DNS</small
-            >${(item.dnsServers || []).join(", ") || "—"}</span
-          ><span
-            ><small>Index / MAC</small>${item.interfaceIndex} /
-            ${item.macAddress || "—"}</span
-          >
-        </div>
-        <div class="metrics">
-          ${this.renderMetric(item, "IPv4", "ipv4")}${this.renderMetric(item, "IPv6", "ipv6")}
-        </div>
-        ${!item.systemInterface ? html`<div class="inline-controls">${!this.privilege.isAdmin ? html`<span class="permission-note">${this.t("permissionHelp")}</span><button class="secondary compact" @click=${this.restartAsAdmin}>${this.t("restartAdmin")}</button>` : nothing}<button class="secondary" ?disabled=${!this.privilege.isAdmin || !disabled || this.isBusy(adapterBusy)} @click=${() => this.adapterAction(item, "enable")}>${this.t("enable")}</button><button class="danger" ?disabled=${!this.privilege.isAdmin || disabled || this.isBusy(adapterBusy)} @click=${() => this.adapterAction(item, "disable")}>${this.t("disable")}</button></div>` : nothing}
-      </details>
-    </article>`;
+  async connectWifi(item) {
+    const profileName = this.querySelector(`#wifi-${item.interfaceIndex}`)?.value;
+    if (!profileName) return;
+    const preview = await this.preview(`wifi-preview:${item.interfaceIndex}`, () =>
+      api.previewWifi({ interfaceName: item.alias, profileName, action: "connect" }),
+    );
+    if (preview)
+      this.requestConfirmation(
+        [`${item.alias} · ${profileName}`, this.t("wifiConnectWarning"), ...this.warningsOf(preview)],
+        () =>
+          this.run(
+            `wifi:${item.interfaceIndex}`,
+            () => api.connectWifi(preview.wifi, preview.confirmationToken),
+            ["interfaces"],
+            `${this.t("connect")} · ${item.alias} → ${profileName}`,
+          ),
+        false,
+        {
+          title: this.t("confirmWifiTitle"),
+          confirmLabel: this.t("connect"),
+          rows: [
+            {
+              label: item.alias,
+              before: item.wifi?.ssid || this.t("disconnected"),
+              after: profileName,
+            },
+          ],
+        },
+      );
+  }
+
+  async disconnectWifi(item) {
+    const preview = await this.preview(`wifi-preview:${item.interfaceIndex}`, () =>
+      api.previewWifi({ interfaceName: item.alias, action: "disconnect" }),
+    );
+    if (preview)
+      this.requestConfirmation(
+        [`${item.alias} · ${this.t("disconnect")}`, ...this.warningsOf(preview)],
+        () =>
+          this.run(
+            `wifi:${item.interfaceIndex}`,
+            () => api.disconnectWifi(preview.wifi, preview.confirmationToken),
+            ["interfaces"],
+            `${this.t("disconnect")} · ${item.alias}`,
+          ),
+        true,
+        { title: this.t("confirmDisconnectTitle"), confirmLabel: this.t("disconnect") },
+      );
   }
 
   async adapterAction(item, action) {
     const key = `adapter:${item.interfaceIndex}`;
-    const preview = await this.run(
-      key,
-      () => api.previewAdapter({ interfaceIndex: item.interfaceIndex, action }),
-      [],
+    const preview = await this.preview(key, () =>
+      api.previewAdapter({ interfaceIndex: item.interfaceIndex, action }),
     );
     if (preview)
       this.requestConfirmation(
-        [
-          `${item.alias} (#${item.interfaceIndex})`,
-          ...(preview.warnings || []),
-        ],
+        [`${item.alias} (#${item.interfaceIndex})`, ...this.warningsOf(preview)],
         () =>
-          this.run(key, () =>
-            api.applyAdapter(
-              { interfaceIndex: item.interfaceIndex, action },
-              preview.confirmationToken,
-            ),
+          this.run(
+            key,
+            () =>
+              api.applyAdapter(
+                { interfaceIndex: item.interfaceIndex, action },
+                preview.confirmationToken,
+              ),
+            ["interfaces", "routes"],
+            `${this.t(action)} · ${item.alias}`,
           ),
+        true,
+        {
+          title: this.t(action === "enable" ? "confirmEnableTitle" : "confirmDisableTitle"),
+          confirmLabel: this.t(action),
+        },
       );
   }
 
-  renderAdapters() {
-    const adapters = this.interfaces().filter((item) =>
-      `${item.alias} ${item.description} ${item.type}`
-        .toLowerCase()
-        .includes(this.adapterSearch.toLowerCase()),
+  // ---- Wi-Fi auto-connect -------------------------------------------------
+
+  wifiAutoGuid(item, adapterInfo = null) {
+    const matchingAdapter = item?.alias
+      ? (this.wifiAuto.adapters || []).find(
+          (adapter) =>
+            String(adapter.interfaceName || "").toLowerCase() ===
+            String(item.alias).toLowerCase(),
+        )
+      : null;
+    return (
+      item?.guid ||
+      item?.adapterGuid ||
+      item?.wifi?.guid ||
+      item?.wifi?.adapterGuid ||
+      adapterInfo?.adapterGuid ||
+      matchingAdapter?.adapterGuid ||
+      ""
     );
-    return html`<section class="view-stack">
-      <div class="toolbar">
-        <label>${this.t("searchAdapters")}<input type="search" .value=${this.adapterSearch} @input=${(event) => { this.adapterSearch = event.target.value; this.requestUpdate(); }} /></label>
-        <label class="toggle"
-          ><input
-            type="checkbox"
-            .checked=${this.settings.showSystemInterfaces}
-            @change=${(event) => this.updateSettings({ showSystemInterfaces: event.target.checked })}
-          />${this.t("showSystem")}</label
-        ><button class="secondary" @click=${() => this.refresh(["interfaces"])}>
-          ${this.t("refresh")}
-        </button>
-      </div>
-      <div class="adapter-grid">
-        ${adapters.length ? adapters.map((item) => this.renderAdapter(item)) : html`<p class="empty">${this.t("noAdapters")}</p>`}
-      </div>
-    </section>`;
   }
 
-  async addRoute(event) {
-    event.preventDefault();
-    if (!this.privilege.isAdmin)
-      return this.notify(this.t("permissionHelp"), "error");
-    const data = new FormData(event.currentTarget);
-    const input = {
+  wifiAutoAdapter(guid) {
+    const key = autoGuidKey(guid);
+    return (this.wifiAuto.adapters || []).find(
+      (adapter) => autoGuidKey(adapter.adapterGuid) === key,
+    );
+  }
+
+  wifiAutoRule(guid) {
+    const key = autoGuidKey(guid);
+    return (this.wifiAuto.rules || []).find(
+      (rule) => autoGuidKey(rule.adapterGuid) === key,
+    );
+  }
+
+  wifiAutoStatus(guid) {
+    const key = autoGuidKey(guid);
+    return (this.wifiAuto.statuses || []).find(
+      (status) => autoGuidKey(status.adapterGuid) === key,
+    );
+  }
+
+  wifiAutoProfiles(guid, item, adapterInfo) {
+    if (Array.isArray(adapterInfo?.profiles)) return adapterInfo.profiles;
+    const profiles = this.wifiProfiles.get(item?.alias);
+    return Array.isArray(profiles) ? profiles : [];
+  }
+
+  wifiAutoDraft(guid, item, adapterInfo) {
+    const key = autoGuidKey(guid);
+    const existing = this.wifiAutoDrafts.get(key);
+    if (existing) return existing;
+    const rule = this.wifiAutoRule(guid);
+    const draft = {
+      adapterGuid: rule?.adapterGuid || guid,
+      interfaceName: item?.alias || adapterInfo?.interfaceName || "",
+      profileName: rule?.profileName || item?.wifi?.currentProfile || "",
+      intervalSeconds: Number(rule?.intervalSeconds) || 60,
+      enabled: Boolean(rule?.enabled),
+    };
+    this.wifiAutoDrafts.set(key, draft);
+    return draft;
+  }
+
+  updateWifiAutoDraft(guid, patch) {
+    const key = autoGuidKey(guid);
+    const current = this.wifiAutoDrafts.get(key) || {
+      adapterGuid: guid,
+      profileName: "",
+      intervalSeconds: 60,
+      enabled: false,
+    };
+    this.wifiAutoDrafts.set(key, { ...current, ...patch });
+    this.requestUpdate();
+  }
+
+  toggleWifiAutoEditor(guid, open = !this.wifiAutoEditing.has(autoGuidKey(guid))) {
+    const key = autoGuidKey(guid);
+    open ? this.wifiAutoEditing.add(key) : this.wifiAutoEditing.delete(key);
+    if (!open) this.wifiAutoDrafts.delete(key);
+    this.requestUpdate();
+  }
+
+  wifiAutoRuleInput(draft) {
+    return {
+      adapterGuid: draft.adapterGuid,
+      profileName: String(draft.profileName || ""),
+      intervalSeconds: Number(draft.intervalSeconds),
+      enabled: Boolean(draft.enabled),
+    };
+  }
+
+  async saveWifiAuto(draft) {
+    const rule = this.wifiAutoRuleInput(draft);
+    if (!rule.adapterGuid || !rule.profileName)
+      return this.notify(this.t("wifiAutoProfileRequired"), "error");
+    if (!Number.isInteger(rule.intervalSeconds) || rule.intervalSeconds < 5 || rule.intervalSeconds > 86400)
+      return this.notify(this.t("wifiAutoIntervalInvalid"), "error");
+    const key = `wifi-auto:${autoGuidKey(rule.adapterGuid)}`;
+    const preview = await this.preview(`${key}:preview`, () => api.previewWifiAuto(rule));
+    if (!preview) return;
+    this.requestConfirmation(
+      [
+        `${draft.interfaceName || rule.adapterGuid} · ${rule.profileName}`,
+        this.t("wifiAutoConfirm"),
+        ...this.warningsOf(preview),
+      ],
+      async () => {
+        const result = await this.run(
+          key,
+          () => api.saveWifiAuto(preview.rule || rule, preview.confirmationToken),
+          [],
+          `${this.t("wifiAutoConnect")} · ${draft.interfaceName || ""}`,
+        );
+        if (result) {
+          this.wifiAutoEditing.delete(autoGuidKey(rule.adapterGuid));
+          await this.loadWifiAutoStatus();
+        }
+      },
+      false,
+      { title: this.t("confirmAutoTitle"), confirmLabel: this.t("save") },
+    );
+  }
+
+  async disableWifiAuto(guid) {
+    const key = `wifi-auto:${autoGuidKey(guid)}`;
+    const result = await this.run(key, () => api.disableWifiAuto(guid), []);
+    if (result) {
+      const draft = this.wifiAutoDrafts.get(autoGuidKey(guid));
+      if (draft) {
+        this.wifiAutoDrafts.set(autoGuidKey(guid), { ...draft, enabled: false });
+        this.requestUpdate();
+      }
+      await this.loadWifiAutoStatus();
+    }
+  }
+
+  removeWifiAuto(guid, name = "") {
+    this.requestConfirmation(
+      [name || guid, this.t("wifiAutoRemoveHelp")],
+      async () => {
+        const key = `wifi-auto:${autoGuidKey(guid)}`;
+        const result = await this.run(key, () => api.removeWifiAuto(guid), []);
+        if (result) {
+          this.wifiAutoDrafts.delete(autoGuidKey(guid));
+          this.wifiAutoEditing.delete(autoGuidKey(guid));
+          await this.loadWifiAutoStatus();
+        }
+      },
+      true,
+      { title: this.t("confirmRemoveAutoTitle"), confirmLabel: this.t("remove") },
+    );
+  }
+
+  wifiAutoStateText(state) {
+    const value = String(state || "").toLowerCase();
+    const labels = {
+      active: "wifiAutoActive",
+      connected: "wifiAutoConnected",
+      waiting: "wifiAutoWaiting",
+      checking: "wifiAutoChecking",
+      disabled: "wifiAutoDisabled",
+      "development-disabled": "wifiAutoDevelopmentDisabled",
+      development_disabled: "wifiAutoDevelopmentDisabled",
+      connecting: "wifiAutoConnecting",
+      error: "wifiAutoError",
+      failed: "wifiAutoError",
+    };
+    return labels[value] ? this.t(labels[value]) : state || this.t("wifiAutoWaiting");
+  }
+
+  wifiAutoStateClass(state) {
+    const value = String(state || "").toLowerCase();
+    if (["active", "connected"].includes(value)) return "success";
+    if (["error", "failed"].includes(value)) return "danger";
+    if (["connecting", "checking"].includes(value)) return "info";
+    return "neutral";
+  }
+
+  wifiAutoResultText(result) {
+    const labels = {
+      "already-connected": "wifiAutoResultAlreadyConnected",
+      "request-sent": "wifiAutoResultRequested",
+      connected: "wifiAutoResultConnected",
+      "observe-failed": "wifiAutoResultCheckFailed",
+      "connect-request-failed": "wifiAutoResultRequestFailed",
+      "verification-timeout": "wifiAutoResultTimeout",
+    };
+    return labels[result] ? this.t(labels[result]) : autoResultText(result);
+  }
+
+  activeAutoRuleCount() {
+    return (this.wifiAuto.rules || []).filter((rule) => rule.enabled).length;
+  }
+
+  // ---- Routes -------------------------------------------------------------
+
+  routeFormValues(form) {
+    const data = new FormData(form);
+    return {
       destinationPrefix: data.get("destinationPrefix"),
       nextHop: data.get("nextHop"),
       interfaceIndex: data.get("interfaceIndex"),
       routeMetric: data.get("routeMetric"),
       persistent: data.get("persistent") === "on",
     };
+  }
+
+  async addRoute(event) {
+    event.preventDefault();
+    if (!this.privilege.isAdmin)
+      return this.notify(this.t("permissionHelp"), "error");
+    const input = this.routeFormValues(event.currentTarget);
     const original = this.editingRoute;
     const key = original ? "route:edit" : "route:add";
-    const preview = await this.run(
-      key,
-      () => original ? api.previewEditRoute(original, input) : api.previewRoute(input),
-      [],
+    const preview = await this.preview(`${key}:preview`, () =>
+      original ? api.previewEditRoute(original, input) : api.previewRoute(input),
     );
     if (preview?.unchanged) return this.notify(this.t("routeUnchanged"));
     if (preview)
@@ -628,205 +959,108 @@ export class NetworkManagerApp extends LitElement {
         [
           ...(original ? [this.routeDescription(preview.oldRoute)] : []),
           this.routeDescription(preview.route),
-          ...(preview.warnings || []),
+          ...this.warningsOf(preview),
         ],
         async () => {
-          const result = await this.run(key, () => original
-            ? api.editRoute(preview.oldRoute, preview.route, preview.confirmationToken)
-            : api.addRoute(preview.route, preview.confirmationToken));
-          if (result && original) {
-            this.editingRoute = null;
-            this.requestUpdate();
-          }
+          const result = await this.run(
+            key,
+            () =>
+              original
+                ? api.editRoute(preview.oldRoute, preview.route, preview.confirmationToken)
+                : api.addRoute(preview.route, preview.confirmationToken),
+            ["interfaces", "routes"],
+            `${this.t(original ? "actRouteEdit" : "actRouteAdd")} · ${preview.route.destinationPrefix}`,
+          );
+          if (result) this.closeRouteDrawer();
         },
+        true,
+        { title: this.t(original ? "editRoute" : "addRoute") },
       );
   }
 
   routeDescription(route) {
-    return `${route.destinationPrefix} → ${route.nextHop} · #${route.interfaceIndex} · ${this.t("metric")} ${route.routeMetric} · ${route.persistent ? this.t("persistent") : "Temporary"}`;
+    return `${route.destinationPrefix} → ${route.nextHop} · #${route.interfaceIndex} · ${this.t("metric")} ${route.routeMetric} · ${route.persistent ? this.t("persistent") : this.t("temporary")}`;
   }
 
   routeBusy() {
     return [...this.busy].some((key) => key.startsWith("route:"));
   }
 
-  async startRouteEdit(route) {
-    this.editingRoute = { ...route };
+  openRouteDrawer(route = null) {
+    this.editingRoute = route ? { ...route } : null;
+    this.routeDraft = route
+      ? {
+          destinationPrefix: route.destinationPrefix,
+          nextHop: route.nextHop,
+          interfaceIndex: String(route.interfaceIndex),
+          routeMetric: String(route.routeMetric ?? 5),
+        }
+      : null;
+    this.routeFormVersion += 1;
+    this.routeDrawerOpen = true;
     this.requestUpdate();
+  }
+
+  closeRouteDrawer() {
+    this.routeDrawerOpen = false;
+    this.editingRoute = null;
+    this.routeDraft = null;
+    this.requestUpdate();
+  }
+
+  async startRouteEdit(route) {
+    this.openRouteDrawer(route);
     await this.updateComplete;
-    this.querySelector(".route-form")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     this.querySelector('[name="destinationPrefix"]')?.focus({ preventScroll: true });
   }
 
   async makePersistent(route) {
     const key = `route:persist:${route.destinationPrefix}:${route.interfaceIndex}:${route.nextHop}`;
-    const preview = await this.run(key, () => api.previewPersistRoute(route), []);
+    const preview = await this.preview(`${key}:preview`, () => api.previewPersistRoute(route));
     if (preview)
       this.requestConfirmation(
-        [`${preview.route.destinationPrefix} → ${preview.route.nextHop}`, ...(preview.warnings || [])],
-        () => this.run(key, () => api.persistRoute(preview.route, preview.confirmationToken)),
+        [`${preview.route.destinationPrefix} → ${preview.route.nextHop}`, ...this.warningsOf(preview)],
+        () =>
+          this.run(
+            key,
+            () => api.persistRoute(preview.route, preview.confirmationToken),
+            ["interfaces", "routes"],
+            `${this.t("actRoutePersist")} · ${route.destinationPrefix}`,
+          ),
+        true,
+        { title: this.t("makePersistent"), confirmLabel: this.t("makePersistent") },
       );
-  }
-
-  renderRoutes() {
-    const rows = this.routeRows();
-    const routeInterfaces = this.interfaces().filter((item) => item.metrics?.ipv4);
-    return html`<section class="view-stack">
-      <div class="toolbar route-filters">
-        <label
-          >${this.t("routeSearch")}<input
-            type="search"
-            .value=${this.routeSearch}
-            @input=${(event) => {
-              this.routeSearch = event.target.value;
-              this.requestUpdate();
-            }} /></label
-        ><label
-          >${this.t("type")}<select
-            .value=${this.routeFamily}
-            @change=${(event) => {
-              this.routeFamily = event.target.value;
-              this.requestUpdate();
-            }}
-          >
-            <option value="IPv4">IPv4</option>
-            <option value="IPv6">IPv6</option>
-            <option value="all">All</option>
-          </select></label
-        ><label class="toggle"
-          ><input
-            type="checkbox"
-            .checked=${this.settings.showAllRoutes}
-            @change=${(event) => this.updateSettings({ showAllRoutes: event.target.checked })}
-          />${this.t("showAllRoutes")}</label
-        ><button class="secondary" @click=${() => this.refresh(["routes"])}>
-          ${this.t("refresh")}
-        </button>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Family</th>
-              <th>${this.t("destination")}</th>
-              <th>${this.t("nextHop")}</th>
-              <th>${this.t("interface")}</th>
-              <th>${this.t("metric")}</th>
-              <th>${this.t("type")}</th>
-              <th>${this.t("actions")}</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${
-              rows.length
-                ? rows.map(
-                    (route) =>
-                      html`<tr>
-                        <td>${route.addressFamily}</td>
-                        <td>${route.destinationPrefix}</td>
-                        <td>${route.onLink ? "On-link" : route.nextHop}</td>
-                        <td>
-                          ${route.interfaceAlias} (#${route.interfaceIndex})
-                        </td>
-                        <td>${route.effectiveMetric ?? route.routeMetric}</td>
-                        <td>
-                          ${route.persistent ? "Persistent" : "Temporary"}${route.systemManaged ? " / System" : ""}
-                        </td>
-                        <td>
-                          ${route.removable ? html`<button class="secondary compact" ?disabled=${!this.privilege.isAdmin || this.routeBusy()} @click=${() => this.startRouteEdit(route)}>${this.t("edit")}</button>` : nothing}
-                          ${route.removable && !route.persistent ? html`<button class="secondary compact" ?disabled=${!this.privilege.isAdmin || this.routeBusy()} @click=${() => this.makePersistent(route)}>${this.t("makePersistent")}</button>` : nothing}
-                          ${route.removable ? html`<button class="danger compact" ?disabled=${!this.privilege.isAdmin || this.routeBusy()} @click=${() => this.removeRoute(route)}>${this.t("remove")}</button>` : "—"}
-                        </td>
-                      </tr>`,
-                  )
-                : html`<tr>
-                    <td colspan="7" class="empty">${this.t("noRoutes")}</td>
-                  </tr>`
-            }
-          </tbody>
-        </table>
-      </div>
-      ${keyed(this.editingRoute, html`<form class="panel route-form" @submit=${this.addRoute}>
-        <h2>${this.t(this.editingRoute ? "editRoute" : "addRoute")}</h2>
-        <label
-          >${this.t("destination")}<input
-            name="destinationPrefix"
-            .value=${this.editingRoute?.destinationPrefix || ""}
-            placeholder="172.16.0.0/12"
-            required /></label
-        ><label
-          >${this.t("nextHop")}<input
-            name="nextHop"
-            .value=${this.editingRoute?.nextHop || ""}
-            placeholder="192.168.3.1"
-            required /></label
-        ><label
-          >${this.t("interface")}<select name="interfaceIndex">
-            ${this.editingRoute && !routeInterfaces.some((item) => item.interfaceIndex === this.editingRoute.interfaceIndex)
-              ? html`<option value=${this.editingRoute.interfaceIndex} selected>${this.editingRoute.interfaceAlias || this.t("interface")} (#${this.editingRoute.interfaceIndex})</option>`
-              : nothing}
-            ${routeInterfaces
-              .map(
-                (item) =>
-                  html`<option value=${item.interfaceIndex} ?selected=${this.editingRoute?.interfaceIndex === item.interfaceIndex}>
-                    ${item.alias} (#${item.interfaceIndex})
-                  </option>`,
-              )}
-          </select></label
-        ><label
-          >${this.t("metric")}<input
-            name="routeMetric"
-            title=${this.t("routeMetricHelp")}
-            type="number"
-            min="1"
-            max="9999"
-            .value=${String(this.editingRoute?.routeMetric ?? 5)}
-            required /></label
-        ><label class="toggle"
-          ><input
-            name="persistent"
-            type="checkbox"
-            .checked=${Boolean(this.editingRoute?.persistent)}
-          />${this.t("persistent")}</label
-        ><button
-          class="primary"
-          ?disabled=${!this.privilege.isAdmin || this.routeBusy()}
-        >
-          ${this.routeBusy() ? this.t("working") : this.t(this.editingRoute ? "saveRoute" : "addRoute")}</button
-        >${this.editingRoute ? html`<button type="button" class="secondary" ?disabled=${this.routeBusy()} @click=${() => { this.editingRoute = null; this.requestUpdate(); }}>${this.t("cancel")}</button>` : nothing}
-        ${!this.privilege.isAdmin ? html`<p class="permission-note">${this.t("permissionHelp")}</p>` : nothing}
-      </form>`)}
-    </section>`;
   }
 
   async removeRoute(route) {
-    const key = `route:remove:${route.destinationPrefix}`;
-    const preview = await this.run(
-      key,
-      () => api.previewRemoveRoute(route),
-      [],
-    );
+    const key = `route:remove:${route.destinationPrefix}:${route.interfaceIndex}:${route.nextHop}`;
+    const preview = await this.preview(`${key}:preview`, () => api.previewRemoveRoute(route));
     if (preview)
       this.requestConfirmation(
-        [
-          `${route.destinationPrefix} → ${route.nextHop}`,
-          ...(preview.warnings || []),
-        ],
+        [`${route.destinationPrefix} → ${route.nextHop}`, ...this.warningsOf(preview)],
         () =>
-          this.run(key, () =>
-            api.removeRoute(
-              {
-                addressFamily: route.addressFamily,
-                destinationPrefix: route.destinationPrefix,
-                nextHop: route.nextHop,
-                interfaceIndex: route.interfaceIndex,
-                policyStores: route.policyStores,
-              },
-              preview.confirmationToken,
-            ),
+          this.run(
+            key,
+            () =>
+              api.removeRoute(
+                {
+                  addressFamily: route.addressFamily,
+                  destinationPrefix: route.destinationPrefix,
+                  nextHop: route.nextHop,
+                  interfaceIndex: route.interfaceIndex,
+                  policyStores: route.policyStores,
+                },
+                preview.confirmationToken,
+              ),
+            ["interfaces", "routes"],
+            `${this.t("actRouteRemove")} · ${route.destinationPrefix}`,
           ),
+        true,
+        { title: this.t("confirmRemoveRouteTitle"), confirmLabel: this.t("remove") },
       );
   }
+
+  // ---- Backups ------------------------------------------------------------
 
   openNameDialog(kind) {
     this.nameDialog = { kind, value: "" };
@@ -846,7 +1080,7 @@ export class NetworkManagerApp extends LitElement {
       await this.run("snapshot", () => api.recentSnapshot(name), [
         "interfaces",
         "routes",
-      ]);
+      ], `${this.t("saveSnapshot")} · ${name}`);
     else
       await this.run(
         "profile",
@@ -859,320 +1093,570 @@ export class NetworkManagerApp extends LitElement {
             },
           }),
         [],
+        `${this.t("saveProfile")} · ${name}`,
       );
-    try {
-      this.config = { ...this.config, ...(await api.profiles()) };
-    } catch {
-      /* refresh is best effort */
-    }
-    this.requestUpdate();
   }
 
-  restoreProfile(item, recent = false) {
-    const key = `${recent ? "recent" : "profile"}:${item.id}`;
-    this.run(
-      key,
-      () => (recent ? api.recentPreview(item.id) : api.profilePreview(item.id)),
-      [],
-    ).then((preview) => {
-      if (preview)
-        this.requestConfirmation([preview.summary], () =>
-          this.run(key, () =>
-            recent
-              ? api.recentRestore(item.id, preview.confirmationToken)
-              : api.profileRestore(item.id, preview.confirmationToken),
-          ),
-        );
+  restoreChangeRows(changes = []) {
+    return changes.map((change) => {
+      switch (change.kind) {
+        case "metric": {
+          const describe = (value) =>
+            value?.automatic
+              ? `${this.t("automaticMetric")}${value.metric != null ? ` (${value.metric})` : ""}`
+              : String(value?.metric ?? "—");
+          return {
+            label: `${change.alias || `#${change.interfaceIndex}`} · ${change.addressFamily} ${this.t("metric")}`,
+            before: describe(change.before),
+            after: describe(change.after),
+          };
+        }
+        case "routeAdd":
+        case "routeRemove": {
+          const route = change.route || {};
+          return {
+            label: this.t(change.kind === "routeAdd" ? "changeRouteAdd" : "changeRouteRemove"),
+            after: `${route.destinationPrefix} → ${route.nextHop} · ${route.interfaceAlias || `#${route.interfaceIndex}`}`,
+            kind: change.kind === "routeAdd" ? "add" : "remove",
+          };
+        }
+        case "adapter":
+          return {
+            label: change.alias || `#${change.interfaceIndex}`,
+            after: this.t(change.action === "disable" ? "disabled" : "enabled"),
+            kind: change.action === "disable" ? "remove" : "add",
+          };
+        case "wifi":
+          return {
+            label: `${change.interfaceName} · Wi-Fi`,
+            before: change.before || this.t("disconnected"),
+            after: change.action === "disconnect" ? this.t("disconnected") : change.after || "—",
+          };
+        default:
+          return { label: this.t("changeSkipped"), after: this.msg(change), kind: "skip" };
+      }
     });
   }
 
-  renderProfiles() {
-    return html`<section class="view-stack">
-      <div class="toolbar">
-        <button class="primary" @click=${() => this.openNameDialog("snapshot")}>
-          ${this.t("saveSnapshot")}</button
-        ><button
-          class="secondary"
-          ?disabled=${!this.network.overview || !this.network.routes}
-          @click=${() => this.openNameDialog("profile")}
-        >
-          ${this.t("saveProfile")}
-        </button>
-      </div>
-      <section class="panel">
-        <h2>${this.t("savedProfiles")}</h2>
-        <div class="list">
-          ${
-            this.config.profiles?.length
-              ? this.config.profiles.map(
-                  (item) =>
-                    html`<div class="list-row">
-                      <div>
-                        <strong>${item.name}</strong
-                        ><small
-                          >${formatTime(item.updatedAt || item.createdAt, this.settings.language)}</small
-                        >
-                      </div>
-                      <div>
-                        <button
-                          class="secondary"
-                          ?disabled=${!this.privilege.isAdmin}
-                          @click=${() => this.restoreProfile(item)}
-                        >
-                          ${this.t("restore")}</button
-                        ><button
-                          class="danger"
-                          @click=${async () => {
-                            await this.run(`delete:${item.id}`, () => api.deleteProfile(item.id), []);
-                            await this.refreshConfig().catch(() => {});
-                          }}
-                        >
-                          ${this.t("delete")}
-                        </button>
-                      </div>
-                    </div>`,
-                )
-              : html`<p class="empty">—</p>`
-          }
-        </div>
-      </section>
-      <section class="panel">
-        <h2>${this.t("recentSnapshots")}</h2>
-        <div class="list">
-          ${
-            this.config.recentSnapshots?.length
-              ? this.config.recentSnapshots.map(
-                  (item) =>
-                    html`<div class="list-row">
-                      <div>
-                        <strong>${item.name}</strong
-                        ><small
-                          >${formatTime(item.lastUsedAt, this.settings.language)}</small
-                        >
-                      </div>
-                      <button
-                        class="secondary"
-                        ?disabled=${!this.privilege.isAdmin}
-                        @click=${() => this.restoreProfile(item, true)}
-                      >
-                        ${this.t("restore")}
-                      </button>
-                    </div>`,
-                )
-              : html`<p class="empty">—</p>`
-          }
-        </div>
-      </section>
-    </section>`;
+  async restoreProfile(item, recent = false) {
+    const key = `${recent ? "recent" : "profile"}:${item.id}`;
+    const preview = await this.preview(`${key}:preview`, () =>
+      recent ? api.recentPreview(item.id) : api.profilePreview(item.id),
+    );
+    if (!preview) return;
+    const rows = this.restoreChangeRows(preview.changes);
+    const hasDiff = Array.isArray(preview.changes);
+    this.requestConfirmation(
+      [
+        item.name,
+        hasDiff && !rows.length ? this.t("restoreNoDifferences") : this.summaryOf(preview),
+        ...this.warningsOf(preview),
+      ],
+      () =>
+        this.run(
+          key,
+          () =>
+            recent
+              ? api.recentRestore(item.id, preview.confirmationToken)
+              : api.profileRestore(item.id, preview.confirmationToken),
+          ["interfaces", "routes"],
+          `${this.t("actRestore")} · ${item.name}`,
+        ),
+      true,
+      {
+        title: this.t("confirmRestoreTitle"),
+        confirmLabel: this.t("restore"),
+        rows,
+        note: preview.unchangedCount
+          ? this.tf("restoreUnchangedCount", { count: preview.unchangedCount })
+          : "",
+      },
+    );
   }
 
-  renderDiagnostics() {
-    const changes = this.diagnostics?.changes || {};
-    const findings = [
-      ...(changes.interfaces || []).map((item) => `${item.alias || item.interfaceIndex}: ${this.t("configurationChange")}`),
-      ...(changes.staticRoutes || []).map((route) => `${route.destinationPrefix}: ${this.t("staticRouteFound")}`),
+  deleteProfile(item) {
+    this.requestConfirmation(
+      [item.name, this.t("deleteProfileHelp")],
+      () => this.run(`delete:${item.id}`, () => api.deleteProfile(item.id), [], `${this.t("actDelete")} · ${item.name}`),
+      true,
+      { title: this.t("confirmDeleteTitle"), confirmLabel: this.t("delete") },
+    );
+  }
+
+  deleteRecent(item) {
+    this.requestConfirmation(
+      [item.name, this.t("deleteRecentHelp")],
+      () => this.run(`delete-recent:${item.id}`, () => api.deleteRecent(item.id), [], `${this.t("actDelete")} · ${item.name}`),
+      true,
+      { title: this.t("confirmDeleteTitle"), confirmLabel: this.t("delete") },
+    );
+  }
+
+  // ---- Diagnostics and recovery ------------------------------------------
+
+  async generateDiagnostics() {
+    const report = await this.preview("diagnostics", () => api.diagnostics());
+    if (report) {
+      this.diagnostics = report;
+      this.requestUpdate();
+    }
+  }
+
+  async undoLastChange() {
+    const preview = await this.preview("reset-preview", () => api.resetPreview());
+    if (!preview) return;
+    const items = Array.isArray(preview.scopeItems)
+      ? preview.scopeItems.map((item) => this.msg(item))
+      : Object.keys(preview.scope || {}).map((key) => `${this.t("affected")}: ${key}`);
+    const baseline = preview.baseline;
+    this.requestConfirmation(
+      [
+        baseline
+          ? this.tf("baselineRecorded", {
+              name: baseline.name || this.t("undoLastChange"),
+              time: formatTime(baseline.createdAt, this.settings.language),
+            })
+          : "",
+        ...items,
+        ...this.warningsOf(preview),
+      ],
+      () => this.run("reset", () => api.reset(preview.confirmationToken), ["interfaces", "routes"], this.t("undoLastChange")),
+      true,
+      { title: this.t("undoLastChange"), confirmLabel: this.t("undo") },
+    );
+  }
+
+  defaultsCandidates() {
+    return this.interfaces().filter((item) => !item.systemInterface);
+  }
+
+  selectedDefaults() {
+    if (!this.defaultsSelection)
+      this.defaultsSelection = new Set(
+        this.defaultsCandidates().map((item) => item.interfaceIndex),
+      );
+    return this.defaultsSelection;
+  }
+
+  async restoreDefaults() {
+    const selected = this.selectedDefaults();
+    const selection = {
+      interfaceIndexes: this.defaultsCandidates()
+        .map((item) => item.interfaceIndex)
+        .filter((index) => selected.has(index)),
+      removeManagedRoutes: this.defaultsRemoveRoutes,
+    };
+    const preview = await this.preview("defaults-preview", () => api.defaultsPreview(selection));
+    if (!preview) return;
+    const rows = [
+      ...(preview.interfaces || []).map((item) => ({
+        label: item.alias,
+        after: this.t("automaticMetric"),
+      })),
+      ...(preview.managedRoutes || []).map((route) => ({
+        label: this.t("changeRouteRemove"),
+        after: `${route.destinationPrefix} → ${route.nextHop}`,
+        kind: "remove",
+      })),
     ];
-    return html`<section class="view-stack">
-      <div class="toolbar">
-        <button
-          class="primary"
-          ?disabled=${this.isBusy("diagnostics")}
-          @click=${() =>
-            this.run(
-              "diagnostics",
-              async () => {
-                this.diagnostics = await api.diagnostics();
-                this.requestUpdate();
-                return { message: this.t("operationComplete") };
-              },
-              [],
-            )}
+    this.requestConfirmation(
+      preview.notices?.length
+        ? this.warningsOf(preview)
+        : [preview.metrics, preview.routes, preview.wifi],
+      () =>
+        this.run(
+          "defaults",
+          () => api.defaults(selection, preview.confirmationToken),
+          ["interfaces", "routes"],
+          this.t("restoreDefaults"),
+        ),
+      true,
+      { title: this.t("restoreDefaults"), confirmLabel: this.t("restore"), rows },
+    );
+  }
+
+  // ---- Rendering ----------------------------------------------------------
+
+  viewSubtitle() {
+    const adapters = this.interfaces();
+    const online = adapters.filter(isAdapterOnline).length;
+    switch (this.view) {
+      case "overview":
+      case "adapters":
+        return this.tf("subtitleAdapters", { total: adapters.length, online });
+      case "routes":
+        return this.tf("routeCount", {
+          shown: this.routeRows().length,
+          total: (this.network.routes?.routes || []).length,
+        });
+      case "profiles":
+        return this.tf("subtitleBackups", {
+          profiles: this.config.profiles?.length || 0,
+          recent: this.config.recentSnapshots?.length || 0,
+        });
+      default:
+        return this.t(`${this.view}Subtitle`);
+    }
+  }
+
+  renderNav() {
+    const activeRules = this.activeAutoRuleCount();
+    const navButton = (view) =>
+      html`<button
+        class="nav-item ${this.view === view ? "selected" : ""}"
+        aria-current=${this.view === view ? "page" : "false"}
+        title=${`${this.t(view)} (Ctrl+${views.indexOf(view) + 1})`}
+        @click=${() => this.setView(view)}
+      >
+        ${icon(view)}<span class="nav-label">${this.t(view)}</span>
+      </button>`;
+    return html`<aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">${icon("globe")}</span>
+        <div class="nav-label">
+          <strong>${this.t("appName")}</strong>
+          <small>${this.version ? `v${this.version}` : ""}</small>
+        </div>
+      </div>
+      <nav aria-label=${this.t("primaryNavigation")}>
+        ${views.filter((view) => view !== "settings").map(navButton)}
+      </nav>
+      <div class="sidebar-footer">
+        ${this.privilege.isAdmin
+          ? html`<div class="side-status admin" title=${this.t("administrator")}>
+              ${icon("shield")}
+              <div class="nav-label">
+                <strong>${this.t("administrator")}</strong>
+                <small>${this.t("adminReady")}</small>
+              </div>
+            </div>`
+          : html`<button
+              class="side-status"
+              title=${`${this.t("permissionHelp")} ${this.t("restartAdmin")}`}
+              ?disabled=${this.isBusy("elevation")}
+              @click=${() => this.restartAsAdmin()}
+            >
+              ${this.isBusy("elevation") ? spinner() : icon("user")}
+              <div class="nav-label">
+                <strong>${this.t("standardUser")}</strong>
+                <small class="side-action">${this.t("restartAdmin")}</small>
+              </div>
+            </button>`}
+        <div
+          class="side-status"
+          title=${activeRules ? this.tf("autoActiveCount", { count: activeRules }) : this.t("autoNone")}
         >
-          ${this.isBusy("diagnostics") ? this.t("working") : this.t("generateDiagnostics")}</button
-        ><button
-          class="secondary"
-          ?disabled=${!this.diagnostics}
-          @click=${async () => {
-            await navigator.clipboard.writeText(
-              JSON.stringify(this.diagnostics, null, 2),
-            );
-            this.notify(this.t("operationComplete"), "success");
+          ${icon("wifi")}
+          <div class="nav-label">
+            <strong>${this.t("wifiAutoConnect")}</strong>
+            <small
+              >${activeRules
+                ? this.tf("autoActiveCount", { count: activeRules })
+                : this.t("autoNone")}</small
+            >
+          </div>
+        </div>
+        ${navButton("settings")}
+      </div>
+    </aside>`;
+  }
+
+  renderHeader() {
+    const refreshing = this.isRefreshing();
+    const sourceLabel = this.network.stale ? this.t("cached") : this.t("live");
+    const running = this.activity.filter((entry) => entry.status === "running").length;
+    const attention = this.activity.filter((entry) => ["failed", "partial"].includes(entry.status) && !entry.seen).length;
+    return html`<header class="app-header">
+      <div class="title-block">
+        <h1>${this.t(this.view)}</h1>
+        <p>${this.viewSubtitle()}</p>
+      </div>
+      <div class="header-actions">
+        <span
+          class="freshness ${this.network.stale ? "stale" : ""} ${refreshing ? "refreshing" : ""}"
+          title=${`${sourceLabel} · ${this.network.source} · ${formatTime(this.network.refreshedAt, this.settings.language)}`}
+          ><span class="pulse-dot"></span>${refreshing
+            ? this.t("refreshing")
+            : `${sourceLabel} · ${formatRelative(this.network.refreshedAt, this.settings.language)}`}</span
+        >
+        <button
+          class="icon-button standard"
+          title=${`${this.t("refresh")} (F5)`}
+          aria-label=${this.t("refresh")}
+          ?disabled=${refreshing}
+          @click=${() => this.refresh(["interfaces", "routes"], true)}
+        >
+          ${refreshing ? spinner() : icon("refresh")}
+        </button>
+        <button
+          class="icon-button standard activity-button"
+          title=${this.t("activity")}
+          aria-label=${this.t("activity")}
+          @click=${() => {
+            this.activityOpen = true;
+            this.activity.forEach((entry) => (entry.seen = true));
+            this.requestUpdate();
           }}
         >
-          ${this.t("copyReport")}
+          ${running ? spinner() : icon("activity")}${attention
+            ? html`<span class="badge">${attention}</span>`
+            : nothing}
         </button>
       </div>
-      ${this.diagnostics ? html`<section class="panel"><h2>${this.t("diagnosticSummary")}</h2>${findings.length ? html`<ul class="findings">${findings.map((finding) => html`<li>${finding}</li>`)}</ul>` : html`<p>${this.t("noChanges")}</p>`}<details><summary>${this.t("technicalDetails")}</summary><pre class="diagnostics">${JSON.stringify(this.diagnostics, null, 2)}</pre></details></section>` : html`<p class="empty">${this.t("diagnosticsIdle")}</p>`}
-    </section>`;
+    </header>`;
   }
 
-  renderMaintenance() {
-    return html`<section class="view-stack">
-      <section class="panel danger-zone">
-        <h2>${this.t("undoLastChange")}</h2>
-        <p>
-          ${this.config.hasBaseline ? this.t("changes") : this.t("noBaseline")}
-        </p>
-        <button
-          class="warning"
-          ?disabled=${!this.config.hasBaseline || !this.privilege.isAdmin}
-          @click=${async () => {
-            const preview = await this.run(
-              "reset-preview",
-              () => api.resetPreview(),
-              [],
-            );
-            if (preview)
-              this.requestConfirmation([this.t("undoLastChange"), ...Object.keys(preview.scope || {}).map((key) => `${this.t("affected")}: ${key}`)], () =>
-                this.run("reset", () => api.reset(preview.confirmationToken)),
-              );
-          }}
-        >
-          ${this.t("undoLastChange")}
-        </button>
-      </section>
-      <section class="panel danger-zone">
-        <h2>${this.t("restoreDefaults")}</h2>
-        <p>${this.t("defaultsHelp")}</p>
-        <div class="default-interface-list">
-          ${this.interfaces()
-            .filter((item) => !item.systemInterface)
-            .map(
-              (item) =>
-                html`<label class="toggle"
-                  ><input
-                    data-default-adapter
-                    type="checkbox"
-                    value=${item.interfaceIndex}
-                    checked
-                  />${item.alias}</label
-                >`,
-            )}
-        </div>
-        <label class="toggle"
-          ><input
-            id="remove-managed"
-            type="checkbox"
-            checked
-          />${this.t("removeManagedRoutes")}</label
-        ><button
-          class="danger"
-          ?disabled=${!this.privilege.isAdmin}
-          @click=${async () => {
-            const selection = {
-              interfaceIndexes: [
-                ...this.querySelectorAll("input[data-default-adapter]:checked"),
-              ].map((input) => Number(input.value)),
-              removeManagedRoutes:
-                this.querySelector("#remove-managed").checked,
-            };
-            const preview = await this.run(
-              "defaults-preview",
-              () => api.defaultsPreview(selection),
-              [],
-            );
-            if (preview)
-              this.requestConfirmation(
-                [
-                  this.t("restoreDefaults"),
-                  ...(preview.interfaces || []).map((item) => item.alias),
-                ],
-                () =>
-                  this.run("defaults", () =>
-                    api.defaults(selection, preview.confirmationToken),
-                  ),
-              );
-          }}
-        >
-          ${this.t("restoreDefaults")}
-        </button>
-      </section>
-    </section>`;
-  }
-
-  renderView() {
-    return {
-      overview: this.renderOverview,
-      adapters: this.renderAdapters,
-      routes: this.renderRoutes,
-      profiles: this.renderProfiles,
-      diagnostics: this.renderDiagnostics,
-      maintenance: this.renderMaintenance,
-    }[this.view].call(this);
-  }
-
-  renderOverlay() {
-    if (this.confirmation)
-      return html`<div class="modal-backdrop" role="presentation">
-        <section
-          class="modal"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="confirm-heading"
-        >
-          <h2 id="confirm-heading">${this.t("confirm")}</h2>
-          <ul>
-            ${this.confirmation.lines.map((line) => html`<li>${line}</li>`)}
-          </ul>
-          <div class="modal-actions">
-            <button class="secondary" @click=${this.closeConfirmation}>
-              ${this.t("cancel")}</button
-            ><button
-              class=${this.confirmation.destructive ? "danger" : "primary"}
-              @click=${this.confirm}
-            >
-              ${this.t("confirm")}
-            </button>
-          </div>
-        </section>
-      </div>`;
-    if (this.nameDialog)
-      return html`<div class="modal-backdrop" role="presentation">
-        <form
-          class="modal"
-          @submit=${this.saveNamed}
-          role="dialog"
-          aria-modal="true"
-        >
-          <h2>
-            ${this.nameDialog.kind === "snapshot" ? this.t("snapshotName") : this.t("configurationName")}
-          </h2>
-          <label><input name="name" required autofocus /></label>
-          <div class="modal-actions">
+  renderToasts() {
+    const icons = { success: "success", error: "error", warning: "warning", info: "info" };
+    return html`<div class="toast-host" role="status" aria-live="polite">
+      ${this.toasts.map(
+        (toast) =>
+          html`<div class="toast ${toast.kind}">
+            ${icon(icons[toast.kind] || "info")}
+            <span>${toast.text}</span>
             <button
-              type="button"
-              class="secondary"
-              @click=${this.closeNameDialog}
+              class="icon-button subtle"
+              aria-label=${this.t("close")}
+              @click=${() => this.dismissToast(toast.id)}
             >
-              ${this.t("cancel")}</button
-            ><button class="primary">${this.t("save")}</button>
-          </div>
-        </form>
+              ${icon("close")}
+            </button>
+          </div>`,
+      )}
+    </div>`;
+  }
+
+  renderActivityResults(result) {
+    const steps = Array.isArray(result?.results) ? result.results : [];
+    if (!steps.length) return nothing;
+    const status = (step) => String(step.status || "").toLowerCase();
+    return html`<ul class="step-list">
+      ${steps.map(
+        (step) =>
+          html`<li class=${status(step)}>
+            ${icon(
+              status(step) === "failed" ? "error" : status(step) === "skipped" ? "info" : "success",
+            )}<span
+              >${step.kind ? html`<strong>${step.kind}</strong> ` : nothing}${step.message ||
+              step.error ||
+              step.alias ||
+              step.destinationPrefix ||
+              step.status ||
+              ""}</span
+            >
+          </li>`,
+      )}
+    </ul>`;
+  }
+
+  renderActivity() {
+    const statusIcon = { success: "success", partial: "warning", failed: "error" };
+    return html`<header class="drawer-header">
+        <h2>${this.t("activity")}</h2>
+        <button
+          class="icon-button subtle"
+          aria-label=${this.t("close")}
+          @click=${() => {
+            this.activityOpen = false;
+            this.requestUpdate();
+          }}
+        >
+          ${icon("close")}
+        </button>
+      </header>
+      <div class="drawer-body">
+        <p class="help-text">${this.t("activityHelp")}</p>
+        ${this.activity.length
+          ? html`<ol class="activity-list">
+              ${this.activity.map(
+                (entry) =>
+                  html`<li class="activity-entry ${entry.status}">
+                    <span class="activity-icon"
+                      >${entry.status === "running" ? spinner() : icon(statusIcon[entry.status])}</span
+                    >
+                    <div>
+                      <strong>${entry.label}</strong>
+                      <small>${formatTime(entry.time, this.settings.language)}</small>
+                      ${entry.message ? html`<p>${entry.message}</p>` : nothing}
+                      ${this.renderActivityResults(entry.result)}
+                      ${entry.result
+                        ? html`<details>
+                            <summary>${this.t("technicalDetails")}</summary>
+                            <pre>${JSON.stringify(entry.result, null, 2)}</pre>
+                          </details>`
+                        : nothing}
+                    </div>
+                  </li>`,
+              )}
+            </ol>`
+          : html`<p class="empty">${this.t("activityEmpty")}</p>`}
       </div>`;
-    return nothing;
+  }
+
+  renderConfirmation() {
+    const confirmation = this.confirmation;
+    return html`<form
+      class="dialog-body"
+      @submit=${(event) => {
+        event.preventDefault();
+        this.confirm();
+      }}
+    >
+      <h2 id="dialog-heading" class="dialog-title ${confirmation.destructive ? "is-danger" : ""}">
+        ${icon(confirmation.destructive ? "warning" : "info")}${confirmation.title}
+      </h2>
+      ${confirmation.rows.length
+        ? html`<div class="change-rows">
+            ${confirmation.rows.map(
+              (row) =>
+                html`<div class="change-row ${row.kind || ""}">
+                  <small>${row.label}</small>
+                  <span
+                    >${row.before != null
+                      ? html`<span class="before">${row.before}</span>${icon("arrowRight")}`
+                      : nothing}<span class="after">${row.after}</span></span
+                  >
+                </div>`,
+            )}
+          </div>`
+        : nothing}
+      <ul class="confirm-lines">
+        ${confirmation.lines.map((line) => html`<li>${line}</li>`)}
+      </ul>
+      ${confirmation.note ? html`<p class="help-text">${confirmation.note}</p>` : nothing}
+      <div class="dialog-actions">
+        <button
+          type="button"
+          class="standard"
+          ?data-autofocus=${confirmation.destructive}
+          @click=${() => this.closeConfirmation()}
+        >
+          ${this.t("cancel")}
+        </button>
+        <button
+          type="submit"
+          class=${confirmation.destructive ? "danger-fill" : "accent"}
+          ?data-autofocus=${!confirmation.destructive}
+        >
+          ${confirmation.confirmLabel}
+        </button>
+      </div>
+    </form>`;
+  }
+
+  renderNameDialog() {
+    const snapshot = this.nameDialog.kind === "snapshot";
+    return html`<form class="dialog-body" @submit=${this.saveNamed}>
+      <h2 id="dialog-heading" class="dialog-title">
+        ${icon(snapshot ? "save" : "profiles")}${snapshot ? this.t("saveSnapshot") : this.t("saveProfile")}
+      </h2>
+      <p class="help-text">${snapshot ? this.t("snapshotHelp") : this.t("profileHelp")}</p>
+      <label class="field"
+        >${snapshot ? this.t("snapshotName") : this.t("configurationName")}<input
+          name="name"
+          required
+          maxlength="80"
+          data-autofocus
+      /></label>
+      <div class="dialog-actions">
+        <button type="button" class="standard" @click=${() => this.closeNameDialog()}>
+          ${this.t("cancel")}
+        </button>
+        <button type="submit" class="accent">${this.t("save")}</button>
+      </div>
+    </form>`;
+  }
+
+  renderDialog() {
+    const content = this.confirmation
+      ? this.renderConfirmation()
+      : this.nameDialog
+        ? this.renderNameDialog()
+        : nothing;
+    return html`<dialog
+      id="app-dialog"
+      class="modal"
+      aria-labelledby="dialog-heading"
+      @cancel=${(event) => {
+        event.preventDefault();
+        this.closeConfirmation();
+        this.closeNameDialog();
+      }}
+      @click=${(event) => {
+        if (event.target === event.currentTarget) {
+          this.closeConfirmation();
+          this.closeNameDialog();
+        }
+      }}
+    >
+      ${content}
+    </dialog>`;
+  }
+
+  renderDrawers() {
+    const close = (event, handler) => {
+      event.preventDefault();
+      handler();
+    };
+    return html`<dialog
+        id="route-drawer"
+        class="drawer"
+        aria-labelledby="route-drawer-heading"
+        @cancel=${(event) => close(event, () => this.closeRouteDrawer())}
+        @click=${(event) => {
+          if (event.target === event.currentTarget) this.closeRouteDrawer();
+        }}
+      >
+        ${this.routeDrawerOpen ? renderRouteDrawer(this) : nothing}
+      </dialog>
+      <dialog
+        id="activity-drawer"
+        class="drawer"
+        aria-label=${this.t("activity")}
+        @cancel=${(event) =>
+          close(event, () => {
+            this.activityOpen = false;
+            this.requestUpdate();
+          })}
+        @click=${(event) => {
+          if (event.target === event.currentTarget) {
+            this.activityOpen = false;
+            this.requestUpdate();
+          }
+        }}
+      >
+        ${this.activityOpen ? this.renderActivity() : nothing}
+      </dialog>`;
+  }
+
+  syncDialog(selector, open) {
+    const dialog = this.querySelector(selector);
+    if (!dialog?.showModal) return;
+    if (open && !dialog.open) {
+      dialog.showModal();
+      (dialog.querySelector("[data-autofocus]") || dialog.querySelector("input, select, button"))?.focus();
+    } else if (!open && dialog.open) {
+      dialog.close();
+    }
+  }
+
+  updated() {
+    // Modal dialogs are stacked: the confirmation can open above the route drawer.
+    this.syncDialog("#route-drawer", this.routeDrawerOpen);
+    this.syncDialog("#activity-drawer", this.activityOpen);
+    this.syncDialog("#app-dialog", Boolean(this.confirmation || this.nameDialog));
   }
 
   render() {
     return html`<div class="app-shell">
       ${this.renderNav()}
       <main>
-        <div class="mobile-nav">
-          ${views.map(
-            (view) =>
-              html`<button
-                class=${this.view === view ? "selected" : ""}
-                @click=${() => {
-                  this.view = view;
-                  this.requestUpdate();
-                }}
-              >
-                ${this.t(view)}
-              </button>`,
-          )}
+        ${this.renderHeader()}
+        <div class="view" data-view=${this.view}>
+          ${viewRenderers[this.view](this)}
         </div>
-        ${this.renderHeader()}${this.message ? html`<div class="notice ${this.message.kind}" role="status"><span>${this.message.text}</span><button class="icon-button" aria-label=${this.t("close")} @click=${this.dismissMessage}>×</button></div>` : nothing}${this.renderView()}
       </main>
-      ${this.renderOverlay()}
+      ${this.renderToasts()} ${this.renderDrawers()} ${this.renderDialog()}
     </div>`;
   }
 }

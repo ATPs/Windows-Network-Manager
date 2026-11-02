@@ -1,3 +1,7 @@
+mod network_insights;
+mod wifi_auto_connect;
+mod wifi_windows;
+
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::Utc;
 use encoding_rs::GBK;
@@ -14,19 +18,30 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     ptr,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tauri::{AppHandle, Manager, State};
+use network_insights::{notice, notice_texts};
+use tauri::{AppHandle, Emitter, Manager, State};
+use wifi_auto_connect::{AutoConnectRule, AutoConnectSupervisor, DiscoveredAdapter};
 use uuid::Uuid;
 use windows_sys::Win32::UI::{
     Shell::{IsUserAnAdmin, ShellExecuteW},
-    WindowsAndMessaging::SW_SHOWNORMAL,
+    WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindowAsync, SW_RESTORE, SW_SHOWNORMAL},
+};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    WindowEvent,
+};
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, GetLastError, SetLastError, HANDLE, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0},
+    System::Threading::{CreateMutexW, OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE},
 };
 use windows_sys::Win32::{
     NetworkManagement::IpHelper::{
         GetAdaptersAddresses, GetIfEntry2, GetIpInterfaceEntry, InitializeIpInterfaceEntry,
-        GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_INCLUDE_PREFIX, IP_ADAPTER_ADDRESSES_LH, MIB_IF_ROW2,
+        GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_INCLUDE_PREFIX, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_DHCP_ENABLED, MIB_IF_ROW2,
         MIB_IPINTERFACE_ROW,
     },
     NetworkManagement::Ndis::{NET_IF_ADMIN_STATUS_DOWN, NET_IF_ADMIN_STATUS_UP},
@@ -133,6 +148,8 @@ struct AppConfig {
     managed_routes: Vec<Value>,
     #[serde(default)]
     route_notes: BTreeMap<String, String>,
+    #[serde(default)]
+    wifi_auto_connect: Vec<Value>,
 }
 fn schema_version() -> u32 {
     3
@@ -147,6 +164,7 @@ impl Default for AppConfig {
             baseline: None,
             managed_routes: vec![],
             route_notes: BTreeMap::new(),
+            wifi_auto_connect: vec![],
         }
     }
 }
@@ -165,15 +183,142 @@ struct AppState {
     cache_path: PathBuf,
     confirmations: Mutex<HashMap<String, Confirmation>>,
     discovery: Mutex<Option<DiscoveryCache>>,
+    config_lock: Mutex<()>,
+    tray_items: Mutex<Option<TrayItems>>,
+    wifi_auto_supervisor: Arc<AutoConnectSupervisor>,
+}
+
+struct TrayItems {
+    open: MenuItem<tauri::Wry>,
+    quit: MenuItem<tauri::Wry>,
+}
+
+fn tray_labels(language: &str) -> (&'static str, &'static str) {
+    if language == "zh-CN" { ("打开 Windows Network Manager", "退出") }
+    else { ("Open Windows Network Manager", "Quit") }
+}
+
+/// Queue a tooltip refresh on the UI thread. Never blocks the caller (worker
+/// threads included) and ignores every failure.
+fn schedule_tray_update(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || update_tray_tooltip(&handle));
+}
+fn update_tray_tooltip(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else { return };
+    let cfg = config(&state);
+    let overview = state
+        .discovery
+        .lock()
+        .ok()
+        .and_then(|cache| cache.as_ref().and_then(|item| item.snapshot.get("overview").cloned()))
+        .or_else(|| disk_cache(&state.cache_path).and_then(|snapshot| snapshot.get("overview").cloned()));
+    let enabled = wifi_auto_rules(&cfg)
+        .map(|rules| rules.iter().filter(|rule| rule.enabled).count())
+        .unwrap_or(0);
+    let failed = state
+        .wifi_auto_supervisor
+        .status_snapshot()
+        .iter()
+        .filter(|status| status.state == "failed")
+        .count();
+    let text = network_insights::tray_tooltip_text(
+        &cfg.settings.language,
+        overview.as_ref(),
+        enabled,
+        failed,
+        cfg!(debug_assertions),
+    );
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_tooltip(Some(text));
+    }
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+// The guard exists before Tauri initializes, preventing two launches from
+// starting workers even when they race or run at different integrity levels.
+struct InstanceGuard(HANDLE);
+impl Drop for InstanceGuard {
+    fn drop(&mut self) { unsafe { CloseHandle(self.0); } }
+}
+
+fn acquire_instance() -> Result<Option<InstanceGuard>, u32> {
+    acquire_named_instance("Local\\com.atps.windows-network-manager.instance")
+}
+
+fn acquire_named_instance(instance_name: &str) -> Result<Option<InstanceGuard>, u32> {
+    let name = wide_null(OsStr::new(instance_name));
+    unsafe {
+        SetLastError(0);
+        let handle = CreateMutexW(ptr::null(), 0, name.as_ptr());
+        let error = GetLastError();
+        if handle.is_null() {
+            // A standard process may lack write access to an elevated app's mutex.
+            return if error == ERROR_ACCESS_DENIED { Ok(None) } else { Err(error) };
+        }
+        if error == ERROR_ALREADY_EXISTS {
+            CloseHandle(handle);
+            Ok(None)
+        } else {
+            Ok(Some(InstanceGuard(handle)))
+        }
+    }
+}
+
+fn reveal_existing_instance() {
+    let title = wide_null(OsStr::new("Windows Network Manager"));
+    // The first process can own the mutex before its window has been created.
+    for _ in 0..50 {
+        let window = unsafe { FindWindowW(ptr::null(), title.as_ptr()) };
+        if !window.is_null() {
+            unsafe { ShowWindowAsync(window, SW_RESTORE); SetForegroundWindow(window); }
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn elevation_parent(args: &[String], current_pid: u32) -> Result<Option<u32>, &'static str> {
+    let mut parent = None;
+    for arg in args {
+        if let Some(value) = arg.strip_prefix("--wnm-wait-parent=") {
+            let pid = value.parse::<u32>().map_err(|_| "Invalid elevation handoff.")?;
+            if pid == 0 || pid == current_pid || parent.is_some() { return Err("Invalid elevation handoff."); }
+            parent = Some(pid);
+        }
+    }
+    Ok(parent)
+}
+
+fn wait_for_elevation_parent() -> Result<(), &'static str> {
+    let args: Vec<String> = std::env::args().collect();
+    let Some(pid) = elevation_parent(&args, std::process::id())? else { return Ok(()) };
+    unsafe {
+        let process = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if process.is_null() {
+            return if GetLastError() == ERROR_INVALID_PARAMETER { Ok(()) }
+                else { Err("Cannot wait for the previous instance.") };
+        }
+        let result = WaitForSingleObject(process, INFINITE);
+        CloseHandle(process);
+        if result == WAIT_OBJECT_0 { Ok(()) } else { Err("The previous instance did not exit.") }
+    }
 }
 
 const OVERVIEW_SCRIPT: &str = r#"
-$Adapters = @(Get-NetAdapter -IncludeHidden | ForEach-Object { [PSCustomObject]@{ interfaceIndex=[int]$_.InterfaceIndex; alias=[string]$_.Name; description=[string]$_.InterfaceDescription; guid=[string]$_.InterfaceGuid; macAddress=[string]$_.MacAddress; interfaceType=[int]$_.InterfaceType; hardwareInterface=[bool]$_.HardwareInterface; virtual=[bool]$_.Virtual; adminStatus=[string]$_.AdminStatus; operationalStatus=[string]$_.Status; mediaConnectionState=[string]$_.MediaConnectionState; linkSpeed=[string]$_.LinkSpeed } })
+$Adapters = @(Get-NetAdapter -IncludeHidden | ForEach-Object { [PSCustomObject]@{ interfaceIndex=[int]$_.InterfaceIndex; alias=[string]$_.Name; description=[string]$_.InterfaceDescription; guid=[string]$_.InterfaceGuid; macAddress=[string]$_.MacAddress; interfaceType=[int]$_.InterfaceType; hardwareInterface=[bool]$_.HardwareInterface; virtual=[bool]$_.Virtual; adminStatus=[string]$_.AdminStatus; operationalStatus=[string]$_.ifOperStatus; mediaConnectionState=[string]$_.MediaConnectionState; linkSpeed=[string]$_.LinkSpeed } })
 $IpInterfaces = @(Get-NetIPInterface | ForEach-Object { [PSCustomObject]@{ interfaceIndex=[int]$_.InterfaceIndex; alias=[string]$_.InterfaceAlias; addressFamily=[string]$_.AddressFamily; automaticMetric=([string]$_.AutomaticMetric -eq 'Enabled'); interfaceMetric=[long]$_.InterfaceMetric; connectionState=[string]$_.ConnectionState; dhcp=([string]$_.Dhcp -eq 'Enabled') } })
   $IpConfigurations = @(Get-NetRoute -DestinationPrefix 0.0.0.0/0,::/0 -ErrorAction SilentlyContinue | Group-Object InterfaceIndex | ForEach-Object { [PSCustomObject]@{ interfaceIndex=[int]$_.Name; alias=[string]$_.Group[0].InterfaceAlias; ipv4Gateways=@($_.Group | Where-Object { [string]$_.AddressFamily -eq 'IPv4' } | ForEach-Object { [string]$_.NextHop }); ipv6Gateways=@($_.Group | Where-Object { [string]$_.AddressFamily -eq 'IPv6' } | ForEach-Object { [string]$_.NextHop }) } })
 $Addresses = @(Get-NetIPAddress | ForEach-Object { [PSCustomObject]@{ interfaceIndex=[int]$_.InterfaceIndex; addressFamily=[string]$_.AddressFamily; ipAddress=[string]$_.IPAddress; prefixLength=[int]$_.PrefixLength; addressState=[string]$_.AddressState; type=[string]$_.Type } })
 $Dns = @(Get-DnsClientServerAddress | ForEach-Object { [PSCustomObject]@{ interfaceIndex=[int]$_.InterfaceIndex; addressFamily=[string]$_.AddressFamily; servers=@($_.ServerAddresses | ForEach-Object { [string]$_ }) } })
-$Profiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object { [PSCustomObject]@{ interfaceIndex=[int]$_.InterfaceIndex; name=[string]$_.Name; category=[string]$_.NetworkCategory } })
+$Profiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object { [PSCustomObject]@{ interfaceIndex=[int]$_.InterfaceIndex; name=[string]$_.Name; category=[string]$_.NetworkCategory; ipv4Connectivity=[string]$_.IPv4Connectivity; ipv6Connectivity=[string]$_.IPv6Connectivity } })
 [PSCustomObject]@{ adapters=$Adapters; ipInterfaces=$IpInterfaces; ipConfigurations=$IpConfigurations; addresses=$Addresses; dns=$Dns; connectionProfiles=$Profiles } | ConvertTo-Json -Compress -Depth 6
 "#;
 
@@ -203,19 +348,70 @@ New-NetRoute @p | Out-Null
 "#;
 
 pub fn run() {
+    if wait_for_elevation_parent().is_err() { return; }
+    let _instance = match acquire_instance() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => { reveal_existing_instance(); return; }
+        Err(error) => { eprintln!("Cannot initialize the single-instance guard: {error}"); return; }
+    };
     tauri::Builder::default()
         .setup(|app| {
             let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
             fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
             let config_path = config_dir.join(CONFIG_FILE);
             let cache_path = config_dir.join(CACHE_FILE);
+            let initial_rules = wifi_auto_rules(&config_from_path(&config_path)).unwrap_or_default();
+            let event_app = app.handle().clone();
+            let supervisor = AutoConnectSupervisor::new(Arc::new(wifi_windows::WindowsWifi), move |status| {
+                let _ = event_app.emit("wifi-auto-connect-updated", status);
+                schedule_tray_update(&event_app);
+            });
             app.manage(AppState {
                 config_path,
                 cache_path,
                 confirmations: Mutex::new(HashMap::new()),
                 discovery: Mutex::new(None),
+                config_lock: Mutex::new(()),
+                tray_items: Mutex::new(None),
+                wifi_auto_supervisor: supervisor,
             });
+            let language = config_from_path(&app.state::<AppState>().config_path).settings.language;
+            let (open_label, quit_label) = tray_labels(&language);
+            let open = MenuItem::with_id(app, "tray-open", open_label, true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "tray-quit", quit_label, true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let icon = app.default_window_icon().ok_or("Application icon is unavailable")?.clone();
+            TrayIconBuilder::with_id("main-tray")
+                .icon(icon)
+                .tooltip("Windows Network Manager")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "tray-open" => show_main_window(app),
+                    "tray-quit" => { app.state::<AppState>().wifi_auto_supervisor.stop_all(); app.exit(0); },
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(event, TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. }) {
+                        show_main_window(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+            if let Ok(mut items) = app.state::<AppState>().tray_items.lock() {
+                *items = Some(TrayItems { open, quit });
+            }
+            app.state::<AppState>().wifi_auto_supervisor.apply_rules(runtime_auto_rules(&initial_rules))
+                .map_err(|e| e.to_string())?;
+            schedule_tray_update(app.handle());
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_wifi_profiles,
@@ -242,7 +438,13 @@ pub fn run() {
             preview_wifi_change,
             connect_wifi,
             disconnect_wifi,
+            get_wifi_auto_connect_status,
+            preview_wifi_auto_connect,
+            save_wifi_auto_connect,
+            disable_wifi_auto_connect,
+            remove_wifi_auto_connect,
             capture_recent_snapshot,
+            delete_recent_snapshot,
             restore_recent_preview,
             restore_recent_apply,
             reset_preview,
@@ -389,6 +591,9 @@ fn field_i64(value: &Value, name: &str) -> i64 {
 fn field_bool(value: &Value, name: &str) -> bool {
     value.get(name).and_then(Value::as_bool).unwrap_or(false)
 }
+fn non_empty_or(value: String, fallback: &str) -> String {
+    if value.is_empty() { fallback.into() } else { value }
+}
 
 fn normalize_overview(raw: Value, wifi: Vec<Value>) -> Value {
     let mut entries: BTreeMap<i64, Map<String, Value>> = BTreeMap::new();
@@ -469,7 +674,7 @@ fn normalize_overview(raw: Value, wifi: Vec<Value>) -> Value {
     let addresses=arrays(entry.get("addresses")); let ipv4=addresses.iter().filter(|x|field_string(x,"addressFamily")=="IPv4").cloned().collect::<Vec<_>>(); let ipv6=addresses.iter().filter(|x|field_string(x,"addressFamily")=="IPv6").cloned().collect::<Vec<_>>();
     let ipv4_metric=ip.get("IPv4").cloned(); let ipv6_metric=ip.get("IPv6").cloned(); let dns=arrays(entry.get("dns")).into_iter().flat_map(|x|arrays(x.get("servers"))).filter_map(|x|x.as_str().map(str::to_owned)).collect::<Vec<_>>();
     let ipv4_gw=arrays(config.get("ipv4Gateways")); let ipv6_gw=arrays(config.get("ipv6Gateways"));
-    json!({"interfaceIndex":index,"alias":alias,"description":description,"guid":field_string(&adapter,"guid").trim_matches(|c|c=='{'||c=='}'),"macAddress":field_string(&adapter,"macAddress"),"type":kind,"hardwareInterface":field_bool(&adapter,"hardwareInterface"),"virtual":field_bool(&adapter,"virtual")||["Virtual","VPN","Tunnel"].contains(&kind),"systemInterface":system,"adminStatus":field_string(&adapter,"adminStatus"),"operationalStatus":field_string(&adapter,"operationalStatus"),"mediaConnectionState":field_string(&adapter,"mediaConnectionState"),"linkSpeed":field_string(&adapter,"linkSpeed"),"ipv4Addresses":ipv4,"ipv6Addresses":ipv6,"ipv4Gateways":ipv4_gw,"ipv6Gateways":ipv6_gw,"dnsServers":dns,"dhcpEnabled":ipv4_metric.as_ref().map(|x|field_bool(x,"dhcp")),"metrics":{"ipv4":ipv4_metric,"ipv6":ipv6_metric},"networkCategory":entry.get("connectionProfile").map(|x|field_string(x,"category")),"defaultRoute":!arrays(config.get("ipv4Gateways")).is_empty()||!arrays(config.get("ipv6Gateways")).is_empty(),"wifi":wifi_item,"deviations":{"manualIpv4Metric":ipv4_metric.as_ref().map(|x|!field_bool(x,"automaticMetric")).unwrap_or(false),"manualIpv6Metric":ipv6_metric.as_ref().map(|x|!field_bool(x,"automaticMetric")).unwrap_or(false),"adapterDisabled":field_string(&adapter,"adminStatus").eq_ignore_ascii_case("down")}})
+    json!({"interfaceIndex":index,"alias":alias,"description":description,"guid":field_string(&adapter,"guid").trim_matches(|c|c=='{'||c=='}'),"macAddress":field_string(&adapter,"macAddress"),"type":kind,"hardwareInterface":field_bool(&adapter,"hardwareInterface"),"virtual":field_bool(&adapter,"virtual")||["Virtual","VPN","Tunnel"].contains(&kind),"systemInterface":system,"adminStatus":field_string(&adapter,"adminStatus"),"operationalStatus":non_empty_or(field_string(&adapter,"operationalStatus"),"Unknown"),"mediaConnectionState":non_empty_or(field_string(&adapter,"mediaConnectionState"),"Unknown"),"linkSpeed":field_string(&adapter,"linkSpeed"),"ipv4Addresses":ipv4,"ipv6Addresses":ipv6,"ipv4Gateways":ipv4_gw,"ipv6Gateways":ipv6_gw,"dnsServers":dns,"dhcpEnabled":ipv4_metric.as_ref().map(|x|field_bool(x,"dhcp")),"metrics":{"ipv4":ipv4_metric,"ipv6":ipv6_metric},"networkCategory":entry.get("connectionProfile").map(|x|field_string(x,"category")).filter(|x|!x.is_empty()),"networkName":entry.get("connectionProfile").map(|x|field_string(x,"name")).filter(|x|!x.is_empty()),"ipv4Connectivity":entry.get("connectionProfile").map(|x|field_string(x,"ipv4Connectivity")).filter(|x|!x.is_empty()),"ipv6Connectivity":entry.get("connectionProfile").map(|x|field_string(x,"ipv6Connectivity")).filter(|x|!x.is_empty()),"defaultRoute":!arrays(config.get("ipv4Gateways")).is_empty()||!arrays(config.get("ipv6Gateways")).is_empty(),"wifi":wifi_item,"deviations":{"manualIpv4Metric":ipv4_metric.as_ref().map(|x|!field_bool(x,"automaticMetric")).unwrap_or(false),"manualIpv6Metric":ipv6_metric.as_ref().map(|x|!field_bool(x,"automaticMetric")).unwrap_or(false),"adapterDisabled":field_string(&adapter,"adminStatus").eq_ignore_ascii_case("down")}})
   }).collect();
     json!({"interfaces":interfaces,"refreshedAt":Utc::now().to_rfc3339()})
 }
@@ -484,6 +689,18 @@ fn wide_text(value: *const u16) -> String {
             length += 1;
         }
         String::from_utf16_lossy(std::slice::from_raw_parts(value, length))
+    }
+}
+fn ansi_text(value: *const u8) -> String {
+    if value.is_null() {
+        return String::new();
+    }
+    unsafe {
+        let mut length = 0usize;
+        while length < 256 && *value.add(length) != 0 {
+            length += 1;
+        }
+        String::from_utf8_lossy(std::slice::from_raw_parts(value, length)).into_owned()
     }
 }
 fn native_socket_text(address: SOCKET_ADDRESS) -> Option<(String, String)> {
@@ -575,6 +792,7 @@ fn native_network_overview() -> AppResult<Value> {
             ));
         }
         let wifi = wifi_overview().unwrap_or_default();
+        let connectivity = network_insights::connectivity_by_adapter();
         let wifi_by_alias: HashMap<String, Value> = wifi
             .into_iter()
             .map(|item| (field_string(&item, "alias"), item))
@@ -673,7 +891,21 @@ fn native_network_overview() -> AppResult<Value> {
                     .and_then(Value::as_bool)
                     .map(|automatic| !automatic)
                     .unwrap_or(false);
-                interfaces.push(json!({"interfaceIndex":index,"alias":alias,"description":description,"guid":"","macAddress":mac,"type":kind,"hardwareInterface":interface_type==6,"virtual":(["VPN","Tunnel"].contains(&kind)),"systemInterface":system,"adminStatus":admin_status,"operationalStatus":item.OperStatus,"mediaConnectionState":"unknown","linkSpeed":native_link_speed(item.TransmitLinkSpeed.max(item.ReceiveLinkSpeed)),"ipv4Addresses":ipv4,"ipv6Addresses":ipv6,"ipv4Gateways":gateways4,"ipv6Gateways":gateways6,"dnsServers":dns,"dhcpEnabled":Value::Null,"metrics":{"ipv4":ipv4_metric,"ipv6":ipv6_metric},"networkCategory":Value::Null,"defaultRoute":!gateways4.is_empty()||!gateways6.is_empty(),"wifi":wifi_item,"deviations":{"manualIpv4Metric":manual_ipv4,"manualIpv6Metric":manual_ipv6,"adapterDisabled":adapter_disabled}}));
+                let guid = network_insights::braced_guid(&ansi_text(item.AdapterName));
+                let oper_status = network_insights::oper_status_text(item.OperStatus);
+                let dhcp_enabled = if ipv4_metric.is_null() {
+                    Value::Null
+                } else {
+                    json!(item.Anonymous2.Flags & IP_ADAPTER_DHCP_ENABLED != 0)
+                };
+                let mut entry = json!({"interfaceIndex":index,"alias":alias,"description":description,"guid":guid,"macAddress":mac,"type":kind,"hardwareInterface":interface_type==6,"virtual":(["VPN","Tunnel"].contains(&kind)),"systemInterface":system,"adminStatus":admin_status,"operationalStatus":oper_status,"mediaConnectionState":network_insights::media_state_text(oper_status),"linkSpeed":native_link_speed(item.TransmitLinkSpeed.max(item.ReceiveLinkSpeed)),"ipv4Addresses":ipv4,"ipv6Addresses":ipv6,"ipv4Gateways":gateways4,"ipv6Gateways":gateways6,"dnsServers":dns,"dhcpEnabled":dhcp_enabled,"metrics":{"ipv4":ipv4_metric,"ipv6":ipv6_metric},"defaultRoute":!gateways4.is_empty()||!gateways6.is_empty(),"wifi":wifi_item,"deviations":{"manualIpv4Metric":manual_ipv4,"manualIpv6Metric":manual_ipv6,"adapterDisabled":adapter_disabled}});
+                if let Some(map) = entry.as_object_mut() {
+                    network_insights::apply_connectivity(
+                        map,
+                        connectivity.get(&network_insights::normalized_guid_key(&guid)),
+                    );
+                }
+                interfaces.push(entry);
                 current = item.Next;
             }
         }
@@ -685,45 +917,78 @@ fn native_network_overview() -> AppResult<Value> {
     ))
 }
 
+/// Split a netsh "key : value" line at the first ASCII or full-width colon so
+/// values that contain colons (BSSID) stay intact.
+fn split_netsh_line(line: &str) -> Option<(&str, &str)> {
+    let ascii = line.find(':');
+    let wide = line.find('：');
+    let (index, width) = match (ascii, wide) {
+        (Some(a), Some(w)) if w < a => (w, '：'.len_utf8()),
+        (Some(a), _) => (a, 1),
+        (None, Some(w)) => (w, '：'.len_utf8()),
+        (None, None) => return None,
+    };
+    Some((&line[..index], &line[index + width..]))
+}
+fn wifi_field_name(key: &str) -> Option<&'static str> {
+    let compact = key.trim().to_lowercase().replace([' ', '\u{3000}'], "");
+    Some(match compact.as_str() {
+        "name" | "名称" => "alias",
+        "description" | "描述" | "说明" => "description",
+        "guid" => "guid",
+        "state" | "状态" => "state",
+        "ssid" => "ssid",
+        "apbssid" | "bssid" => "bssid",
+        "band" | "频带" | "波段" => "band",
+        "channel" | "信道" | "通道" => "channel",
+        "radiotype" | "无线电类型" => "radioType",
+        "authentication" | "身份验证" => "authentication",
+        "cipher" | "密码" => "cipher",
+        "signal" | "信号" => "signal",
+        "profile" | "配置文件" => "currentProfile",
+        other if other.starts_with("receiverate") || other.starts_with("接收速率") => "receiveRate",
+        other if other.starts_with("transmitrate")
+            || other.starts_with("传输速率")
+            || other.starts_with("发送速率") => "transmitRate",
+        _ => return None,
+    })
+}
+fn signal_percent(value: &str) -> Option<u8> {
+    let digits = value.trim().trim_end_matches('%').trim();
+    digits.parse::<u8>().ok().filter(|value| *value <= 100)
+}
+fn finish_wifi_interface(mut current: Map<String, Value>) -> Value {
+    let item = Value::Object(current.clone());
+    let state = field_string(&item, "state");
+    let connected = state.eq_ignore_ascii_case("connected") || state == "已连接";
+    current.insert("connected".into(), json!(connected));
+    current.insert("signalPercent".into(), json!(signal_percent(&field_string(&item, "signal"))));
+    for name in ["bssid", "band", "channel", "authentication", "cipher", "receiveRate", "transmitRate"] {
+        current.entry(name).or_insert(Value::Null);
+    }
+    Value::Object(current)
+}
 fn parse_wifi_interfaces(output: &str) -> Vec<Value> {
     let mut result = vec![];
     let mut current: Map<String, Value> = Map::new();
     for line in output.lines() {
-        let Some((key, value)) = line.split_once(':').or_else(|| line.split_once('：')) else {
+        let Some((key, value)) = split_netsh_line(line) else {
             continue;
         };
-        let key = key.trim().to_lowercase();
         let value = value.trim();
-        let name = match key.as_str() {
-            "name" | "名称" => Some("alias"),
-            "description" | "描述" | "说明" => Some("description"),
-            "guid" => Some("guid"),
-            "state" | "状态" => Some("state"),
-            "ssid" => Some("ssid"),
-            "signal" | "信号" => Some("signal"),
-            "profile" | "配置文件" => Some("currentProfile"),
-            "radio type" | "无线电类型" => Some("radioType"),
-            _ => None,
-        };
-        if let Some(name) = name {
+        if let Some(name) = wifi_field_name(key) {
             if name == "alias" && !current.is_empty() {
-                let connected = field_string(&Value::Object(current.clone()), "state")
-                    .to_lowercase()
-                    == "connected"
-                    || field_string(&Value::Object(current.clone()), "state") == "已连接";
-                current.insert("connected".into(), json!(connected));
-                result.push(Value::Object(current));
+                result.push(finish_wifi_interface(current));
                 current = Map::new();
             }
-            current.insert(name.into(), json!(value));
+            // Some Windows builds print both "AP BSSID" and "BSSID"; keep the first.
+            if !current.contains_key(name) {
+                current.insert(name.into(), json!(value));
+            }
         }
     }
     if !current.is_empty() {
-        let connected = field_string(&Value::Object(current.clone()), "state").to_lowercase()
-            == "connected"
-            || field_string(&Value::Object(current.clone()), "state") == "已连接";
-        current.insert("connected".into(), json!(connected));
-        result.push(Value::Object(current));
+        result.push(finish_wifi_interface(current));
     }
     result
 }
@@ -818,7 +1083,18 @@ fn config(state: &State<AppState>) -> AppConfig {
     config_from_path(&state.config_path)
 }
 fn persist(state: &State<AppState>, config: &AppConfig) -> AppResult<()> {
-    save_config(&state.config_path, config)
+    let _guard = state.config_lock.lock().map_err(|_| err("STATE_ERROR", "Cannot save configuration."))?;
+    // Existing settings/snapshot commands may have read the file before an
+    // automation rule was updated. Preserve the latest rules when they save.
+    let latest = config_from_path(&state.config_path);
+    let merged = merge_preserving_auto_rules(config, &latest);
+    save_config(&state.config_path, &merged)
+}
+
+fn merge_preserving_auto_rules(config: &AppConfig, latest: &AppConfig) -> AppConfig {
+    let mut merged = config.clone();
+    merged.wifi_auto_connect = latest.wifi_auto_connect.clone();
+    merged
 }
 fn disk_cache(path: &Path) -> Option<Value> {
     fs::read_to_string(path)
@@ -1024,6 +1300,146 @@ fn get_wifi_profiles(interface_name: String) -> AppResult<Value> {
     ])?;
     Ok(json!({"interfaceName":alias,"profiles":parse_wifi_profiles(&output),"profilesLoaded":true}))
 }
+
+fn wifi_auto_rules(config: &AppConfig) -> AppResult<Vec<AutoConnectRule>> {
+    let mut rules = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for value in &config.wifi_auto_connect {
+        let rule: AutoConnectRule = serde_json::from_value(value.clone())
+            .map_err(|_| err("VALIDATION_ERROR", "Stored Wi-Fi auto-connect rule is invalid."))?;
+        wifi_auto_connect::validate_rule(&rule).map_err(|message| err("VALIDATION_ERROR", message))?;
+        let key = normalized_wifi_guid(&rule.adapter_guid)?;
+        if !seen.insert(key) { return Err(err("VALIDATION_ERROR", "Duplicate Wi-Fi auto-connect rules.")); }
+        rules.push(rule);
+    }
+    Ok(rules)
+}
+
+fn normalized_wifi_guid(value: &str) -> AppResult<String> {
+    Uuid::parse_str(value.trim().trim_matches(|c| c == '{' || c == '}'))
+        .map(|value| value.to_string())
+        .map_err(|_| err("VALIDATION_ERROR", "Invalid Wi-Fi adapter GUID."))
+}
+
+fn canonical_auto_rule(mut rule: AutoConnectRule) -> AppResult<AutoConnectRule> {
+    wifi_auto_connect::validate_rule(&rule).map_err(|message| err("VALIDATION_ERROR", message))?;
+    rule.adapter_guid = normalized_wifi_guid(&rule.adapter_guid)?;
+    Ok(rule)
+}
+
+// Development builds and automated tests can inspect and save rules, but do
+// not start connection workers against the user's real network.
+fn runtime_auto_rules(rules: &[AutoConnectRule]) -> Vec<AutoConnectRule> {
+    rules.iter().cloned().map(|mut rule| {
+        if cfg!(any(debug_assertions, test)) { rule.enabled = false; }
+        rule
+    }).collect()
+}
+
+fn validate_auto_target(rule: &AutoConnectRule) -> AppResult<()> {
+    let adapters = wifi_windows::discover_adapters().map_err(|message| err("WIFI_DISCOVERY_FAILED", message))?;
+    let adapter = adapters.iter().find(|a| normalized_wifi_guid(&a.adapter_guid).ok().as_deref() == Some(rule.adapter_guid.as_str()))
+        .ok_or_else(|| err("NOT_FOUND", "The selected Wi-Fi adapter is unavailable."))?;
+    if !adapter.profiles.iter().any(|profile| profile == &rule.profile_name) {
+        return Err(err("NOT_FOUND", "The selected saved Wi-Fi profile is unavailable."));
+    }
+    Ok(())
+}
+
+fn mutate_auto_rules<F>(state: &State<AppState>, change: F) -> AppResult<Vec<AutoConnectRule>>
+where F: FnOnce(&mut Vec<AutoConnectRule>) -> AppResult<()> {
+    let _guard = state.config_lock.lock().map_err(|_| err("STATE_ERROR", "Cannot save Wi-Fi auto-connect settings."))?;
+    let mut cfg = config_from_path(&state.config_path);
+    let original = cfg.clone();
+    let mut rules = wifi_auto_rules(&cfg)?;
+    change(&mut rules)?;
+    cfg.wifi_auto_connect = rules.iter().map(serde_json::to_value).collect::<Result<_, _>>()
+        .map_err(|_| err("SERIALIZE_ERROR", "Cannot save Wi-Fi auto-connect settings."))?;
+    save_config(&state.config_path, &cfg)?;
+    if let Err(message) = state.wifi_auto_supervisor.apply_rules(runtime_auto_rules(&rules)) {
+        let _ = save_config(&state.config_path, &original);
+        if let Ok(previous) = wifi_auto_rules(&original) {
+            let _ = state.wifi_auto_supervisor.apply_rules(runtime_auto_rules(&previous));
+        }
+        return Err(err("WORKER_ERROR", message));
+    }
+    Ok(rules)
+}
+
+#[tauri::command]
+async fn get_wifi_auto_connect_status(state: State<'_, AppState>) -> AppResult<Value> {
+    let (adapters, discovery_error) = match wifi_windows::discover_adapters() {
+        Ok(adapters) => (adapters, None),
+        Err(message) => (Vec::<DiscoveredAdapter>::new(), Some(message)),
+    };
+    let rules = wifi_auto_rules(&config(&state))?;
+    let mut statuses = state.wifi_auto_supervisor.status_snapshot();
+    if cfg!(any(debug_assertions, test)) {
+        for status in &mut statuses {
+            if rules.iter().any(|rule| rule.enabled && normalized_wifi_guid(&rule.adapter_guid).ok() == normalized_wifi_guid(&status.adapter_guid).ok()) {
+                status.state = "development-disabled".into();
+                status.error = Some("Auto-connect is inactive in development builds.".into());
+                status.next_check = None;
+            }
+        }
+    }
+    Ok(json!({"adapters":adapters,"rules":rules,"statuses":statuses,"discoveryError":discovery_error}))
+}
+
+#[tauri::command]
+async fn preview_wifi_auto_connect(state: State<'_, AppState>, input: Value) -> AppResult<Value> {
+    let rule: AutoConnectRule = serde_json::from_value(input.get("rule").unwrap_or(&input).clone())
+        .map_err(|_| err("VALIDATION_ERROR", "Invalid Wi-Fi auto-connect rule."))?;
+    let rule = canonical_auto_rule(rule)?;
+    validate_auto_target(&rule)?;
+    let payload = serde_json::to_value(&rule).map_err(|_| err("SERIALIZE_ERROR", "Cannot prepare Wi-Fi auto-connect rule."))?;
+    Ok(json!({"rule":payload,"confirmationToken":issue_confirmation(&state,"wifi-auto",&payload)?}))
+}
+
+#[tauri::command]
+async fn save_wifi_auto_connect(state: State<'_, AppState>, input: Value) -> AppResult<Value> {
+    let rule: AutoConnectRule = serde_json::from_value(input.get("rule").cloned().unwrap_or(Value::Null))
+        .map_err(|_| err("VALIDATION_ERROR", "Invalid Wi-Fi auto-connect rule."))?;
+    let rule = canonical_auto_rule(rule)?;
+    validate_auto_target(&rule)?;
+    let payload = serde_json::to_value(&rule).map_err(|_| err("SERIALIZE_ERROR", "Cannot save Wi-Fi auto-connect rule."))?;
+    let token = input.get("confirmationToken").and_then(Value::as_str).unwrap_or("");
+    consume_confirmation(&state, token, "wifi-auto", &payload)?;
+    mutate_auto_rules(&state, |rules| {
+        rules.retain(|old| normalized_wifi_guid(&old.adapter_guid).ok().as_deref() != Some(rule.adapter_guid.as_str()));
+        rules.push(rule.clone());
+        Ok(())
+    })?;
+    let message = notice("wifiAuto.saved", json!({"profileName":rule.profile_name}), "Wi-Fi auto-connect rule saved.");
+    Ok(json!({"rule":rule,"message":message["text"],"messageCode":message}))
+}
+
+#[tauri::command]
+async fn disable_wifi_auto_connect(state: State<'_, AppState>, adapter_guid: String) -> AppResult<Value> {
+    let key = normalized_wifi_guid(&adapter_guid)?;
+    mutate_auto_rules(&state, |rules| {
+        let rule = rules.iter_mut().find(|rule| normalized_wifi_guid(&rule.adapter_guid).ok().as_deref() == Some(key.as_str()))
+            .ok_or_else(|| err("NOT_FOUND", "No auto-connect rule exists for this adapter."))?;
+        rule.enabled = false;
+        Ok(())
+    })?;
+    let message = notice("wifiAuto.disabled", json!({}), "Wi-Fi auto-connect disabled.");
+    Ok(json!({"adapterGuid":key,"enabled":false,"message":message["text"],"messageCode":message}))
+}
+
+#[tauri::command]
+async fn remove_wifi_auto_connect(state: State<'_, AppState>, adapter_guid: String) -> AppResult<Value> {
+    let key = normalized_wifi_guid(&adapter_guid)?;
+    mutate_auto_rules(&state, |rules| {
+        let before = rules.len();
+        rules.retain(|rule| normalized_wifi_guid(&rule.adapter_guid).ok().as_deref() != Some(key.as_str()));
+        if rules.len() == before { return Err(err("NOT_FOUND", "No auto-connect rule exists for this adapter.")); }
+        Ok(())
+    })?;
+    let message = notice("wifiAuto.removed", json!({}), "Wi-Fi auto-connect rule removed.");
+    Ok(json!({"adapterGuid":key,"removed":true,"message":message["text"],"messageCode":message}))
+}
+
 fn get_routes() -> AppResult<Value> {
     let raw = run_powershell_json(ROUTES_SCRIPT, None)?;
     let mut metrics = HashMap::new();
@@ -1191,13 +1607,17 @@ fn preview_metric_change(state: State<AppState>, input: Value) -> AppResult<Valu
             .and_then(Value::as_bool)
             .unwrap_or(false)
             || current.get("interfaceMetric") == payload.get("metric"));
-    let mut warnings = vec![];
+    let mut notices = vec![];
     if adapter
         .get("defaultRoute")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        warnings.push("This interface carries a default gateway; changing Metric can alter the default network path.");
+        notices.push(notice(
+            "metric.defaultGateway",
+            json!({"alias":field_string(&adapter,"alias")}),
+            "This interface carries a default gateway; changing Metric can alter the default network path.",
+        ));
     }
     let token = if unchanged {
         None
@@ -1205,7 +1625,7 @@ fn preview_metric_change(state: State<AppState>, input: Value) -> AppResult<Valu
         Some(issue_confirmation(&state, "metric", &payload)?)
     };
     Ok(
-        json!({"input":payload,"current":current,"unchanged":unchanged,"warnings":warnings,"confirmationToken":token,"requiresAdmin":true}),
+        json!({"input":payload,"current":current,"unchanged":unchanged,"warnings":notice_texts(&notices),"notices":notices,"confirmationToken":token,"requiresAdmin":true}),
     )
 }
 #[tauri::command]
@@ -1239,15 +1659,23 @@ fn preview_add_route(state: State<AppState>, input: Value) -> AppResult<Value> {
             field_string(r, "destinationPrefix") == field_string(&payload, "destinationPrefix")
         })
         .collect::<Vec<_>>();
-    let mut warnings = vec![];
+    let mut notices = vec![];
     if field_string(&payload, "destinationPrefix") == "0.0.0.0/0" {
-        warnings.push("This is a default route and can change network connectivity.");
+        notices.push(notice(
+            "route.add.defaultRoute",
+            json!({}),
+            "This is a default route and can change network connectivity.",
+        ));
     }
     if !conflicts.is_empty() {
-        warnings.push("Routes with the same destination prefix already exist.");
+        notices.push(notice(
+            "route.add.samePrefix",
+            json!({"count":conflicts.len().to_string(),"destination":field_string(&payload,"destinationPrefix")}),
+            "Routes with the same destination prefix already exist.",
+        ));
     }
     Ok(
-        json!({"route":payload,"conflicts":conflicts,"warnings":warnings,"confirmationToken":issue_confirmation(&state,"add-route",&payload)?}),
+        json!({"route":payload,"conflicts":conflicts,"warnings":notice_texts(&notices),"notices":notices,"confirmationToken":issue_confirmation(&state,"add-route",&payload)?}),
     )
 }
 #[tauri::command]
@@ -1371,8 +1799,13 @@ fn preview_edit_route(state: State<AppState>, input: Value) -> AppResult<Value> 
     } else {
         Some(issue_confirmation(&state, "edit-route", &payload)?)
     };
+    let notices = vec![notice(
+        "route.edit.replace",
+        json!({}),
+        "The old route will be briefly replaced. Connectivity may be interrupted. The app will try to restore the original route if the edit fails.",
+    )];
     Ok(
-        json!({"oldRoute":payload["oldRoute"],"route":payload["route"],"unchanged":unchanged,"warnings":["The old route will be briefly replaced. Connectivity may be interrupted. The app will try to restore the original route if the edit fails."],"confirmationToken":token}),
+        json!({"oldRoute":payload["oldRoute"],"route":payload["route"],"unchanged":unchanged,"warnings":notice_texts(&notices),"notices":notices,"confirmationToken":token}),
     )
 }
 #[tauri::command]
@@ -1416,8 +1849,13 @@ fn temporary_route(requested: &Value) -> AppResult<Value> {
 fn preview_persist_route(state: State<AppState>, route: Value) -> AppResult<Value> {
     let target = temporary_route(&route)?;
     let payload = persistable_route_payload(&target)?;
+    let notices = vec![notice(
+        "route.persist.replace",
+        json!({}),
+        "The route will be briefly replaced and saved across restarts. If creation fails, the app will try to restore the temporary route.",
+    )];
     Ok(
-        json!({"route":payload,"warnings":["The route will be briefly replaced and saved across restarts. If creation fails, the app will try to restore the temporary route."],"confirmationToken":issue_confirmation(&state,"persist-route",&payload)?}),
+        json!({"route":payload,"warnings":notice_texts(&notices),"notices":notices,"confirmationToken":issue_confirmation(&state,"persist-route",&payload)?}),
     )
 }
 fn persist_route_script() -> String {
@@ -1482,8 +1920,13 @@ fn preview_remove_route(state: State<AppState>, route: Value) -> AppResult<Value
         return Err(err("VALIDATION_ERROR","This route is Windows-managed, on-link, multicast, IPv6, or a default route and cannot be safely removed."));
     }
     let payload = route_remove_payload(&target);
+    let notices = vec![notice(
+        "route.remove.recovery",
+        json!({}),
+        "If connectivity is affected, reopen the app as administrator and use Undo last app change.",
+    )];
     Ok(
-        json!({"route":target,"warnings":["If connectivity is affected, reopen the app as administrator and use Reset to pre-change baseline."],"confirmationToken":issue_confirmation(&state,"remove-route",&payload)?}),
+        json!({"route":target,"warnings":notice_texts(&notices),"notices":notices,"confirmationToken":issue_confirmation(&state,"remove-route",&payload)?}),
     )
 }
 #[tauri::command]
@@ -1556,18 +1999,20 @@ fn preview_wifi_change(state: State<AppState>, input: Value) -> AppResult<Value>
                 && item.get("wifi").is_some()
         })
         .ok_or_else(|| err("NOT_FOUND", "Wireless interface no longer exists."))?;
-    let mut warnings = vec![];
+    let mut notices = vec![];
     if adapter
         .get("defaultRoute")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        warnings.push(
+        notices.push(notice(
+            "wifi.change.defaultRoute",
+            json!({"interfaceName":field_string(&payload,"interfaceName")}),
             "This adapter currently has a default route; the change can interrupt connectivity.",
-        );
+        ));
     }
     Ok(
-        json!({"wifi":payload,"warnings":warnings,"confirmationToken":issue_confirmation(&state,"wifi",&payload)?}),
+        json!({"wifi":payload,"warnings":notice_texts(&notices),"notices":notices,"confirmationToken":issue_confirmation(&state,"wifi",&payload)?}),
     )
 }
 #[tauri::command]
@@ -1594,7 +2039,12 @@ fn connect_wifi(state: State<AppState>, input: Value) -> AppResult<Value> {
         format!("name={profile}"),
         format!("interface={alias}"),
     ])?;
-    Ok(json!({"message":format!("Connection request sent to {alias}.")}))
+    let message = notice(
+        "wifi.connect.requested",
+        json!({"interfaceName":alias,"profileName":profile}),
+        format!("Connection request sent to {alias}."),
+    );
+    Ok(json!({"message":message["text"],"messageCode":message}))
 }
 #[tauri::command]
 fn disconnect_wifi(state: State<AppState>, input: Value) -> AppResult<Value> {
@@ -1615,7 +2065,12 @@ fn disconnect_wifi(state: State<AppState>, input: Value) -> AppResult<Value> {
         "disconnect".into(),
         format!("interface={alias}"),
     ])?;
-    Ok(json!({"message":format!("Disconnect request sent to {alias}.")}))
+    let message = notice(
+        "wifi.disconnect.requested",
+        json!({"interfaceName":alias}),
+        format!("Disconnect request sent to {alias}."),
+    );
+    Ok(json!({"message":message["text"],"messageCode":message}))
 }
 
 fn adapter_control_payload(input: &Value) -> AppResult<Value> {
@@ -1650,23 +2105,29 @@ fn preview_adapter_control(state: State<AppState>, input: Value) -> AppResult<Va
             "System interfaces cannot be enabled or disabled.",
         ));
     }
-    let mut warnings = vec![];
-    if payload.get("action").and_then(Value::as_str) == Some("disable") {
-        warnings.push("Disabling this adapter can interrupt network connectivity.".to_string());
-        if adapter
-            .get("defaultRoute")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            warnings.push(
-                "This adapter currently has a default gateway and may be your active network path."
-                    .to_string(),
-            );
+    let notices = adapter_control_notices(&adapter, field_string(&payload, "action").as_str());
+    Ok(
+        json!({"adapter":adapter,"action":payload["action"],"warnings":notice_texts(&notices),"notices":notices,"requiresAdmin":true,"confirmationToken":issue_confirmation(&state,"adapter-control",&payload)?}),
+    )
+}
+fn adapter_control_notices(adapter: &Value, action: &str) -> Vec<Value> {
+    let mut notices = vec![];
+    if action == "disable" {
+        let alias = field_string(adapter, "alias");
+        notices.push(notice(
+            "adapter.disable.interrupt",
+            json!({"alias":alias}),
+            "Disabling this adapter can interrupt network connectivity.",
+        ));
+        if field_bool(adapter, "defaultRoute") {
+            notices.push(notice(
+                "adapter.disable.defaultGateway",
+                json!({"alias":alias}),
+                "This adapter currently has a default gateway and may be your active network path.",
+            ));
         }
     }
-    Ok(
-        json!({"adapter":adapter,"action":payload["action"],"warnings":warnings,"requiresAdmin":true,"confirmationToken":issue_confirmation(&state,"adapter-control",&payload)?}),
-    )
+    notices
 }
 #[tauri::command]
 fn apply_adapter_control(state: State<AppState>, input: Value) -> AppResult<Value> {
@@ -1701,6 +2162,7 @@ fn get_bootstrap_state(state: State<AppState>) -> Value {
 }
 #[tauri::command]
 fn refresh_network_state(
+    app: AppHandle,
     state: State<AppState>,
     scopes: Option<Vec<String>>,
     force: Option<bool>,
@@ -1714,6 +2176,7 @@ fn refresh_network_state(
             None => current_snapshot(&state)?,
         }
     };
+    schedule_tray_update(&app);
     let interfaces = requested.iter().any(|scope| scope == "interfaces");
     let routes = requested.iter().any(|scope| scope == "routes");
     Ok(
@@ -1721,7 +2184,7 @@ fn refresh_network_state(
     )
 }
 #[tauri::command]
-fn update_settings(state: State<AppState>, settings: Settings) -> AppResult<Settings> {
+fn update_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> AppResult<Settings> {
     if settings.language != "en" && settings.language != "zh-CN" {
         return Err(err("VALIDATION_ERROR", "Unsupported language."));
     }
@@ -1734,6 +2197,14 @@ fn update_settings(state: State<AppState>, settings: Settings) -> AppResult<Sett
         show_all_routes: settings.show_all_routes,
     };
     persist(&state, &cfg)?;
+    if let Ok(items) = state.tray_items.lock() {
+        if let Some(items) = items.as_ref() {
+            let (open, quit) = tray_labels(&cfg.settings.language);
+            let _ = items.open.set_text(open);
+            let _ = items.quit.set_text(quit);
+        }
+    }
+    schedule_tray_update(&app);
     Ok(cfg.settings)
 }
 #[tauri::command]
@@ -1784,14 +2255,34 @@ fn save_profile(state: State<AppState>, profile: Value) -> AppResult<Value> {
     persist(&state, &cfg)?;
     Ok(saved)
 }
-#[tauri::command]
-fn delete_profile(state: State<AppState>, id: String) -> AppResult<Value> {
-    let mut cfg = config(&state);
+fn remove_profile_entry(cfg: &mut AppConfig, id: &str) -> AppResult<()> {
     let before = cfg.profiles.len();
     cfg.profiles.retain(|x| field_string(x, "id") != id);
     if cfg.profiles.len() == before {
         return Err(err("NOT_FOUND", "Configuration does not exist."));
     }
+    Ok(())
+}
+fn remove_recent_entry(cfg: &mut AppConfig, id: &str) -> AppResult<()> {
+    let before = cfg.recent_snapshots.len();
+    cfg.recent_snapshots.retain(|x| x.id != id);
+    if cfg.recent_snapshots.len() == before {
+        return Err(err("NOT_FOUND", "Recent configuration not found."));
+    }
+    Ok(())
+}
+#[tauri::command]
+fn delete_profile(state: State<AppState>, id: String) -> AppResult<Value> {
+    let mut cfg = config(&state);
+    remove_profile_entry(&mut cfg, &id)?;
+    persist(&state, &cfg)?;
+    Ok(json!({"deleted":true}))
+}
+// Configuration-only write: removes a history entry, never touches the network.
+#[tauri::command]
+fn delete_recent_snapshot(state: State<AppState>, id: String) -> AppResult<Value> {
+    let mut cfg = config(&state);
+    remove_recent_entry(&mut cfg, &id)?;
     persist(&state, &cfg)?;
     Ok(json!({"deleted":true}))
 }
@@ -1810,8 +2301,14 @@ fn restore_profile_preview(state: State<AppState>, id: String) -> AppResult<Valu
         )
     })?;
     let payload = json!({"id":id,"hash":fingerprint(snapshot)});
+    let summary = notice(
+        "restore.profile.summary",
+        json!({"name":field_string(profile,"name")}),
+        "The saved configuration will restore its Metric, adapter, Wi-Fi, and app-managed-route state.",
+    );
+    let (changes, unchanged) = restore_preview_changes(&state, &cfg, snapshot);
     Ok(
-        json!({"profile":profile,"summary":"The saved configuration will restore its Metric, Wi-Fi, and app-managed-route state.","confirmationToken":issue_confirmation(&state,"restore-profile",&payload)?}),
+        json!({"profile":profile,"summary":summary["text"],"summaryCode":summary,"changes":changes,"unchangedCount":unchanged,"confirmationToken":issue_confirmation(&state,"restore-profile",&payload)?}),
     )
 }
 #[tauri::command]
@@ -1855,6 +2352,22 @@ fn restore_profile_apply(state: State<AppState>, input: Value) -> AppResult<Valu
     restore_snapshot(&state, &snapshot, &json!({"restoreProfile":id}))
 }
 
+/// Read-only comparison for restore confirmations. A failed live read yields
+/// `null` changes so the preview itself still works.
+fn restore_preview_changes(state: &State<AppState>, cfg: &AppConfig, target: &Value) -> (Value, Value) {
+    match snapshot_current(state) {
+        Ok(current) => {
+            let (changes, unchanged) = network_insights::restore_changes(
+                target,
+                current.get("overview").unwrap_or(&Value::Null),
+                current.get("routes").unwrap_or(&Value::Null),
+                &cfg.managed_routes,
+            );
+            (json!(changes), json!(unchanged))
+        }
+        Err(_) => (Value::Null, Value::Null),
+    }
+}
 fn snapshot_current(state: &State<AppState>) -> AppResult<Value> {
     recent_snapshot(state)
         .map(Ok)
@@ -2134,8 +2647,14 @@ fn restore_recent_preview(state: State<AppState>, id: String) -> AppResult<Value
         .iter()
         .find(|x| x.id == id)
         .ok_or_else(|| err("NOT_FOUND", "Recent configuration not found."))?;
+    let summary = notice(
+        "restore.recent.summary",
+        json!({"name":item.name}),
+        "The snapshot will restore its saved Metric, adapter, Wi-Fi, and app-managed-route state.",
+    );
+    let (changes, unchanged) = restore_preview_changes(&state, &cfg, &item.state);
     Ok(
-        json!({"snapshot":item,"summary":"The snapshot will restore saved Metric settings and app-managed routes. Wi-Fi actions require explicit confirmation.","confirmationToken":issue_confirmation(&state,"restore-recent",&json!({"id":id,"hash":item.hash}))?}),
+        json!({"snapshot":item,"summary":summary["text"],"summaryCode":summary,"changes":changes,"unchangedCount":unchanged,"confirmationToken":issue_confirmation(&state,"restore-recent",&json!({"id":id,"hash":item.hash}))?}),
     )
 }
 #[tauri::command]
@@ -2171,14 +2690,31 @@ fn restore_recent_apply(state: State<AppState>, input: Value) -> AppResult<Value
     restore_snapshot(&state, &item.state, &json!({"restoreRecent":id}))
 }
 
+fn baseline_scope_items(cfg: &AppConfig, baseline: &Baseline) -> Vec<Value> {
+    let profile_name = |id: &str| {
+        cfg.profiles
+            .iter()
+            .find(|item| field_string(item, "id") == id)
+            .map(|item| field_string(item, "name"))
+    };
+    let recent_name = |id: &str| {
+        cfg.recent_snapshots
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.name.clone())
+    };
+    network_insights::scope_items(&baseline.scope, &baseline.snapshot.state, &profile_name, &recent_name)
+}
 #[tauri::command]
 fn reset_preview(state: State<AppState>) -> AppResult<Value> {
     let cfg = config(&state);
     let baseline = cfg
         .baseline
+        .clone()
         .ok_or_else(|| err("NOT_FOUND", "No pre-change baseline is available."))?;
+    let scope_items = baseline_scope_items(&cfg, &baseline);
     Ok(
-        json!({"baseline":baseline.snapshot,"scope":baseline.scope,"confirmationToken":issue_confirmation(&state,"reset-baseline",&json!({"hash":baseline.snapshot.hash,"scope":baseline.scope}))?}),
+        json!({"baseline":baseline.snapshot,"scope":baseline.scope,"scopeItems":scope_items,"confirmationToken":issue_confirmation(&state,"reset-baseline",&json!({"hash":baseline.snapshot.hash,"scope":baseline.scope}))?}),
     )
 }
 #[tauri::command]
@@ -2207,12 +2743,17 @@ fn reset_apply(state: State<AppState>, input: Value) -> AppResult<Value> {
     let result = restore_snapshot(&state, &baseline.snapshot.state, &baseline.scope)?;
     let route_result = restore_route_scope(&baseline.scope)?;
     let complete = !has_failed_result(&result) && !has_failed_result(&route_result);
+    let message = if complete {
+        notice("reset.complete", json!({}), "The last app change was undone.")
+    } else {
+        notice("reset.partial", json!({}), "Undo was only partially completed. Recovery remains available.")
+    };
     if complete {
         cfg.baseline = None;
         persist(&state, &cfg)?;
     }
     Ok(
-        json!({"reset":complete,"partial":!complete,"result":result,"routeResult":route_result,"message":if complete {"The last app change was undone."} else {"Undo was only partially completed. Recovery remains available."}}),
+        json!({"reset":complete,"partial":!complete,"result":result,"routeResult":route_result,"message":message["text"],"messageCode":message}),
     )
 }
 fn windows_defaults_payload(state: &State<AppState>, input: &Value) -> AppResult<Value> {
@@ -2257,11 +2798,33 @@ fn windows_defaults_payload(state: &State<AppState>, input: &Value) -> AppResult
         json!({"interfaces":selected,"managedRoutes":managed_routes,"removeManagedRoutes":remove_routes}),
     )
 }
+fn windows_defaults_notices(payload: &Value) -> Vec<Value> {
+    let count = arrays(payload.get("interfaces")).len().to_string();
+    let routes = arrays(payload.get("managedRoutes")).len().to_string();
+    vec![
+        notice(
+            "defaults.metrics",
+            json!({"count":count}),
+            "Enable AutomaticMetric for the selected IPv4/IPv6 interfaces.",
+        ),
+        if field_bool(payload, "removeManagedRoutes") {
+            notice(
+                "defaults.routes",
+                json!({"count":routes}),
+                "Remove only routes recorded as app-managed when selected.",
+            )
+        } else {
+            notice("defaults.routesKept", json!({}), "App-managed routes are kept.")
+        },
+        notice("defaults.wifi", json!({}), "Wi-Fi is unchanged."),
+    ]
+}
 #[tauri::command]
 fn windows_defaults_preview(state: State<AppState>, input: Option<Value>) -> AppResult<Value> {
     let payload = windows_defaults_payload(&state, input.as_ref().unwrap_or(&Value::Null))?;
+    let notices = windows_defaults_notices(&payload);
     Ok(
-        json!({"metrics":"Enable AutomaticMetric for the selected IPv4/IPv6 interfaces.","routes":"Remove only routes recorded as app-managed when selected.","wifi":"Wi-Fi is unchanged.","interfaces":payload["interfaces"],"managedRoutes":payload["managedRoutes"],"removeManagedRoutes":payload["removeManagedRoutes"],"confirmationToken":issue_confirmation(&state,"windows-defaults",&payload)?}),
+        json!({"metrics":"Enable AutomaticMetric for the selected IPv4/IPv6 interfaces.","routes":"Remove only routes recorded as app-managed when selected.","wifi":"Wi-Fi is unchanged.","notices":notices,"interfaces":payload["interfaces"],"managedRoutes":payload["managedRoutes"],"removeManagedRoutes":payload["removeManagedRoutes"],"confirmationToken":issue_confirmation(&state,"windows-defaults",&payload)?}),
     )
 }
 #[tauri::command]
@@ -2280,6 +2843,11 @@ fn windows_defaults_apply(state: State<AppState>, input: Value) -> AppResult<Val
     capture_baseline(&state, json!({"windowsDefaults":payload.clone()}))?;
     let script = r#"$results=@();foreach($i in @($InputData.interfaces)){foreach($family in @('IPv4','IPv6')){try{Set-NetIPInterface -InterfaceIndex ([int]$i.interfaceIndex) -AddressFamily $family -AutomaticMetric Enabled -Confirm:$false -ErrorAction Stop;$results+=[PSCustomObject]@{interfaceIndex=$i.interfaceIndex;addressFamily=$family;status='success'}}catch{$results+=[PSCustomObject]@{interfaceIndex=$i.interfaceIndex;addressFamily=$family;status='skipped'}}}};$results|ConvertTo-Json -Compress"#;
     let metric_results = run_powershell_json(script, Some(&payload))?;
+    let message = notice(
+        "defaults.complete",
+        json!({}),
+        "Windows-managed automatic Metric has been enabled. Only routes created by this app were removed.",
+    );
     let current_routes = get_routes()?;
     let mut route_results = vec![];
     for managed in arrays(payload.get("managedRoutes")) {
@@ -2308,7 +2876,7 @@ fn windows_defaults_apply(state: State<AppState>, input: Value) -> AppResult<Val
         persist(&state, &new_cfg)?;
     }
     Ok(
-        json!({"metrics":metric_results,"routeResults":route_results,"message":"Windows-managed automatic Metric has been enabled. Only routes created by this app were removed."}),
+        json!({"metrics":metric_results,"routeResults":route_results,"message":message["text"],"messageCode":message}),
     )
 }
 
@@ -2358,12 +2926,14 @@ fn restart_as_administrator(app: AppHandle) -> AppResult<Value> {
     })?;
     let verb = wide_null(OsStr::new("runas"));
     let executable = wide_null(exe.as_os_str());
+    let argument = format!("--wnm-wait-parent={}", std::process::id());
+    let argument = wide_null(OsStr::new(&argument));
     let result = unsafe {
         ShellExecuteW(
             ptr::null_mut(),
             verb.as_ptr(),
             executable.as_ptr(),
-            ptr::null(),
+            argument.as_ptr(),
             ptr::null(),
             SW_SHOWNORMAL,
         )
@@ -2375,6 +2945,7 @@ fn restart_as_administrator(app: AppHandle) -> AppResult<Value> {
             json!({"shellExecuteCode":result as isize,"hint":"Accept the Windows UAC prompt. Installation in a user folder is supported."}),
         ));
     }
+    app.state::<AppState>().wifi_auto_supervisor.stop_all();
     app.exit(0);
     Ok(json!({"started":true}))
 }
@@ -2382,6 +2953,70 @@ fn restart_as_administrator(app: AppHandle) -> AppResult<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn instance_guard_prevents_duplicate_process_owners() {
+        let name = format!("Local\\wnm-test-{}", Uuid::new_v4());
+        let first = acquire_named_instance(&name).unwrap().expect("first instance should own the guard");
+        assert!(acquire_named_instance(&name).unwrap().is_none());
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child.creation_flags(CREATE_NO_WINDOW)
+            .args(["--ignored", "--exact", "tests::instance_guard_child"])
+            .env("WNM_TEST_INSTANCE_NAME", &name);
+        let mut child = child.spawn().expect("start the isolated instance test");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            match child.try_wait().expect("wait for isolated instance test") {
+                Some(status) => break status,
+                None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                None => { let _ = child.kill(); let _ = child.wait(); panic!("isolated instance test timed out"); }
+            }
+        };
+        assert!(status.success(), "second process did not detect the existing guard");
+        drop(first);
+        assert!(acquire_named_instance(&name).unwrap().is_some());
+    }
+    #[test]
+    #[ignore = "called only by the isolated single-instance test"]
+    fn instance_guard_child() {
+        let name = std::env::var("WNM_TEST_INSTANCE_NAME").expect("test mutex name");
+        assert!(acquire_named_instance(&name).unwrap().is_none());
+    }
+    #[test]
+    fn elevation_handoff_accepts_only_one_valid_parent() {
+        assert_eq!(elevation_parent(&["app.exe".into()], 99).unwrap(), None);
+        assert_eq!(elevation_parent(&["--wnm-wait-parent=42".into()], 99).unwrap(), Some(42));
+        assert!(elevation_parent(&["--wnm-wait-parent=0".into()], 99).is_err());
+        assert!(elevation_parent(&["--wnm-wait-parent=99".into()], 99).is_err());
+        assert!(elevation_parent(&["--wnm-wait-parent=abc".into()], 99).is_err());
+        assert!(elevation_parent(&["--wnm-wait-parent=42".into(), "--wnm-wait-parent=43".into()], 99).is_err());
+    }
+    #[test]
+    fn auto_connect_rules_preserve_legacy_config_and_are_inactive_in_tests() {
+        let legacy: AppConfig = serde_json::from_value(json!({
+            "schemaVersion": 3,
+            "settings": {"language":"en", "theme":"dark"},
+            "profiles": [{"id":"existing"}]
+        })).unwrap();
+        assert!(legacy.wifi_auto_connect.is_empty());
+        let rule = canonical_auto_rule(AutoConnectRule {
+            adapter_guid: "{255BC7A7-A80C-47E6-902B-386AA6EE90DB}".into(),
+            profile_name: "转化医学研究中心813".into(),
+            interval_seconds: 60,
+            enabled: true,
+        }).unwrap();
+        assert_eq!(rule.adapter_guid, "255bc7a7-a80c-47e6-902b-386aa6ee90db");
+        assert_eq!(rule.profile_name, "转化医学研究中心813");
+        assert!(!runtime_auto_rules(&[rule.clone()])[0].enabled);
+        assert!(rule.enabled);
+        let mut latest = legacy.clone();
+        latest.wifi_auto_connect.push(serde_json::to_value(&rule).unwrap());
+        let mut stale = legacy;
+        stale.settings.theme = "light".into();
+        let merged = merge_preserving_auto_rules(&stale, &latest);
+        assert_eq!(merged.settings.theme, "light");
+        assert_eq!(wifi_auto_rules(&merged).unwrap(), vec![rule]);
+        assert_eq!(merged.profiles.len(), 1);
+    }
     #[test]
     fn route_edit_validation_and_live_state_are_checked() {
         let old = json!({"addressFamily":"IPv4","destinationPrefix":"172.16.0.0/12","nextHop":"192.168.3.1","interfaceIndex":26,"routeMetric":5,"persistent":false,"removable":true,"policyStores":["ActiveStore"]});
@@ -2636,9 +3271,8 @@ function New-NetRoute {
     fn ui_contains_sidebar_and_operation_feedback() {
         let ui = include_str!("../frontend/src/network-manager-app.js");
         let html = include_str!("../frontend/index.html");
-        assert!(ui.contains("operationComplete"));
-        assert!(ui.contains("renderMaintenance"));
-        assert!(ui.contains("adapterAction"));
+        assert!(ui.contains("network-manager-app"));
+        assert!(ui.contains("requestConfirmation"));
         assert!(html.contains("network-manager-app"));
     }
     #[test]
@@ -2688,12 +3322,142 @@ function New-NetRoute {
         assert_eq!(items[0]["connected"], true);
     }
     #[test]
+    fn wifi_parser_reads_extended_english_fields() {
+        let output = "There is 1 interface on the system:\n\n    Name                   : Wi-Fi\n    Description            : Intel(R) Wi-Fi 6E AX211 160MHz\n    GUID                   : 255bc7a7-a80c-47e6-902b-386aa6ee90db\n    Physical address       : aa:bb:cc:dd:ee:ff\n    State                  : connected\n    SSID                   : HomeWiFi\n    AP BSSID               : 11:22:33:44:55:66\n    Band                   : 5 GHz\n    Channel                : 44\n    Network type           : Infrastructure\n    Radio type             : 802.11ax\n    Authentication         : WPA2-Personal\n    Cipher                 : CCMP\n    Connection mode        : Auto Connect\n    Receive rate (Mbps)    : 1201\n    Transmit rate (Mbps)   : 960\n    Signal                 : 93%\n    Profile                : HomeWiFi\n";
+        let items = parse_wifi_interfaces(output);
+        assert_eq!(items.len(), 1);
+        let wifi = &items[0];
+        assert_eq!(wifi["alias"], "Wi-Fi");
+        assert_eq!(wifi["connected"], true);
+        assert_eq!(wifi["bssid"], "11:22:33:44:55:66");
+        assert_eq!(wifi["band"], "5 GHz");
+        assert_eq!(wifi["channel"], "44");
+        assert_eq!(wifi["authentication"], "WPA2-Personal");
+        assert_eq!(wifi["cipher"], "CCMP");
+        assert_eq!(wifi["receiveRate"], "1201");
+        assert_eq!(wifi["transmitRate"], "960");
+        assert_eq!(wifi["signal"], "93%");
+        assert_eq!(wifi["signalPercent"], 93);
+        assert_eq!(wifi["currentProfile"], "HomeWiFi");
+        assert_eq!(wifi["radioType"], "802.11ax");
+    }
+    #[test]
+    fn wifi_parser_reads_extended_chinese_fields() {
+        let output = "系统上有 2 个接口:\n\n    名称                   : WLAN\n    描述                   : Realtek 8852BE\n    状态                   : 已连接\n    SSID                   : 测试网络\n    AP BSSID               : 11:22:33:44:55:66\n    频带                   : 2.4 GHz\n    信道                   : 6\n    无线电类型             : 802.11n\n    身份验证               : WPA2 - 个人\n    密码                   : CCMP\n    接收速率(Mbps)         : 144.4\n    传输速率 (Mbps)        : 130\n    信号                   : 71%\n    配置文件               : 测试网络\n\n    名称                   : WLAN 2\n    状态                   : 已断开连接\n";
+        let items = parse_wifi_interfaces(output);
+        assert_eq!(items.len(), 2);
+        let wifi = &items[0];
+        assert_eq!(wifi["connected"], true);
+        assert_eq!(wifi["bssid"], "11:22:33:44:55:66");
+        assert_eq!(wifi["band"], "2.4 GHz");
+        assert_eq!(wifi["channel"], "6");
+        assert_eq!(wifi["authentication"], "WPA2 - 个人");
+        assert_eq!(wifi["cipher"], "CCMP");
+        assert_eq!(wifi["receiveRate"], "144.4");
+        assert_eq!(wifi["transmitRate"], "130");
+        assert_eq!(wifi["signalPercent"], 71);
+        assert_eq!(wifi["currentProfile"], "测试网络");
+        let second = &items[1];
+        assert_eq!(second["connected"], false);
+        assert!(second["bssid"].is_null());
+        assert!(second["signalPercent"].is_null());
+    }
+    #[test]
+    fn netsh_lines_split_at_the_first_colon_of_either_width() {
+        assert_eq!(split_netsh_line("AP BSSID : 11:22:33"), Some(("AP BSSID ", " 11:22:33")));
+        assert_eq!(split_netsh_line("名称：WLAN"), Some(("名称", "WLAN")));
+        assert_eq!(split_netsh_line("BSSID ： aa:bb"), Some(("BSSID ", " aa:bb")));
+        assert_eq!(split_netsh_line("no separator"), None);
+        assert_eq!(signal_percent("100%"), Some(100));
+        assert_eq!(signal_percent("abc"), None);
+    }
+    #[test]
+    fn powershell_overview_exposes_status_and_connectivity() {
+        let raw = json!({
+            "adapters":{"interfaceIndex":7,"alias":"Wi-Fi","description":"Intel","guid":"{ABC}","interfaceType":71,"adminStatus":"Up","operationalStatus":"Up","mediaConnectionState":"Connected","linkSpeed":"866.7 Mbps"},
+            "ipInterfaces":[{"interfaceIndex":7,"alias":"Wi-Fi","addressFamily":"IPv4","automaticMetric":true,"interfaceMetric":35,"dhcp":true},
+                            {"interfaceIndex":1,"alias":"Loopback Pseudo-Interface 1","addressFamily":"IPv4","automaticMetric":true,"interfaceMetric":75,"dhcp":false}],
+            "connectionProfiles":[{"interfaceIndex":7,"name":"HomeWiFi","category":"Private","ipv4Connectivity":"Internet","ipv6Connectivity":"NoTraffic"}]
+        });
+        let overview = normalize_overview(raw, vec![]);
+        let items = arrays(overview.get("interfaces"));
+        let wifi = items.iter().find(|x| field_i64(x, "interfaceIndex") == 7).unwrap();
+        assert_eq!(wifi["operationalStatus"], "Up");
+        assert_eq!(wifi["mediaConnectionState"], "Connected");
+        assert_eq!(wifi["dhcpEnabled"], true);
+        assert_eq!(wifi["networkCategory"], "Private");
+        assert_eq!(wifi["networkName"], "HomeWiFi");
+        assert_eq!(wifi["ipv4Connectivity"], "Internet");
+        assert_eq!(wifi["ipv6Connectivity"], "NoTraffic");
+        let loopback = items.iter().find(|x| field_i64(x, "interfaceIndex") == 1).unwrap();
+        assert_eq!(loopback["operationalStatus"], "Unknown");
+        assert_eq!(loopback["mediaConnectionState"], "Unknown");
+        assert!(loopback["ipv4Connectivity"].is_null());
+        assert!(loopback["networkCategory"].is_null());
+    }
+    #[test]
+    fn preview_notices_match_warning_text() {
+        let adapter = json!({"alias":"Ethernet","defaultRoute":true});
+        let notices = adapter_control_notices(&adapter, "disable");
+        let codes = notices.iter().map(|x| field_string(x, "code")).collect::<Vec<_>>();
+        assert_eq!(codes, vec!["adapter.disable.interrupt", "adapter.disable.defaultGateway"]);
+        assert_eq!(notice_texts(&notices).len(), notices.len());
+        assert_eq!(notices[0]["params"]["alias"], "Ethernet");
+        assert!(adapter_control_notices(&adapter, "enable").is_empty());
+        let kept = windows_defaults_notices(&json!({"interfaces":[{"interfaceIndex":7}],"managedRoutes":[],"removeManagedRoutes":false}));
+        let codes = kept.iter().map(|x| field_string(x, "code")).collect::<Vec<_>>();
+        assert_eq!(codes, vec!["defaults.metrics", "defaults.routesKept", "defaults.wifi"]);
+        assert_eq!(kept[0]["params"]["count"], "1");
+        let removed = windows_defaults_notices(&json!({"interfaces":[],"managedRoutes":[{},{}],"removeManagedRoutes":true}));
+        assert_eq!(removed[1]["code"], "defaults.routes");
+        assert_eq!(removed[1]["params"]["count"], "2");
+    }
+    #[test]
+    fn deleting_history_and_configurations_only_edits_config() {
+        let mut cfg = AppConfig::default();
+        cfg.profiles.push(json!({"id":"p1","name":"Home"}));
+        let snapshot = |id: &str| Snapshot {
+            id: id.into(), hash: id.into(), name: id.into(), created_at: "x".into(),
+            last_used_at: "x".into(), use_count: 1, state: json!({}),
+        };
+        cfg.recent_snapshots = vec![snapshot("r1"), snapshot("r2")];
+        remove_recent_entry(&mut cfg, "r1").unwrap();
+        assert_eq!(cfg.recent_snapshots.len(), 1);
+        assert_eq!(cfg.recent_snapshots[0].id, "r2");
+        assert_eq!(remove_recent_entry(&mut cfg, "r1").unwrap_err().code, "NOT_FOUND");
+        remove_profile_entry(&mut cfg, "p1").unwrap();
+        assert!(cfg.profiles.is_empty());
+        assert_eq!(remove_profile_entry(&mut cfg, "p1").unwrap_err().code, "NOT_FOUND");
+    }
+    #[test]
+    fn baseline_scope_items_resolve_saved_names() {
+        let mut cfg = AppConfig::default();
+        cfg.profiles.push(json!({"id":"p1","name":"Home"}));
+        let baseline = Baseline {
+            snapshot: Snapshot {
+                id: "b".into(), hash: "h".into(), name: "Before latest change".into(),
+                created_at: "x".into(), last_used_at: "x".into(), use_count: 0, state: json!({}),
+            },
+            scope: json!({"restoreProfile":"p1"}),
+        };
+        let items = baseline_scope_items(&cfg, &baseline);
+        assert_eq!(items[0]["code"], "scope.restoreProfile");
+        assert_eq!(items[0]["params"]["name"], "Home");
+    }
+    #[test]
     fn native_discovery_returns_a_structured_overview() {
         let overview = native_network_overview()
             .expect("native adapter discovery should be available on Windows");
-        assert!(overview
+        let interfaces = overview
             .get("interfaces")
             .and_then(Value::as_array)
-            .is_some());
+            .expect("interfaces array");
+        for item in interfaces {
+            assert!(item["operationalStatus"].is_string());
+            assert!(item["mediaConnectionState"].is_string());
+            assert!(item.get("ipv4Connectivity").is_some());
+            assert!(item.get("networkName").is_some());
+        }
+        assert!(interfaces.iter().any(|item| field_string(item, "guid").starts_with('{')));
     }
 }
