@@ -24,6 +24,7 @@
 - Keep Windows networking commands in Rust and use fixed PowerShell/netsh argument templates with strict validation.
 - Never run real network write operations in automated tests or development validation: no Wi-Fi connect/disconnect, Metric changes, route changes, adapter enable/disable, or UAC elevation.
 - Preserve the userData configuration location and never store passwords or credentials.
+- Coexist with tunnel/proxy software (EasyTier, v2rayN/xray/sing-box/mihomo, Tailscale, ZeroTier, WireGuard): never enable/disable their adapters, edit their routes or capture routes, or change the system proxy. Only Metric may change, with a warning. Enforce this in Rust, not only in the UI.
 
 ## Build cleanup
 

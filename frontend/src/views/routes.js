@@ -25,6 +25,8 @@ function renderRow(app, route, managed, showFamily) {
   const busy = app.routeBusy();
   const disabled = !app.privilege.isAdmin || busy;
   const isManaged = managed.has(routeIdentity(route));
+  // Routes of EasyTier, v2rayN and similar software are left to that program.
+  const owned = (route.managedBy || route.captureRoute) && !isManaged;
   const effective = route.effectiveMetric ?? route.routeMetric;
   return html`<tr class=${route.defaultRoute ? "default-route" : ""}>
     ${showFamily ? html`<td class="muted">${route.addressFamily}</td>` : nothing}
@@ -48,9 +50,10 @@ function renderRow(app, route, managed, showFamily) {
       ${chip(route.persistent ? app.t("persistent") : app.t("temporary"), route.persistent ? "" : "muted")}
       ${route.systemManaged ? chip(app.t("system"), "muted") : nothing}
       ${isManaged ? chip(app.t("appManaged"), "accent") : nothing}
+      ${route.managedBy ? chip(app.ownerLabel(route.managedBy), "muted") : nothing}
     </td>
     <td class="row-actions">
-      ${route.removable
+      ${route.removable && !owned
         ? html`<button
               class="icon-button subtle"
               title=${app.t("edit")}
@@ -80,7 +83,7 @@ function renderRow(app, route, managed, showFamily) {
             >
               ${icon("trash")}
             </button>`
-        : html`<span class="muted" title=${app.t("routeReadOnly")}>—</span>`}
+        : html`<span class="muted" title=${owned ? app.t("routeProtected") : app.t("routeReadOnly")}>—</span>`}
     </td>
   </tr>`;
 }

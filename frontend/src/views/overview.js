@@ -42,6 +42,10 @@ function renderHero(app, active) {
           ? chip(active.networkName)
           : nothing}
         ${active.networkCategory ? chip(app.t(`category${active.networkCategory}`)) : nothing}
+        ${active.managedBy ? chip(app.managedLabel(active.managedBy), "accent") : nothing}
+        <button class="subtle compact" ?disabled=${app.isBusy("tools:connectivity")} @click=${() => app.openTools()}>
+          ${icon("diagnostics")}${app.t("testConnection")}
+        </button>
       </div>
     </div>
     <div class="fact-grid">
@@ -213,6 +217,51 @@ function renderAutoConnect(app) {
   </section>`;
 }
 
+function renderCoexistence(app) {
+  const info = app.coexistence;
+  const software = info?.software || [];
+  const tunnels = info?.tunnels || [];
+  const proxy = info?.systemProxy;
+  if (!software.length && !tunnels.length && !proxy?.enabled) return nothing;
+  const via = info.defaultVia;
+  return html`<section class="card">
+    ${cardHeader(app.t("coexistence"), app.t("coexistenceHelp"))}
+    <div class="row-list">
+      ${software.map(
+        (item) => html`<div class="list-row">
+          ${icon("shield")}
+          <span class="list-main">
+            <strong>${item.product}</strong>
+            <small>${(item.processes || []).join(", ")}</small>
+          </span>
+        </div>`,
+      )}
+      <div class="list-row">
+        ${icon("globe")}
+        <span class="list-main">
+          <strong>${app.t("systemProxy")}</strong>
+          <small>${proxy?.enabled ? app.tf("proxyOn", { server: proxy.server || proxy.autoConfigUrl || "—" }) : app.t("proxyOff")}</small>
+        </span>
+        <span class="list-meta"
+          >${via
+            ? app.tf("trafficVia", { alias: via.alias, owner: app.ownerLabel(via.owner) })
+            : app.t("trafficDirect")}</span
+        >
+      </div>
+      ${tunnels.map(
+        (tunnel) => html`<div class="list-row">
+          ${icon("tunnel")}
+          <span class="list-main">
+            <strong>${tunnel.alias}</strong>
+            <small>${app.managedLabel(tunnel.owner)}${tunnel.ipv4 ? ` · ${tunnel.ipv4}` : ""}</small>
+          </span>
+          ${pill(tunnel.up ? "success" : "neutral", tunnel.up ? app.t("connected") : app.t("disconnected"))}
+        </div>`,
+      )}
+    </div>
+  </section>`;
+}
+
 export function renderOverview(app) {
   const adapters = app.interfaces();
   const routes = app.network.routes;
@@ -220,13 +269,16 @@ export function renderOverview(app) {
     routes?.defaultCandidates || (routes?.routes || []).filter((route) => route.defaultRoute),
   )[0];
   const usable = adapters.filter((item) => item.defaultRoute && !isAdapterDisabled(item));
-  // The active path is the adapter that owns the preferred default route.
+  // The active path is the adapter that owns the preferred default route, or
+  // the tunnel (v2rayN TUN, EasyTier exit node) that captures default traffic.
+  const via = app.coexistence?.defaultVia;
   const active =
+    (via && adapters.find((item) => item.interfaceIndex === via.interfaceIndex)) ||
     usable.find((item) => item.interfaceIndex === preferred?.interfaceIndex) ||
     sortAdapters(usable)[0];
   return html`<div class="dashboard">
     <div class="span-2">${renderHero(app, active)}</div>
     ${renderDefaultRoutes(app)} ${renderDeviationTiles(app, adapters)}
-    ${renderAdapterList(app, adapters)} ${renderAutoConnect(app)}
+    ${renderAdapterList(app, adapters)} ${renderAutoConnect(app)} ${renderCoexistence(app)}
   </div>`;
 }

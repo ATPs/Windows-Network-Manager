@@ -65,5 +65,11 @@ export const api = {
   defaults: (selection, confirmationToken) =>
     call("windows_defaults_apply", { input: { ...selection, confirmationToken } }),
   diagnostics: () => call("get_diagnostics"),
+  connectivityTest: () => call("run_connectivity_test"),
+  lookupRoute: (host) => call("lookup_route", { host }),
+  startTrace: (host, maxHops = 30) => call("start_trace", { host, maxHops }),
+  cancelTrace: () => call("cancel_trace"),
+  activeConnections: () => call("get_active_connections"),
+  scanWifi: (adapterGuid) => call("scan_wifi_networks", { adapterGuid }),
   restartAsAdmin: () => call("restart_as_administrator"),
 };

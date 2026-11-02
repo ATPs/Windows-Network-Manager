@@ -361,7 +361,14 @@ function renderAdapterBody(app, item) {
       ${!app.privilege.isAdmin ? html`<p class="permission-note">${icon("shield")}${app.t("permissionHelp")}</p>` : nothing}
     </section>
     ${item.wifi ? renderWifiSection(app, item) : nothing}
-    ${!item.systemInterface
+    ${item.managedBy
+      ? html`<section class="detail-section span-2 advanced">
+          <h4>${icon("shield")}${app.managedLabel(item.managedBy)}</h4>
+          <p class="help-text">
+            ${app.tf("protectedAdapterHelp", { owner: app.ownerLabel(item.managedBy) })}
+          </p>
+        </section>`
+      : !item.systemInterface
       ? html`<section class="detail-section span-2 advanced">
           <h4>${icon("power")}${app.t("advanced")}</h4>
           <div class="advanced-row">
@@ -420,6 +427,7 @@ function renderAdapter(app, item) {
         ${hasManualMetric(item) ? chip(app.t("manualMetric"), "warning") : nothing}
         ${rule?.enabled ? chip(app.t("autoOn"), "accent") : nothing}
         ${item.systemInterface ? chip(app.t("system")) : nothing}
+        ${item.managedBy ? chip(app.managedLabel(item.managedBy), "accent") : nothing}
         ${pill(disabled ? "danger" : online ? "success" : "neutral", app.connectionLabel(item))}
       </span>
       ${icon(expanded ? "chevronUp" : "chevronDown", "muted")}

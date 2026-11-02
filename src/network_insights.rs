@@ -2,7 +2,7 @@
 //! connectivity, status labels, translatable notices, restore previews,
 //! undo descriptions and the tray tooltip. Nothing here changes the network.
 
-use crate::{arrays, field_bool, field_i64, field_string, route_key};
+use crate::{arrays, coexistence::owner_of, field_bool, field_i64, field_string, route_key};
 use serde_json::{json, Map, Value};
 use std::{
     collections::HashMap,
@@ -257,6 +257,24 @@ fn route_summary(route: &Value) -> Value {
     })
 }
 
+/// Find the current adapter for a stored one. Tunnel software recreates its
+/// adapters, so a stored GUID must match; an index reused by a different
+/// adapter is not the same interface. Older snapshots without a GUID match by
+/// index and alias together.
+pub fn match_interface<'a>(wanted: &Value, current: &'a [Value]) -> Option<&'a Value> {
+    let guid = normalized_guid_key(&field_string(wanted, "guid"));
+    if !guid.is_empty() {
+        return current
+            .iter()
+            .find(|item| normalized_guid_key(&field_string(item, "guid")) == guid);
+    }
+    let index = field_i64(wanted, "interfaceIndex");
+    let alias = field_string(wanted, "alias");
+    current.iter().find(|item| {
+        field_i64(item, "interfaceIndex") == index && (alias.is_empty() || field_string(item, "alias") == alias)
+    })
+}
+
 /// Describe what restoring `target` (a stored snapshot) would change, using the
 /// same scope as `restore_snapshot` for saved configurations and history:
 /// Metric, adapter enabled state, Wi-Fi connection and app-managed routes.
@@ -270,19 +288,28 @@ pub fn restore_changes(
     let mut unchanged = 0usize;
     let current_interfaces = arrays(current_overview.get("interfaces"));
     for wanted in arrays(target.pointer("/overview/interfaces")) {
-        let index = field_i64(&wanted, "interfaceIndex");
+        let stored_index = field_i64(&wanted, "interfaceIndex");
         let alias = field_string(&wanted, "alias");
-        let Some(actual) = current_interfaces
-            .iter()
-            .find(|item| field_i64(item, "interfaceIndex") == index)
-        else {
-            changes.push(json!({
-                "kind":"skipped","code":"restore.interfaceMissing",
-                "params":{"alias":alias,"interfaceIndex":index.to_string()},
-                "text":format!("{alias} (#{index}) no longer exists and will be skipped.")
-            }));
+        let Some(actual) = match_interface(&wanted, &current_interfaces) else {
+            let reused = current_interfaces
+                .iter()
+                .any(|item| field_i64(item, "interfaceIndex") == stored_index);
+            changes.push(if reused {
+                json!({
+                    "kind":"skipped","code":"restore.interfaceRecreated",
+                    "params":{"alias":alias,"interfaceIndex":stored_index.to_string()},
+                    "text":format!("{alias} (#{stored_index}) was replaced by a different adapter and will be skipped.")
+                })
+            } else {
+                json!({
+                    "kind":"skipped","code":"restore.interfaceMissing",
+                    "params":{"alias":alias,"interfaceIndex":stored_index.to_string()},
+                    "text":format!("{alias} (#{stored_index}) no longer exists and will be skipped.")
+                })
+            });
             continue;
         };
+        let index = field_i64(actual, "interfaceIndex");
         for (family, key) in [("IPv4", "ipv4"), ("IPv6", "ipv6")] {
             let Some(metric) = wanted.pointer(&format!("/metrics/{key}")).filter(|x| !x.is_null()) else {
                 continue;
@@ -312,6 +339,12 @@ pub fn restore_changes(
             let actual_disabled = field_string(actual, "adminStatus").eq_ignore_ascii_case("down");
             if wanted_disabled == actual_disabled {
                 unchanged += 1;
+            } else if let Some(owner) = owner_of(actual) {
+                changes.push(json!({
+                    "kind":"skipped","code":"restore.adapterProtected",
+                    "params":{"alias":alias,"owner":owner},
+                    "text":format!("{alias} is managed by {owner}; its enabled state will not be changed.")
+                }));
             } else {
                 changes.push(json!({
                     "kind":"adapter","interfaceIndex":index,"alias":alias,
@@ -675,6 +708,43 @@ mod tests {
         assert_eq!(changes[0]["action"], "disconnect");
         assert_eq!(changes[0]["before"], "Cafe");
         assert!(changes[0]["after"].is_null());
+    }
+
+    #[test]
+    fn restore_matches_recreated_tunnels_by_guid() {
+        let stored = |index: i64, guid: &str| {
+            let mut item = interface(index, "et_6_0qmn", false, 5, "Down", Value::Null);
+            item["guid"] = json!(guid);
+            item
+        };
+        let target = json!({"overview":{"interfaces":[stored(33, "{AAAA-1}")]},"routes":{"routes":[]}});
+        // Same index, different GUID: EasyTier recreated the adapter.
+        let mut replaced = stored(33, "bbbb-2");
+        replaced["adminStatus"] = json!("Up");
+        let (changes, _) = restore_changes(&target, &json!({"interfaces":[replaced]}), &json!({}), &[]);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["code"], "restore.interfaceRecreated");
+        // Same GUID under a new index: changes use the current index; a
+        // protected adapter's enabled state is left to its owner.
+        let mut moved = stored(41, "aaaa-1");
+        moved["adminStatus"] = json!("Up");
+        moved["managedBy"] = json!("EasyTier");
+        moved["metrics"]["ipv4"] = json!({"automaticMetric":true,"interfaceMetric":5});
+        let (changes, _) = restore_changes(&target, &json!({"interfaces":[moved]}), &json!({}), &[]);
+        let kinds = changes.iter().map(|c| field_string(c, "kind")).collect::<Vec<_>>();
+        assert_eq!(kinds, vec!["metric", "skipped"]);
+        assert_eq!(changes[0]["interfaceIndex"], 41);
+        assert_eq!(changes[1]["code"], "restore.adapterProtected");
+        assert_eq!(changes[1]["params"]["owner"], "EasyTier");
+    }
+
+    #[test]
+    fn legacy_snapshots_without_guid_need_matching_alias() {
+        let wanted = interface(7, "Wi-Fi", true, 35, "Up", Value::Null);
+        let same = [interface(7, "Wi-Fi", true, 35, "Up", Value::Null)];
+        let other = [interface(7, "vgate0", true, 35, "Up", Value::Null)];
+        assert!(match_interface(&wanted, &same).is_some());
+        assert!(match_interface(&wanted, &other).is_none());
     }
 
     #[test]

@@ -20,6 +20,7 @@ import { renderAdapters } from "./views/adapters.js";
 import { renderRoutes, renderRouteDrawer } from "./views/routes.js";
 import { renderProfiles } from "./views/profiles.js";
 import { renderDiagnostics } from "./views/diagnostics.js";
+import { renderTools } from "./views/tools.js";
 import { renderMaintenance } from "./views/maintenance.js";
 import { renderSettings } from "./views/settings.js";
 
@@ -29,6 +30,7 @@ export const views = [
   "routes",
   "profiles",
   "diagnostics",
+  "tools",
   "maintenance",
   "settings",
 ];
@@ -38,6 +40,7 @@ const viewRenderers = {
   routes: renderRoutes,
   profiles: renderProfiles,
   diagnostics: renderDiagnostics,
+  tools: renderTools,
   maintenance: renderMaintenance,
   settings: renderSettings,
 };
@@ -133,6 +136,18 @@ export class NetworkManagerApp extends LitElement {
     this.defaultsSelection = null;
     this.defaultsRemoveRoutes = true;
     this.diagnostics = null;
+    this.coexistence = null;
+    this.tools = {
+      connectivity: null,
+      lookupHost: "",
+      lookup: null,
+      trace: null,
+      connections: null,
+      connectionFilters: { search: "", protocol: "all", state: "all" },
+      wifiAdapter: "",
+      wifiScan: null,
+    };
+    this.toolEventUnlisten = [];
     this.refreshTimer = null;
     this.clockTimer = null;
     this.onVisibilityChange = () => this.scheduleRefresh();
@@ -156,6 +171,8 @@ export class NetworkManagerApp extends LitElement {
       this.wifiAutoEventUnlisten();
       this.wifiAutoEventUnlisten = null;
     }
+    this.toolEventUnlisten.forEach((unlisten) => unlisten());
+    this.toolEventUnlisten = [];
   }
 
   t(key) {
@@ -202,6 +219,7 @@ export class NetworkManagerApp extends LitElement {
   async initialize() {
     try {
       this.subscribeWifiAutoEvents();
+      this.subscribeToolEvents();
       this.loadVersion();
       const bootstrap = await api.bootstrap();
       this.settings = { ...this.settings, ...(bootstrap.settings || {}) };
@@ -249,6 +267,7 @@ export class NetworkManagerApp extends LitElement {
       source: result.source || "live",
       stale: Boolean(result.stale),
     };
+    if (result.coexistence) this.coexistence = result.coexistence;
   }
 
   scheduleRefresh() {
@@ -304,6 +323,19 @@ export class NetworkManagerApp extends LitElement {
         "wifi-auto-connect-updated",
         () => this.loadWifiAutoStatus(),
       );
+    } catch {
+      // The event bridge is unavailable in browser and unit-test environments.
+    }
+  }
+
+  async subscribeToolEvents() {
+    if (this.toolEventUnlisten.length) return;
+    try {
+      const { listen } = await import("@tauri-apps/api/event");
+      this.toolEventUnlisten = [
+        await listen("trace-hop", (event) => this.onTraceHop(event.payload)),
+        await listen("trace-done", (event) => this.onTraceDone(event.payload)),
+      ];
     } catch {
       // The event bridge is unavailable in browser and unit-test environments.
     }
@@ -520,7 +552,7 @@ export class NetworkManagerApp extends LitElement {
       return;
     }
     if (this.anyDialogOpen()) return;
-    if (event.ctrlKey && !event.altKey && /^[1-7]$/.test(event.key)) {
+    if (event.ctrlKey && !event.altKey && /^[1-8]$/.test(event.key)) {
       event.preventDefault();
       this.setView(views[Number(event.key) - 1]);
       return;
@@ -1227,7 +1259,105 @@ export class NetworkManagerApp extends LitElement {
   }
 
   defaultsCandidates() {
-    return this.interfaces().filter((item) => !item.systemInterface);
+    // Adapters owned by EasyTier, v2rayN and similar software are left to them.
+    return this.interfaces().filter((item) => !item.systemInterface && !item.managedBy);
+  }
+
+  // ---- Coexistence with tunnel and proxy software -------------------------
+
+  ownerLabel(owner) {
+    return owner === "tunnel" ? this.t("tunnelSoftware") : owner || "";
+  }
+
+  managedLabel(owner) {
+    return this.tf("managedBy", { owner: this.ownerLabel(owner) });
+  }
+
+  // ---- Tools (read-only) --------------------------------------------------
+
+  openTools() {
+    this.setView("tools");
+    this.runConnectivityTest();
+  }
+
+  async runConnectivityTest() {
+    const result = await this.preview("tools:connectivity", () => api.connectivityTest());
+    if (result) {
+      this.tools.connectivity = result;
+      this.requestUpdate();
+    }
+  }
+
+  async lookupRoute() {
+    const host = this.tools.lookupHost.trim();
+    if (!host) return;
+    const result = await this.preview("tools:lookup", () => api.lookupRoute(host));
+    if (result) {
+      this.tools.lookup = result;
+      this.requestUpdate();
+    }
+  }
+
+  async startTrace() {
+    const host = this.tools.lookupHost.trim();
+    if (!host || this.isBusy("tools:trace")) return;
+    const started = await this.preview("tools:trace-start", () => api.startTrace(host));
+    if (!started) return;
+    this.tools.trace = { ...started, hops: [], done: false };
+    this.setBusy("tools:trace", true);
+  }
+
+  async cancelTrace() {
+    try {
+      await api.cancelTrace();
+    } catch {
+      // The trace finishes on its own when cancellation is unavailable.
+    }
+  }
+
+  onTraceHop(hop) {
+    const trace = this.tools.trace;
+    if (!trace || hop?.traceId !== trace.traceId) return;
+    trace.hops = [...trace.hops, hop];
+    this.requestUpdate();
+  }
+
+  onTraceDone(done) {
+    const trace = this.tools.trace;
+    if (!trace || done?.traceId !== trace.traceId) return;
+    Object.assign(trace, {
+      done: true,
+      reached: Boolean(done.reached),
+      cancelled: Boolean(done.cancelled),
+      error: done.error || null,
+    });
+    this.setBusy("tools:trace", false);
+  }
+
+  async loadConnections() {
+    const result = await this.preview("tools:connections", () => api.activeConnections());
+    if (result) {
+      this.tools.connections = result;
+      this.requestUpdate();
+    }
+  }
+
+  setConnectionFilter(change) {
+    this.tools.connectionFilters = { ...this.tools.connectionFilters, ...change };
+    this.requestUpdate();
+  }
+
+  wifiAdapters() {
+    return this.interfaces().filter((item) => item.wifi && item.guid);
+  }
+
+  async scanWifi(adapterGuid) {
+    if (!adapterGuid) return;
+    const result = await this.preview("tools:wifi", () => api.scanWifi(adapterGuid));
+    if (result) {
+      this.tools.wifiScan = result;
+      this.requestUpdate();
+    }
   }
 
   selectedDefaults() {

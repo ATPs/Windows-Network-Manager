@@ -1344,6 +1344,77 @@ td.chips .chip {
   color: var(--text);
 }
 
+/* ---- Tools ---------------------------------------------------------------- */
+.tool-results {
+  display: grid;
+  gap: 12px;
+}
+.tool-block {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+}
+.tool-results .tool-block {
+  margin-top: 0;
+}
+.tool-block-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.tool-block-head .icon {
+  width: 16px;
+  height: 16px;
+  color: var(--text-2);
+}
+.tool-form {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.tool-form input {
+  flex: 1;
+  min-width: 0;
+}
+.compact-table {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+.compact-table td,
+.compact-table th {
+  padding: 4px 10px;
+  font-size: 0.86rem;
+}
+.compact-table tr.failed td {
+  color: var(--danger);
+}
+.compact-table tr.reached td {
+  color: var(--success);
+}
+.table-scroll {
+  max-height: 360px;
+  overflow: auto;
+}
+.table-scroll.tall {
+  max-height: 520px;
+}
+.channel-summary {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+.channel-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.channel-row strong {
+  min-width: 64px;
+  font-size: 0.86rem;
+}
+
 /* ---- Backups / diagnostics / recovery ----------------------------------- */
 .finding-list {
   display: grid;

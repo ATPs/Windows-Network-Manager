@@ -1,7 +1,8 @@
-//! Read-only WLAN discovery and narrowly scoped, hidden connection requests.
-//! No profile XML or credentials are read by this module.
+//! Read-only WLAN discovery, nearby-network scans and narrowly scoped, hidden
+//! connection requests. No profile XML or credentials are read by this module.
 
 use crate::wifi_auto_connect::{AutoConnectRule, DiscoveredAdapter, WifiBackend, WifiObservation};
+use serde_json::{json, Value};
 use std::{
     ffi::c_void,
     mem::size_of,
@@ -26,10 +27,13 @@ use windows_sys::{
                 wlan_interface_state_authenticating, wlan_interface_state_connected,
                 wlan_interface_state_disconnecting, wlan_interface_state_discovering,
                 wlan_interface_state_not_ready, wlan_intf_opcode_current_connection,
-                wlan_intf_opcode_radio_state, WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory,
-                WlanGetProfileList, WlanOpenHandle, WlanQueryInterface, WLAN_CONNECTION_ATTRIBUTES,
-                WLAN_INTERFACE_INFO, WLAN_INTERFACE_INFO_LIST, WLAN_PROFILE_INFO_LIST,
-                WLAN_RADIO_STATE,
+                dot11_BSS_type_any, wlan_intf_opcode_radio_state, WlanCloseHandle,
+                WlanEnumInterfaces, WlanFreeMemory, WlanGetAvailableNetworkList,
+                WlanGetNetworkBssList, WlanGetProfileList, WlanOpenHandle, WlanQueryInterface,
+                WlanScan, DOT11_SSID, WLAN_AVAILABLE_NETWORK_CONNECTED,
+                WLAN_AVAILABLE_NETWORK_HAS_PROFILE, WLAN_AVAILABLE_NETWORK_LIST, WLAN_BSS_LIST,
+                WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO, WLAN_INTERFACE_INFO_LIST,
+                WLAN_PROFILE_INFO_LIST, WLAN_RADIO_STATE,
             },
         },
     },
@@ -282,6 +286,112 @@ fn selected_adapter(rule: &AutoConnectRule) -> Result<InspectedAdapter, String> 
     Ok(adapter)
 }
 
+/// Band label and channel number for a centre frequency in kHz.
+pub fn band_channel(frequency_khz: u32) -> (Option<&'static str>, Option<u32>) {
+    let mhz = frequency_khz / 1000;
+    match mhz {
+        2484 => (Some("2.4 GHz"), Some(14)),
+        2412..=2472 => (Some("2.4 GHz"), Some((mhz - 2407) / 5)),
+        5955..=7115 => (Some("6 GHz"), Some((mhz - 5950) / 5)),
+        5000..=5925 => (Some("5 GHz"), Some((mhz - 5000) / 5)),
+        _ => (None, None),
+    }
+}
+
+/// DOT11_AUTH_ALGORITHM as a short security label.
+pub fn security_text(algorithm: i32, secured: bool) -> &'static str {
+    match algorithm {
+        1 if !secured => "Open",
+        1 | 2 => "WEP",
+        3 => "WPA-Enterprise",
+        4 => "WPA-Personal",
+        6 => "WPA2-Enterprise",
+        7 => "WPA2-Personal",
+        8 | 11 => "WPA3-Enterprise",
+        9 => "WPA3-Personal",
+        10 => "OWE",
+        _ => "Other",
+    }
+}
+
+fn ssid_text(ssid: &DOT11_SSID) -> String {
+    let length = (ssid.uSSIDLength as usize).min(ssid.ucSSID.len());
+    String::from_utf8_lossy(&ssid.ucSSID[..length]).into_owned()
+}
+
+/// Scan for nearby networks with one adapter and list every visible access
+/// point. This only reads what Windows sees; it never connects.
+pub fn scan_networks(adapter_guid: &str) -> Result<Value, String> {
+    ensure_wifi_access()?;
+    let client = WlanClient::open()?;
+    let info = interface_infos(&client)?
+        .into_iter()
+        .find(|info| same_guid(&guid_string(&info.InterfaceGuid), adapter_guid))
+        .ok_or_else(|| "The selected Wi-Fi adapter is unavailable.".to_string())?;
+    let guid = info.InterfaceGuid;
+    // A fresh scan completes within a few seconds; when Windows refuses one
+    // (e.g. while connecting) the recent cached results are used instead.
+    let scanned = unsafe { WlanScan(client.0, &guid, ptr::null(), ptr::null(), ptr::null()) } == 0;
+    if scanned {
+        thread::sleep(Duration::from_millis(4000));
+    }
+    let mut networks: Vec<(String, bool, i32, bool, bool)> = vec![];
+    let mut available: *mut WLAN_AVAILABLE_NETWORK_LIST = ptr::null_mut();
+    let code = unsafe { WlanGetAvailableNetworkList(client.0, &guid, 0, ptr::null(), &mut available) };
+    let _available = WlanBuffer(available.cast());
+    if code == 0 && !available.is_null() {
+        let count = unsafe { (*available).dwNumberOfItems as usize }.min(4096);
+        let items = unsafe { std::slice::from_raw_parts((*available).Network.as_ptr(), count) };
+        for item in items {
+            networks.push((
+                ssid_text(&item.dot11Ssid),
+                item.bSecurityEnabled != 0,
+                item.dot11DefaultAuthAlgorithm,
+                item.dwFlags & WLAN_AVAILABLE_NETWORK_HAS_PROFILE != 0,
+                item.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED != 0,
+            ));
+        }
+    }
+    let mut list: *mut WLAN_BSS_LIST = ptr::null_mut();
+    let code = unsafe {
+        WlanGetNetworkBssList(client.0, &guid, ptr::null(), dot11_BSS_type_any, 0, ptr::null(), &mut list)
+    };
+    let _list = WlanBuffer(list.cast());
+    if code != 0 || list.is_null() {
+        return Err(format!("Cannot read nearby Wi-Fi networks (error {code})."));
+    }
+    let count = unsafe { (*list).dwNumberOfItems as usize }.min(4096);
+    let entries = unsafe { std::slice::from_raw_parts((*list).wlanBssEntries.as_ptr(), count) };
+    let access_points = entries
+        .iter()
+        .map(|entry| {
+            let ssid = ssid_text(&entry.dot11Ssid);
+            let known = networks.iter().find(|(name, ..)| name == &ssid);
+            let (band, channel) = band_channel(entry.ulChCenterFrequency);
+            let bssid = entry.dot11Bssid.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":");
+            json!({
+                "ssid":ssid,
+                "bssid":bssid,
+                "rssi":entry.lRssi,
+                "signalPercent":entry.uLinkQuality.min(100),
+                "frequencyMhz":entry.ulChCenterFrequency / 1000,
+                "band":band,
+                "channel":channel,
+                "security":known.map(|(_, secured, algorithm, ..)| security_text(*algorithm, *secured)),
+                "savedProfile":known.map(|(.., saved, _)| *saved).unwrap_or(false),
+                "connected":known.map(|(.., connected)| *connected).unwrap_or(false)
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "adapterGuid":guid_string(&guid),
+        "interfaceName":alias_for_guid(&guid).unwrap_or_default(),
+        "fresh":scanned,
+        "scannedAt":chrono::Utc::now().to_rfc3339(),
+        "accessPoints":access_points
+    }))
+}
+
 impl WifiBackend for WindowsWifi {
     fn observe(&self, rule: &AutoConnectRule) -> Result<WifiObservation, String> {
         let adapter = selected_adapter(rule)?;
@@ -350,6 +460,24 @@ mod tests {
         assert!(!same_guid(&guid_string(&guid), "invalid"));
         let name: Vec<_> = "转化医学813\0ignored".encode_utf16().collect();
         assert_eq!(utf16_string(&name), "转化医学813");
+    }
+
+    #[test]
+    fn frequencies_map_to_bands_and_channels() {
+        assert_eq!(band_channel(2_412_000), (Some("2.4 GHz"), Some(1)));
+        assert_eq!(band_channel(2_437_000), (Some("2.4 GHz"), Some(6)));
+        assert_eq!(band_channel(2_484_000), (Some("2.4 GHz"), Some(14)));
+        assert_eq!(band_channel(5_180_000), (Some("5 GHz"), Some(36)));
+        assert_eq!(band_channel(5_825_000), (Some("5 GHz"), Some(165)));
+        assert_eq!(band_channel(5_955_000), (Some("6 GHz"), Some(1)));
+        assert_eq!(band_channel(60_480_000), (None, None));
+        assert_eq!(security_text(7, true), "WPA2-Personal");
+        assert_eq!(security_text(9, true), "WPA3-Personal");
+        assert_eq!(security_text(1, false), "Open");
+        let mut bytes = [0u8; 32];
+        bytes[..4].copy_from_slice(b"Home");
+        assert_eq!(ssid_text(&DOT11_SSID { uSSIDLength: 4, ucSSID: bytes }), "Home");
+        assert_eq!(ssid_text(&DOT11_SSID { uSSIDLength: 99, ucSSID: bytes }).len(), 32);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+mod coexistence;
+mod net_tools;
 mod network_insights;
 mod wifi_auto_connect;
 mod wifi_windows;
@@ -452,6 +454,12 @@ pub fn run() {
             windows_defaults_preview,
             windows_defaults_apply,
             get_diagnostics,
+            run_connectivity_test,
+            lookup_route,
+            start_trace,
+            cancel_trace,
+            get_active_connections,
+            scan_wifi_networks,
             restart_as_administrator
         ])
         .run(tauri::generate_context!())
@@ -674,7 +682,7 @@ fn normalize_overview(raw: Value, wifi: Vec<Value>) -> Value {
     let addresses=arrays(entry.get("addresses")); let ipv4=addresses.iter().filter(|x|field_string(x,"addressFamily")=="IPv4").cloned().collect::<Vec<_>>(); let ipv6=addresses.iter().filter(|x|field_string(x,"addressFamily")=="IPv6").cloned().collect::<Vec<_>>();
     let ipv4_metric=ip.get("IPv4").cloned(); let ipv6_metric=ip.get("IPv6").cloned(); let dns=arrays(entry.get("dns")).into_iter().flat_map(|x|arrays(x.get("servers"))).filter_map(|x|x.as_str().map(str::to_owned)).collect::<Vec<_>>();
     let ipv4_gw=arrays(config.get("ipv4Gateways")); let ipv6_gw=arrays(config.get("ipv6Gateways"));
-    json!({"interfaceIndex":index,"alias":alias,"description":description,"guid":field_string(&adapter,"guid").trim_matches(|c|c=='{'||c=='}'),"macAddress":field_string(&adapter,"macAddress"),"type":kind,"hardwareInterface":field_bool(&adapter,"hardwareInterface"),"virtual":field_bool(&adapter,"virtual")||["Virtual","VPN","Tunnel"].contains(&kind),"systemInterface":system,"adminStatus":field_string(&adapter,"adminStatus"),"operationalStatus":non_empty_or(field_string(&adapter,"operationalStatus"),"Unknown"),"mediaConnectionState":non_empty_or(field_string(&adapter,"mediaConnectionState"),"Unknown"),"linkSpeed":field_string(&adapter,"linkSpeed"),"ipv4Addresses":ipv4,"ipv6Addresses":ipv6,"ipv4Gateways":ipv4_gw,"ipv6Gateways":ipv6_gw,"dnsServers":dns,"dhcpEnabled":ipv4_metric.as_ref().map(|x|field_bool(x,"dhcp")),"metrics":{"ipv4":ipv4_metric,"ipv6":ipv6_metric},"networkCategory":entry.get("connectionProfile").map(|x|field_string(x,"category")).filter(|x|!x.is_empty()),"networkName":entry.get("connectionProfile").map(|x|field_string(x,"name")).filter(|x|!x.is_empty()),"ipv4Connectivity":entry.get("connectionProfile").map(|x|field_string(x,"ipv4Connectivity")).filter(|x|!x.is_empty()),"ipv6Connectivity":entry.get("connectionProfile").map(|x|field_string(x,"ipv6Connectivity")).filter(|x|!x.is_empty()),"defaultRoute":!arrays(config.get("ipv4Gateways")).is_empty()||!arrays(config.get("ipv6Gateways")).is_empty(),"wifi":wifi_item,"deviations":{"manualIpv4Metric":ipv4_metric.as_ref().map(|x|!field_bool(x,"automaticMetric")).unwrap_or(false),"manualIpv6Metric":ipv6_metric.as_ref().map(|x|!field_bool(x,"automaticMetric")).unwrap_or(false),"adapterDisabled":field_string(&adapter,"adminStatus").eq_ignore_ascii_case("down")}})
+    json!({"interfaceIndex":index,"alias":alias,"description":description,"interfaceType":interface_type,"guid":field_string(&adapter,"guid").trim_matches(|c|c=='{'||c=='}'),"macAddress":field_string(&adapter,"macAddress"),"type":kind,"hardwareInterface":field_bool(&adapter,"hardwareInterface"),"virtual":field_bool(&adapter,"virtual")||["Virtual","VPN","Tunnel"].contains(&kind),"systemInterface":system,"adminStatus":field_string(&adapter,"adminStatus"),"operationalStatus":non_empty_or(field_string(&adapter,"operationalStatus"),"Unknown"),"mediaConnectionState":non_empty_or(field_string(&adapter,"mediaConnectionState"),"Unknown"),"linkSpeed":field_string(&adapter,"linkSpeed"),"ipv4Addresses":ipv4,"ipv6Addresses":ipv6,"ipv4Gateways":ipv4_gw,"ipv6Gateways":ipv6_gw,"dnsServers":dns,"dhcpEnabled":ipv4_metric.as_ref().map(|x|field_bool(x,"dhcp")),"metrics":{"ipv4":ipv4_metric,"ipv6":ipv6_metric},"networkCategory":entry.get("connectionProfile").map(|x|field_string(x,"category")).filter(|x|!x.is_empty()),"networkName":entry.get("connectionProfile").map(|x|field_string(x,"name")).filter(|x|!x.is_empty()),"ipv4Connectivity":entry.get("connectionProfile").map(|x|field_string(x,"ipv4Connectivity")).filter(|x|!x.is_empty()),"ipv6Connectivity":entry.get("connectionProfile").map(|x|field_string(x,"ipv6Connectivity")).filter(|x|!x.is_empty()),"defaultRoute":!arrays(config.get("ipv4Gateways")).is_empty()||!arrays(config.get("ipv6Gateways")).is_empty(),"wifi":wifi_item,"deviations":{"manualIpv4Metric":ipv4_metric.as_ref().map(|x|!field_bool(x,"automaticMetric")).unwrap_or(false),"manualIpv6Metric":ipv6_metric.as_ref().map(|x|!field_bool(x,"automaticMetric")).unwrap_or(false),"adapterDisabled":field_string(&adapter,"adminStatus").eq_ignore_ascii_case("down")}})
   }).collect();
     json!({"interfaces":interfaces,"refreshedAt":Utc::now().to_rfc3339()})
 }
@@ -898,7 +906,7 @@ fn native_network_overview() -> AppResult<Value> {
                 } else {
                     json!(item.Anonymous2.Flags & IP_ADAPTER_DHCP_ENABLED != 0)
                 };
-                let mut entry = json!({"interfaceIndex":index,"alias":alias,"description":description,"guid":guid,"macAddress":mac,"type":kind,"hardwareInterface":interface_type==6,"virtual":(["VPN","Tunnel"].contains(&kind)),"systemInterface":system,"adminStatus":admin_status,"operationalStatus":oper_status,"mediaConnectionState":network_insights::media_state_text(oper_status),"linkSpeed":native_link_speed(item.TransmitLinkSpeed.max(item.ReceiveLinkSpeed)),"ipv4Addresses":ipv4,"ipv6Addresses":ipv6,"ipv4Gateways":gateways4,"ipv6Gateways":gateways6,"dnsServers":dns,"dhcpEnabled":dhcp_enabled,"metrics":{"ipv4":ipv4_metric,"ipv6":ipv6_metric},"defaultRoute":!gateways4.is_empty()||!gateways6.is_empty(),"wifi":wifi_item,"deviations":{"manualIpv4Metric":manual_ipv4,"manualIpv6Metric":manual_ipv6,"adapterDisabled":adapter_disabled}});
+                let mut entry = json!({"interfaceIndex":index,"alias":alias,"description":description,"interfaceType":interface_type,"guid":guid,"macAddress":mac,"type":kind,"hardwareInterface":interface_type==6,"virtual":(["VPN","Tunnel"].contains(&kind)),"systemInterface":system,"adminStatus":admin_status,"operationalStatus":oper_status,"mediaConnectionState":network_insights::media_state_text(oper_status),"linkSpeed":native_link_speed(item.TransmitLinkSpeed.max(item.ReceiveLinkSpeed)),"ipv4Addresses":ipv4,"ipv6Addresses":ipv6,"ipv4Gateways":gateways4,"ipv6Gateways":gateways6,"dnsServers":dns,"dhcpEnabled":dhcp_enabled,"metrics":{"ipv4":ipv4_metric,"ipv6":ipv6_metric},"defaultRoute":!gateways4.is_empty()||!gateways6.is_empty(),"wifi":wifi_item,"deviations":{"manualIpv4Metric":manual_ipv4,"manualIpv6Metric":manual_ipv6,"adapterDisabled":adapter_disabled}});
                 if let Some(map) = entry.as_object_mut() {
                     network_insights::apply_connectivity(
                         map,
@@ -909,7 +917,9 @@ fn native_network_overview() -> AppResult<Value> {
                 current = item.Next;
             }
         }
-        return Ok(json!({"interfaces":interfaces,"refreshedAt":Utc::now().to_rfc3339()}));
+        return Ok(annotate_owners(
+            json!({"interfaces":interfaces,"refreshedAt":Utc::now().to_rfc3339()}),
+        ));
     }
     Err(err(
         "NATIVE_DISCOVERY_FAILED",
@@ -1111,11 +1121,12 @@ fn persist_cache(path: &Path, snapshot: &Value) {
     }
 }
 fn live_snapshot() -> AppResult<Value> {
-    let routes = get_routes()?;
+    let mut routes = get_routes()?;
     let (overview, source) = match native_network_overview() {
         Ok(overview) => (overview, "native"),
         Err(_) => (get_network_overview()?, "powershell-fallback"),
     };
+    coexistence::annotate_routes(&mut routes, &overview);
     Ok(
         json!({"overview":overview,"routes":routes,"refreshedAt":Utc::now().to_rfc3339(),"source":source,"stale":false}),
     )
@@ -1287,7 +1298,15 @@ fn normalize_cidr(value: &str) -> AppResult<String> {
 fn get_network_overview() -> AppResult<Value> {
     let raw = run_powershell_json(OVERVIEW_SCRIPT, None)?;
     let wifi = wifi_overview().unwrap_or_default();
-    Ok(normalize_overview(raw, wifi))
+    Ok(annotate_owners(normalize_overview(raw, wifi)))
+}
+
+/// Label adapters owned by tunnel/proxy software (EasyTier, v2rayN, ...).
+fn annotate_owners(mut overview: Value) -> Value {
+    let processes = coexistence::running_processes();
+    let software = coexistence::detect_software(processes.values().map(String::as_str));
+    coexistence::annotate_overview(&mut overview, &coexistence::proxy_product(&software));
+    overview
 }
 #[tauri::command]
 fn get_wifi_profiles(interface_name: String) -> AppResult<Value> {
@@ -1546,6 +1565,12 @@ fn route_payload(input: &Value) -> AppResult<Value> {
             .and_then(Value::as_str)
             .ok_or_else(|| err("VALIDATION_ERROR", "DestinationPrefix is required."))?,
     )?;
+    if coexistence::is_capture_prefix(&destination) {
+        return Err(err(
+            "PROTECTED_ROUTE",
+            "This prefix is used by proxy/VPN TUN software (v2rayN, sing-box, mihomo) and cannot be changed here.",
+        ));
+    }
     let next = input
         .get("nextHop")
         .and_then(Value::as_str)
@@ -1619,6 +1644,14 @@ fn preview_metric_change(state: State<AppState>, input: Value) -> AppResult<Valu
             "This interface carries a default gateway; changing Metric can alter the default network path.",
         ));
     }
+    if let Some(owner) = coexistence::owner_of(&adapter) {
+        let alias = field_string(&adapter, "alias");
+        notices.push(notice(
+            "metric.protected",
+            json!({"alias":alias,"owner":owner}),
+            format!("{alias} is managed by {owner}. {owner} may reset this Metric when it restarts or recreates the adapter."),
+        ));
+    }
     let token = if unchanged {
         None
     } else {
@@ -1641,6 +1674,32 @@ fn apply_metric_change(state: State<AppState>, input: Value) -> AppResult<Value>
     ps_set_metric(&payload)
 }
 
+/// Routes on adapters owned by tunnel/proxy software (EasyTier, v2rayN, ...)
+/// are left to that program unless this app created them.
+fn ensure_route_not_protected(state: &State<AppState>, route: &Value) -> AppResult<()> {
+    if coexistence::is_capture_prefix(&field_string(route, "destinationPrefix")) {
+        return Err(err(
+            "PROTECTED_ROUTE",
+            "This route is used by proxy/VPN TUN software (v2rayN, sing-box, mihomo) and cannot be changed here.",
+        ));
+    }
+    let snapshot = snapshot_current(state)?;
+    let Some((alias, owner)) = coexistence::protected_owner(
+        snapshot.get("overview").unwrap_or(&Value::Null),
+        field_i64(route, "interfaceIndex"),
+    ) else {
+        return Ok(());
+    };
+    let key = route_key(route);
+    if config(state).managed_routes.iter().any(|item| route_key(item) == key) {
+        return Ok(());
+    }
+    Err(err_with(
+        "PROTECTED_ROUTE",
+        format!("This route belongs to {alias}, which is managed by {owner}. Change it in {owner} instead."),
+        json!({"alias":alias,"owner":owner}),
+    ))
+}
 #[tauri::command]
 fn preview_add_route(state: State<AppState>, input: Value) -> AppResult<Value> {
     let payload = route_payload(&input)?;
@@ -1672,6 +1731,17 @@ fn preview_add_route(state: State<AppState>, input: Value) -> AppResult<Value> {
             "route.add.samePrefix",
             json!({"count":conflicts.len().to_string(),"destination":field_string(&payload,"destinationPrefix")}),
             "Routes with the same destination prefix already exist.",
+        ));
+    }
+    let snapshot = snapshot_current(&state)?;
+    if let Some((alias, owner)) = coexistence::protected_owner(
+        snapshot.get("overview").unwrap_or(&Value::Null),
+        field_i64(&payload, "interfaceIndex"),
+    ) {
+        notices.push(notice(
+            "route.add.protected",
+            json!({"alias":alias,"owner":owner}),
+            format!("{alias} is managed by {owner}. This route disappears when {owner} recreates the adapter."),
         ));
     }
     Ok(
@@ -1787,6 +1857,7 @@ try {{
 }
 #[tauri::command]
 fn preview_edit_route(state: State<AppState>, input: Value) -> AppResult<Value> {
+    ensure_route_not_protected(&state, &input["originalRoute"])?;
     let routes = get_routes()?;
     let payload = prepare_route_edit(
         &arrays(routes.get("routes")),
@@ -1810,6 +1881,7 @@ fn preview_edit_route(state: State<AppState>, input: Value) -> AppResult<Value> 
 }
 #[tauri::command]
 fn edit_route(state: State<AppState>, input: Value) -> AppResult<Value> {
+    ensure_route_not_protected(&state, &input["originalRoute"])?;
     let routes = get_routes()?;
     let payload = prepare_route_edit(
         &arrays(routes.get("routes")),
@@ -1848,6 +1920,7 @@ fn temporary_route(requested: &Value) -> AppResult<Value> {
 #[tauri::command]
 fn preview_persist_route(state: State<AppState>, route: Value) -> AppResult<Value> {
     let target = temporary_route(&route)?;
+    ensure_route_not_protected(&state, &target)?;
     let payload = persistable_route_payload(&target)?;
     let notices = vec![notice(
         "route.persist.replace",
@@ -1882,6 +1955,7 @@ try {{
 #[tauri::command]
 fn persist_route(state: State<AppState>, input: Value) -> AppResult<Value> {
     let target = temporary_route(input.get("route").unwrap_or(&input))?;
+    ensure_route_not_protected(&state, &target)?;
     let payload = persistable_route_payload(&target)?;
     consume_confirmation(
         &state,
@@ -1919,6 +1993,7 @@ fn preview_remove_route(state: State<AppState>, route: Value) -> AppResult<Value
     if !is_removable_route(&target) {
         return Err(err("VALIDATION_ERROR","This route is Windows-managed, on-link, multicast, IPv6, or a default route and cannot be safely removed."));
     }
+    ensure_route_not_protected(&state, &target)?;
     let payload = route_remove_payload(&target);
     let notices = vec![notice(
         "route.remove.recovery",
@@ -1943,6 +2018,7 @@ fn remove_route(state: State<AppState>, input: Value) -> AppResult<Value> {
             "This route can no longer be safely removed.",
         ));
     }
+    ensure_route_not_protected(&state, &target)?;
     let payload = route_remove_payload(&target);
     let token = input
         .get("confirmationToken")
@@ -2105,6 +2181,14 @@ fn preview_adapter_control(state: State<AppState>, input: Value) -> AppResult<Va
             "System interfaces cannot be enabled or disabled.",
         ));
     }
+    if let Some(owner) = coexistence::owner_of(&adapter) {
+        let alias = field_string(&adapter, "alias");
+        return Err(err_with(
+            "PROTECTED_ADAPTER",
+            format!("{alias} is managed by {owner}. Enable or disable it from {owner} instead."),
+            json!({"alias":alias,"owner":owner}),
+        ));
+    }
     let notices = adapter_control_notices(&adapter, field_string(&payload, "action").as_str());
     Ok(
         json!({"adapter":adapter,"action":payload["action"],"warnings":notice_texts(&notices),"notices":notices,"requiresAdmin":true,"confirmationToken":issue_confirmation(&state,"adapter-control",&payload)?}),
@@ -2179,8 +2263,12 @@ fn refresh_network_state(
     schedule_tray_update(&app);
     let interfaces = requested.iter().any(|scope| scope == "interfaces");
     let routes = requested.iter().any(|scope| scope == "routes");
+    let coexistence = coexistence::live_status(
+        snapshot.get("overview").unwrap_or(&Value::Null),
+        snapshot.get("routes").unwrap_or(&Value::Null),
+    );
     Ok(
-        json!({"overview":if interfaces{snapshot.get("overview").cloned()}else{None},"routes":if routes{snapshot.get("routes").cloned()}else{None},"refreshedAt":snapshot.get("refreshedAt"),"source":snapshot.get("source").and_then(Value::as_str).unwrap_or("memory"),"stale":false}),
+        json!({"overview":if interfaces{snapshot.get("overview").cloned()}else{None},"routes":if routes{snapshot.get("routes").cloned()}else{None},"coexistence":coexistence,"refreshedAt":snapshot.get("refreshedAt"),"source":snapshot.get("source").and_then(Value::as_str).unwrap_or("memory"),"stale":false}),
     )
 }
 #[tauri::command]
@@ -2490,17 +2578,14 @@ fn restore_snapshot(state: &State<AppState>, snapshot: &Value, scope: &Value) ->
     let current_interfaces = arrays(current.get("interfaces"));
     let mut results = vec![];
     for target in target_interfaces {
-        let index = field_i64(&target, "interfaceIndex");
         if !scope_touches_interface(scope, &target) {
             continue;
         }
-        if !current_interfaces
-            .iter()
-            .any(|item| field_i64(item, "interfaceIndex") == index)
-        {
-            results.push(json!({"status":"skipped","kind":"interface","interfaceIndex":index,"message":"Interface no longer exists."}));
+        let Some(actual) = network_insights::match_interface(&target, &current_interfaces) else {
+            results.push(json!({"status":"skipped","kind":"interface","interfaceIndex":field_i64(&target,"interfaceIndex"),"message":"Interface no longer exists or was replaced by a different adapter."}));
             continue;
-        }
+        };
+        let index = field_i64(actual, "interfaceIndex");
         for (family, key) in [("IPv4", "ipv4"), ("IPv6", "ipv6")] {
             if let Some(metric) = target.pointer(&format!("/metrics/{key}")) {
                 if metric.is_null() {
@@ -2511,12 +2596,11 @@ fn restore_snapshot(state: &State<AppState>, snapshot: &Value, scope: &Value) ->
             }
         }
         let target_disabled = field_string(&target, "adminStatus").eq_ignore_ascii_case("down");
-        if let Some(actual) = current_interfaces
-            .iter()
-            .find(|item| field_i64(item, "interfaceIndex") == index)
-        {
-            let actual_disabled = field_string(actual, "adminStatus").eq_ignore_ascii_case("down");
-            if target_disabled != actual_disabled && !field_bool(&target, "systemInterface") {
+        let actual_disabled = field_string(actual, "adminStatus").eq_ignore_ascii_case("down");
+        if target_disabled != actual_disabled {
+            if let Some(owner) = coexistence::owner_of(actual) {
+                results.push(json!({"status":"skipped","kind":"adapter","interfaceIndex":index,"message":format!("{} is managed by {owner}; its enabled state was not changed.", field_string(actual,"alias"))}));
+            } else if !field_bool(&target, "systemInterface") {
                 let action = if target_disabled { "disable" } else { "enable" };
                 let script = r#"$item=Get-NetAdapter -IncludeHidden -InterfaceIndex ([int]$InputData.interfaceIndex) -ErrorAction Stop;if($InputData.action -eq 'enable'){$item|Enable-NetAdapter -Confirm:$false -ErrorAction Stop}else{$item|Disable-NetAdapter -Confirm:$false -ErrorAction Stop};[PSCustomObject]@{interfaceIndex=[int]$InputData.interfaceIndex;status='success'}|ConvertTo-Json -Compress"#;
                 match run_powershell_json(script, Some(&json!({"interfaceIndex":index,"action":action}))) {
@@ -2526,7 +2610,7 @@ fn restore_snapshot(state: &State<AppState>, snapshot: &Value, scope: &Value) ->
             }
         }
         if let Some(wifi) = target.get("wifi") {
-            let alias = field_string(&target, "alias");
+            let alias = field_string(actual, "alias");
             let connected = wifi
                 .get("connected")
                 .and_then(Value::as_bool)
@@ -2759,7 +2843,7 @@ fn reset_apply(state: State<AppState>, input: Value) -> AppResult<Value> {
 fn windows_defaults_payload(state: &State<AppState>, input: &Value) -> AppResult<Value> {
     let overview = get_network_overview()?;
     let cfg = config(state);
-    let eligible=arrays(overview.get("interfaces")).into_iter().filter(|item|!item.get("systemInterface").and_then(Value::as_bool).unwrap_or(false)).map(|item|json!({"interfaceIndex":field_i64(&item,"interfaceIndex"),"alias":field_string(&item,"alias")})).collect::<Vec<_>>();
+    let eligible=arrays(overview.get("interfaces")).into_iter().filter(|item|!item.get("systemInterface").and_then(Value::as_bool).unwrap_or(false)&&coexistence::owner_of(item).is_none()).map(|item|json!({"interfaceIndex":field_i64(&item,"interfaceIndex"),"alias":field_string(&item,"alias")})).collect::<Vec<_>>();
     let requested = arrays(input.get("interfaceIndexes"))
         .into_iter()
         .map(|item| valid_index(&item))
@@ -2878,6 +2962,73 @@ fn windows_defaults_apply(state: State<AppState>, input: Value) -> AppResult<Val
     Ok(
         json!({"metrics":metric_results,"routeResults":route_results,"message":message["text"],"messageCode":message}),
     )
+}
+
+// ---- Tools (read-only; network traffic only when the user runs a tool) ----
+
+fn tools_state(state: &State<AppState>) -> AppResult<(Value, Value)> {
+    let snapshot = snapshot_current(state)?;
+    Ok((
+        snapshot.get("overview").cloned().unwrap_or(Value::Null),
+        snapshot.get("routes").cloned().unwrap_or(Value::Null),
+    ))
+}
+
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> AppResult<T> + Send + 'static) -> AppResult<T> {
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|_| err("COMMAND_FAILED", "The tool stopped unexpectedly."))?
+}
+
+#[tauri::command]
+async fn run_connectivity_test(state: State<'_, AppState>) -> AppResult<Value> {
+    let (overview, routes) = tools_state(&state)?;
+    blocking(move || Ok(net_tools::connectivity_test(&overview, &routes))).await
+}
+
+#[tauri::command]
+async fn lookup_route(state: State<'_, AppState>, host: String) -> AppResult<Value> {
+    let (overview, routes) = tools_state(&state)?;
+    blocking(move || net_tools::lookup_route(&host, &overview, &routes)).await
+}
+
+#[tauri::command]
+async fn start_trace(app: AppHandle, host: String, max_hops: Option<u8>) -> AppResult<Value> {
+    let (id, target, destination, cancel) =
+        blocking(move || net_tools::begin_trace(&host).map_err(|message| err("VALIDATION_ERROR", message))).await?;
+    let hops = max_hops.unwrap_or(30).clamp(1, 30);
+    let emitter = app.clone();
+    std::thread::spawn(move || {
+        let result = net_tools::run_trace(destination, hops, &cancel, |mut hop| {
+            hop["traceId"] = json!(id);
+            let _ = emitter.emit("trace-hop", hop);
+        });
+        let done = match result {
+            Ok((reached, cancelled)) => json!({"traceId":id,"reached":reached,"cancelled":cancelled}),
+            Err(error) => json!({"traceId":id,"reached":false,"cancelled":false,"error":error}),
+        };
+        let _ = app.emit("trace-done", done);
+    });
+    Ok(json!({"traceId":id,"target":target,"address":destination.to_string(),"maxHops":hops}))
+}
+
+#[tauri::command]
+fn cancel_trace() {
+    net_tools::cancel_trace();
+}
+
+#[tauri::command]
+async fn get_active_connections(state: State<'_, AppState>) -> AppResult<Value> {
+    let (overview, _) = tools_state(&state)?;
+    blocking(move || Ok(net_tools::active_connections(&overview))).await
+}
+
+#[tauri::command]
+async fn scan_wifi_networks(adapter_guid: String) -> AppResult<Value> {
+    if !wifi_auto_connect::valid_guid(&adapter_guid) {
+        return Err(err("VALIDATION_ERROR", "Invalid Wi-Fi adapter."));
+    }
+    blocking(move || wifi_windows::scan_networks(&adapter_guid).map_err(|message| err("WIFI_SCAN_FAILED", message))).await
 }
 
 #[tauri::command]
@@ -3459,5 +3610,26 @@ function New-NetRoute {
             assert!(item.get("networkName").is_some());
         }
         assert!(interfaces.iter().any(|item| field_string(item, "guid").starts_with('{')));
+        assert!(interfaces.iter().all(|item| item.get("managedBy").is_some()));
+    }
+    #[test]
+    #[ignore = "manual, read-only: pings 1.1.1.1, resolves a host and scans Wi-Fi"]
+    fn read_only_tools_against_local_network() {
+        let overview = &native_network_overview().expect("overview");
+        let routes = &json!({"routes":[]});
+        for item in arrays(overview.get("interfaces")) {
+            println!("#{} {} -> {}", field_i64(&item, "interfaceIndex"), field_string(&item, "alias"), item["managedBy"]);
+        }
+        println!("{}", coexistence::live_status(overview, routes));
+        println!("{}", net_tools::connectivity_test(overview, routes));
+        println!("{}", net_tools::lookup_route("1.1.1.1", overview, routes).map(|v| v.to_string()).unwrap_or_else(|e| e.message));
+        let connections = net_tools::active_connections(overview);
+        println!("connections: {}", connections["total"]);
+        if let Some(wifi) = arrays(overview.get("interfaces")).into_iter().find(|item| item["wifi"].is_object()) {
+            match wifi_windows::scan_networks(&field_string(&wifi, "guid")) {
+                Ok(scan) => println!("access points: {}", arrays(scan.get("accessPoints")).len()),
+                Err(error) => println!("scan: {error}"),
+            }
+        }
     }
 }
