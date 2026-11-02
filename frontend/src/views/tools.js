@@ -265,6 +265,7 @@ function renderWifiScan(app) {
                   <th>${app.t("channel")}</th>
                   <th>${app.t("security")}</th>
                   <th>BSSID</th>
+                  <th><span class="visually-hidden">${app.t("actions")}</span></th>
                 </tr>
               </thead>
               <tbody>
@@ -278,6 +279,17 @@ function renderWifiScan(app) {
                     <td>${ap.band ? `${ap.band} · ${ap.channel}` : `${ap.frequencyMhz} MHz`}</td>
                     <td>${ap.security || "—"}</td>
                     <td class="mono muted">${ap.bssid}</td>
+                    <td>
+                      ${app.canConnectNew(ap)
+                        ? html`<button
+                            class="subtle compact"
+                            ?disabled=${app.isBusyPrefix("wifi-new")}
+                            @click=${() => app.startConnectNew(ap)}
+                          >
+                            ${buttonContent(app.isBusy(`wifi-new:preview:${ap.ssid}`), "wifi", app.t("connectEllipsis"))}
+                          </button>`
+                        : nothing}
+                    </td>
                   </tr>`,
                 )}
               </tbody>

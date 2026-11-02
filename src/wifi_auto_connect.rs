@@ -20,6 +20,7 @@ use std::{
 pub const MIN_INTERVAL_SECONDS: u64 = 5;
 pub const MAX_INTERVAL_SECONDS: u64 = 86_400;
 pub const VERIFY_TIMEOUT_SECONDS: u64 = 30;
+pub const MAX_FALLBACK_PROFILES: usize = 3;
 
 /// One persisted auto-connect rule. `adapter_guid` is the stable Windows
 /// interface identity; the alias is deliberately resolved at runtime.
@@ -31,6 +32,16 @@ pub struct AutoConnectRule {
     pub interval_seconds: u64,
     #[serde(default)]
     pub enabled: bool,
+    /// Saved profiles tried in order when the preferred one is unavailable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_profiles: Vec<String>,
+}
+
+impl AutoConnectRule {
+    /// The same rule aimed at another saved profile (a fallback attempt).
+    fn targeting(&self, profile: &str) -> Self {
+        Self { profile_name: profile.to_string(), ..self.clone() }
+    }
 }
 
 /// Data returned by a read-only adapter/profile discovery pass.
@@ -69,6 +80,37 @@ impl WifiObservation {
 pub trait WifiBackend: Send + Sync + 'static {
     fn observe(&self, rule: &AutoConnectRule) -> Result<WifiObservation, String>;
     fn connect(&self, rule: &AutoConnectRule) -> Result<(), String>;
+    /// Saved profiles Windows currently sees in range. An empty list means
+    /// unknown, and every candidate is tried.
+    fn visible_profiles(&self, _rule: &AutoConnectRule) -> Result<Vec<String>, String> {
+        Ok(vec![])
+    }
+}
+
+/// The profiles to request this cycle, in order. On a fallback network the
+/// rule switches back only when the preferred profile is in range.
+pub fn connection_plan(rule: &AutoConnectRule, current: Option<&str>, visible: &[String]) -> Vec<String> {
+    let in_range = |name: &String| visible.is_empty() || visible.contains(name);
+    if current.map(|name| rule.fallback_profiles.iter().any(|item| item == name)).unwrap_or(false) {
+        return if !visible.is_empty() && visible.contains(&rule.profile_name) {
+            vec![rule.profile_name.clone()]
+        } else {
+            vec![]
+        };
+    }
+    let all = std::iter::once(&rule.profile_name).chain(rule.fallback_profiles.iter());
+    let plan = all.clone().filter(|name| in_range(name)).cloned().collect::<Vec<_>>();
+    if plan.is_empty() {
+        vec![rule.profile_name.clone()]
+    } else {
+        plan
+    }
+}
+
+enum Attempt {
+    Connected,
+    Failed,
+    Aborted,
 }
 
 /// Status shape consumed by the frontend and tray status surfaces.
@@ -123,6 +165,19 @@ pub fn validate_rule(rule: &AutoConnectRule) -> Result<(), String> {
             .any(|c| c == '\0' || c == '\r' || c == '\n' || c.is_control())
     {
         return Err("Invalid Wi-Fi profile name.".into());
+    }
+    if rule.fallback_profiles.len() > MAX_FALLBACK_PROFILES {
+        return Err(format!("At most {MAX_FALLBACK_PROFILES} fallback networks are allowed."));
+    }
+    for (index, name) in rule.fallback_profiles.iter().enumerate() {
+        if name.trim().is_empty()
+            || name.encode_utf16().count() > 255
+            || name.chars().any(|c| c.is_control())
+            || name == &rule.profile_name
+            || rule.fallback_profiles[..index].contains(name)
+        {
+            return Err("Invalid or duplicate fallback network.".into());
+        }
     }
     if !(MIN_INTERVAL_SECONDS..=MAX_INTERVAL_SECONDS).contains(&rule.interval_seconds) {
         return Err(format!(
@@ -430,65 +485,95 @@ impl AutoConnectSupervisor {
         if should_stop_or_change(control, generation) {
             return;
         }
-        status.state = "connecting".into();
-        status.last_attempt = Some(now());
-        status.last_result = Some("request-sent".into());
-        if !self.emit_if_current(control, generation, status.clone()) {
+        let visible = if rule.fallback_profiles.is_empty() {
+            vec![]
+        } else {
+            self.backend.visible_profiles(rule).unwrap_or_default()
+        };
+        let current = if observation.connected { observation.current_profile.as_deref() } else { None };
+        let plan = connection_plan(rule, current, &visible);
+        if plan.is_empty() {
+            status.state = "connected".into();
+            status.last_result = Some("on-fallback".into());
+            status.next_check = Some(now_after(rule.interval_seconds));
+            self.emit_if_current(control, generation, status);
             return;
         }
-        match self.connect_if_current(rule, control, generation) {
-            Ok(false) => return,
-            Ok(true) => {}
-            Err(error) => {
-                if should_stop_or_change(control, generation) {
-                    return;
-                }
-                status.state = "failed".into();
-                status.last_result = Some("connect-request-failed".into());
-                status.error = Some(error);
-                status.next_check = Some(now_after(rule.interval_seconds));
-                self.emit_if_current(control, generation, status);
-                return;
-            }
-        }
-
-        let deadline = Instant::now() + verify_timeout;
-        loop {
-            if should_stop_or_change(control, generation) {
-                return;
-            }
-            let observation = self.backend.observe(rule);
-            if should_stop_or_change(control, generation) {
-                return;
-            }
-            match observation {
-                Ok(observation) if observation.target_connected(rule) => {
+        for profile in &plan {
+            let target = rule.targeting(profile);
+            match self.attempt(&target, control, generation, verify_timeout, &mut status) {
+                Attempt::Aborted => return,
+                Attempt::Connected => {
                     status.state = "connected".into();
-                    status.last_result = Some("connected".into());
+                    status.last_result =
+                        Some(if profile == &rule.profile_name { "connected" } else { "connected-fallback" }.into());
                     status.error = None;
                     status.next_check = Some(now_after(rule.interval_seconds));
                     self.emit_if_current(control, generation, status);
                     return;
                 }
+                Attempt::Failed => {}
+            }
+        }
+        if should_stop_or_change(control, generation) {
+            return;
+        }
+        status.state = "failed".into();
+        status.next_check = Some(now_after(rule.interval_seconds));
+        self.emit_if_current(control, generation, status);
+    }
+
+    /// Request one profile and wait for Windows to report it connected.
+    fn attempt(
+        &self,
+        target: &AutoConnectRule,
+        control: &WorkerControl,
+        generation: u64,
+        verify_timeout: Duration,
+        status: &mut AutoConnectStatus,
+    ) -> Attempt {
+        status.state = "connecting".into();
+        status.last_attempt = Some(now());
+        status.last_result = Some("request-sent".into());
+        if !self.emit_if_current(control, generation, status.clone()) {
+            return Attempt::Aborted;
+        }
+        match self.connect_if_current(target, control, generation) {
+            Ok(false) => return Attempt::Aborted,
+            Ok(true) => {}
+            Err(error) => {
+                if should_stop_or_change(control, generation) {
+                    return Attempt::Aborted;
+                }
+                status.last_result = Some("connect-request-failed".into());
+                status.error = Some(error);
+                return Attempt::Failed;
+            }
+        }
+        let deadline = Instant::now() + verify_timeout;
+        loop {
+            if should_stop_or_change(control, generation) {
+                return Attempt::Aborted;
+            }
+            let observation = self.backend.observe(target);
+            if should_stop_or_change(control, generation) {
+                return Attempt::Aborted;
+            }
+            match observation {
+                Ok(observation) if observation.target_connected(target) => return Attempt::Connected,
                 Ok(_) => {}
                 Err(error) => status.error = Some(error),
             }
             if Instant::now() >= deadline {
-                if should_stop_or_change(control, generation) {
-                    return;
-                }
-                status.state = "failed".into();
                 status.last_result = Some("verification-timeout".into());
-                status.next_check = Some(now_after(rule.interval_seconds));
-                self.emit_if_current(control, generation, status);
-                return;
+                return Attempt::Failed;
             }
             let guard = match control.state.lock() {
                 Ok(guard) => guard,
-                Err(_) => return,
+                Err(_) => return Attempt::Aborted,
             };
             if guard.stop || guard.generation != generation {
-                return;
+                return Attempt::Aborted;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             let _ = control
@@ -591,6 +676,7 @@ mod tests {
             profile_name: "Office".into(),
             interval_seconds: MIN_INTERVAL_SECONDS,
             enabled,
+            fallback_profiles: vec![],
         }
     }
 
@@ -601,6 +687,7 @@ mod tests {
             profile_name: "办公 Wi-Fi".into(),
             interval_seconds: 60,
             enabled: true,
+            fallback_profiles: vec![],
         };
         assert!(validate_rule(&rule).is_ok());
         rule.adapter_guid = "not-a-guid".into();
@@ -620,12 +707,69 @@ mod tests {
     }
 
     #[test]
+    fn fallback_networks_are_validated_and_planned() {
+        let mut rule = test_rule(true);
+        rule.fallback_profiles = vec!["Home".into(), "Phone".into()];
+        assert!(validate_rule(&rule).is_ok());
+        let none: Vec<String> = vec![];
+        assert_eq!(connection_plan(&rule, Some("Other"), &none), vec!["Office", "Home", "Phone"]);
+        assert_eq!(connection_plan(&rule, None, &["Phone".to_string()]), vec!["Phone"]);
+        assert_eq!(connection_plan(&rule, None, &["Cafe".to_string()]), vec!["Office"], "nothing in range: try the preferred one");
+        assert!(connection_plan(&rule, Some("Home"), &none).is_empty(), "stay on a fallback when range is unknown");
+        assert!(connection_plan(&rule, Some("Home"), &["Phone".to_string()]).is_empty());
+        assert_eq!(connection_plan(&rule, Some("Home"), &["Office".to_string()]), vec!["Office"], "switch back when the preferred network returns");
+        for bad in [vec!["Office".to_string()], vec!["Home".into(), "Home".into()], vec!["a".into(), "b".into(), "c".into(), "d".into()], vec!["x\n".into()]] {
+            rule.fallback_profiles = bad;
+            assert!(validate_rule(&rule).is_err());
+        }
+        let legacy: AutoConnectRule = serde_json::from_str(r#"{"adapterGuid":"255bc7a7-a80c-47e6-902b-386aa6ee90db","profileName":"Office","intervalSeconds":60}"#).unwrap();
+        assert!(legacy.fallback_profiles.is_empty());
+        assert!(serde_json::to_value(&legacy).unwrap().get("fallbackProfiles").is_none());
+    }
+
+    #[test]
+    fn a_failed_preferred_network_falls_back_in_order() {
+        struct FallbackBackend {
+            requests: Mutex<Vec<String>>,
+            connected: Mutex<Option<String>>,
+        }
+        impl WifiBackend for FallbackBackend {
+            fn observe(&self, rule: &AutoConnectRule) -> Result<WifiObservation, String> {
+                let current = self.connected.lock().unwrap().clone();
+                Ok(WifiObservation { adapter_guid: rule.adapter_guid.clone(), connected: current.is_some(), current_profile: current })
+            }
+            fn connect(&self, rule: &AutoConnectRule) -> Result<(), String> {
+                self.requests.lock().unwrap().push(rule.profile_name.clone());
+                if rule.profile_name == "Home" {
+                    *self.connected.lock().unwrap() = Some("Home".into());
+                }
+                Ok(())
+            }
+        }
+        let mut rule = test_rule(true);
+        rule.fallback_profiles = vec!["Home".into(), "Phone".into()];
+        let backend = Arc::new(FallbackBackend { requests: Mutex::new(vec![]), connected: Mutex::new(None) });
+        let supervisor = AutoConnectSupervisor::new(Arc::clone(&backend), |_| {});
+        let control = WorkerControl {
+            state: Mutex::new(ControlState { rule: rule.clone(), stop: false, generation: 0 }),
+            wake: Condvar::new(),
+        };
+        supervisor.run_cycle(&rule, &control, 0, Duration::from_millis(20));
+        assert_eq!(*backend.requests.lock().unwrap(), vec!["Office", "Home"]);
+        assert_eq!(supervisor.status_snapshot()[0].last_result.as_deref(), Some("connected-fallback"));
+        supervisor.run_cycle(&rule, &control, 0, Duration::from_millis(20));
+        assert_eq!(backend.requests.lock().unwrap().len(), 2, "stays on the fallback while Office is not in range");
+        assert_eq!(supervisor.status_snapshot()[0].last_result.as_deref(), Some("on-fallback"));
+    }
+
+    #[test]
     fn observation_matches_exact_target_profile_and_adapter() {
         let rule = AutoConnectRule {
             adapter_guid: "255BC7A7-A80C-47E6-902B-386AA6EE90DB".into(),
             profile_name: "Office".into(),
             interval_seconds: 60,
             enabled: true,
+            fallback_profiles: vec![],
         };
         let good = WifiObservation {
             adapter_guid: "{255bc7a7-a80c-47e6-902b-386aa6ee90db}".into(),

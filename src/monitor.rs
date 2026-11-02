@@ -175,11 +175,12 @@ pub fn diff_events(previous: &Observation, next: &Observation) -> Vec<Value> {
             let alias = new.or(old).map(|item| item.alias.clone()).unwrap_or_default();
             let old_ssid = old.and_then(|item| item.ssid.clone());
             let new_ssid = new.and_then(|item| item.ssid.clone());
+            let profile = new.and_then(|item| item.profile.clone());
             match (old_ssid, new_ssid) {
                 (None, Some(ssid)) => events.push(event(
                     "wifi",
                     "event.wifiConnected",
-                    json!({"alias":alias,"ssid":ssid}),
+                    json!({"alias":alias,"ssid":ssid,"adapterGuid":key,"profile":profile}),
                     format!("{alias} connected to {ssid}."),
                     false,
                 )),
@@ -193,7 +194,7 @@ pub fn diff_events(previous: &Observation, next: &Observation) -> Vec<Value> {
                 (Some(from), Some(to)) if from != to => events.push(event(
                     "wifi",
                     "event.wifiSwitched",
-                    json!({"alias":alias,"from":from,"to":to}),
+                    json!({"alias":alias,"from":from,"to":to,"adapterGuid":key,"profile":profile}),
                     format!("{alias} switched from {from} to {to}."),
                     false,
                 )),
@@ -542,6 +543,14 @@ impl Monitor {
             .lock()
             .map(|state| state.traffic.iter().map(|(key, series)| (key.clone(), series.owner.clone())).collect())
             .unwrap_or_default()
+    }
+
+    /// Record events produced elsewhere in the app (network triggers).
+    pub fn record(&self, events: Vec<Value>) -> Vec<Value> {
+        let Ok(mut state) = self.state.lock() else { return vec![] };
+        let stamped = state.append_events(events);
+        self.save(&state.events);
+        stamped
     }
 
     fn save(&self, events: &[Value]) {

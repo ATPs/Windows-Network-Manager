@@ -1,7 +1,7 @@
 import { html, nothing } from "lit";
 import { icon } from "../icons.js";
 import { formatTime } from "../format.js";
-import { buttonContent, cardHeader, emptyState } from "../ui.js";
+import { buttonContent, cardHeader, chip, emptyState, switchInput } from "../ui.js";
 
 function restoreButton(app, item, recent) {
   const key = `${recent ? "recent" : "profile"}:${item.id}`;
@@ -27,6 +27,91 @@ function deleteButton(app, item, recent) {
   >
     ${icon("trash")}
   </button>`;
+}
+
+function renderTriggerEditor(app) {
+  const draft = app.triggerDraft;
+  const adapters = app.wifiAdapters();
+  const adapter = adapters.find((item) => item.guid === draft.adapterGuid);
+  const profiles = (adapter && app.wifiProfiles.get(adapter.alias)) || [];
+  const configs = (app.config.profiles || []).filter((item) => item.id);
+  const busy = app.isBusy("trigger") || app.isBusy("trigger:preview");
+  return html`<div class="auto-editor">
+    <div class="form-row">
+      <label class="field"
+        >${app.t("adapters")}
+        <select @change=${(event) => app.updateTriggerDraft({ adapterGuid: event.target.value, profileName: "" })}>
+          ${adapters.map((item) => html`<option value=${item.guid} ?selected=${item.guid === draft.adapterGuid}>${item.alias}</option>`)}
+        </select>
+      </label>
+      <label class="field"
+        >${app.t("whenConnectedTo")}
+        <select @change=${(event) => app.updateTriggerDraft({ profileName: event.target.value })}>
+          <option value="">${app.t("wifiAutoChooseProfile")}</option>
+          ${profiles.map((name) => html`<option value=${name} ?selected=${name === draft.profileName}>${name}</option>`)}
+        </select>
+      </label>
+      <label class="field"
+        >${app.t("applySavedConfig")}
+        <select @change=${(event) => app.updateTriggerDraft({ savedConfigId: event.target.value })}>
+          ${configs.map((item) => html`<option value=${item.id} ?selected=${item.id === draft.savedConfigId}>${item.name}</option>`)}
+        </select>
+      </label>
+    </div>
+    <div class="button-row">
+      <button class="accent" ?disabled=${busy || !draft.profileName || !draft.savedConfigId} @click=${() => app.saveTrigger()}>
+        ${buttonContent(busy, null, app.t("save"))}
+      </button>
+      <button class="standard" @click=${() => { app.triggerDraft = null; app.requestUpdate(); }}>${app.t("cancel")}</button>
+    </div>
+  </div>`;
+}
+
+function renderTriggers(app) {
+  const triggers = app.config.networkTriggers || [];
+  const configName = (id) => (app.config.profiles || []).find((item) => item.id === id)?.name || id;
+  const adapterName = (guid) =>
+    app.wifiAdapters().find((item) => String(item.guid).toLowerCase().includes(String(guid).toLowerCase()))?.alias || app.t("wifiAutoConfiguredAdapter");
+  return html`<section class="card">
+    ${cardHeader(
+      app.t("automaticConfigs"),
+      app.t("automaticConfigsHelp"),
+      app.triggerDraft
+        ? html``
+        : html`<button class="standard" ?disabled=${!(app.config.profiles || []).length || !app.wifiAdapters().length} @click=${() => app.openTriggerEditor()}>
+            ${icon("plus")}${app.t("addTrigger")}
+          </button>`,
+    )}
+    ${!app.privilege.isAdmin ? html`<p class="permission-note">${icon("shield")}${app.t("triggerAdminHelp")}</p>` : nothing}
+    ${app.triggerDraft ? renderTriggerEditor(app) : nothing}
+    ${triggers.length
+      ? html`<div class="row-list">
+          ${triggers.map(
+            (trigger) => html`<div class="list-row">
+              ${icon("wifi")}
+              <span class="list-main">
+                <strong>${trigger.profileName} → ${configName(trigger.savedConfigId)}</strong>
+                <small>${adapterName(trigger.adapterGuid)}</small>
+              </span>
+              ${trigger.enabled ? chip(app.t("enabled"), "accent") : chip(app.t("disabled"), "muted")}
+              <span class="row-buttons">
+                ${switchInput(trigger.enabled, "", (enabled) => app.toggleTrigger(trigger, enabled), app.isBusyPrefix("trigger"))}
+                <button
+                  class="icon-button subtle danger-text"
+                  title=${app.t("remove")}
+                  aria-label=${`${app.t("remove")} ${trigger.profileName}`}
+                  @click=${() => app.removeTrigger(trigger)}
+                >
+                  ${icon("trash")}
+                </button>
+              </span>
+            </div>`,
+          )}
+        </div>`
+      : app.triggerDraft
+        ? nothing
+        : html`<p class="empty">${app.t("noTriggers")}</p>`}
+  </section>`;
 }
 
 export function renderProfiles(app) {
@@ -101,5 +186,6 @@ export function renderProfiles(app) {
           </div>`
         : emptyState("clock", app.t("noSnapshots"), app.t("noSnapshotsHelp"))}
     </section>
+    ${renderTriggers(app)}
   </div>`;
 }

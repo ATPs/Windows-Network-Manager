@@ -498,6 +498,17 @@ pub fn scope_items(
             format!("Restored history snapshot \"{name}\"."),
         ));
     }
+    if let Some(item) = scope.get("domainRoute") {
+        let domain = field_string(item, "domain");
+        items.push(notice(
+            "scope.domainRoute",
+            json!({"domain":domain}),
+            format!("Changed domain routes for {domain}."),
+        ));
+    }
+    if scope.get("hosts").is_some() {
+        items.push(notice("scope.hosts", json!({}), "Edited the hosts file (restored from the backup taken before the edit)."));
+    }
     if let Some(item) = scope.get("ipSettings") {
         let alias = field_string(item, "alias");
         items.push(notice(

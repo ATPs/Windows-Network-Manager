@@ -1,3 +1,4 @@
+mod advanced;
 mod app_automation;
 mod coexistence;
 mod config_edit;
@@ -160,6 +161,10 @@ struct AppConfig {
     route_notes: BTreeMap<String, String>,
     #[serde(default)]
     wifi_auto_connect: Vec<Value>,
+    #[serde(default)]
+    network_triggers: Vec<Value>,
+    #[serde(default)]
+    domain_routes: Vec<Value>,
 }
 fn schema_version() -> u32 {
     3
@@ -175,6 +180,8 @@ impl Default for AppConfig {
             managed_routes: vec![],
             route_notes: BTreeMap::new(),
             wifi_auto_connect: vec![],
+            network_triggers: vec![],
+            domain_routes: vec![],
         }
     }
 }
@@ -254,6 +261,7 @@ fn stop_workers(app: &AppHandle) {
 /// Forward new monitor events to the UI and, when opted in, to the tray.
 fn on_network_events(app: &AppHandle, events: &[Value]) {
     let _ = app.emit("network-event", events);
+    advanced::handle_events(app, events);
     let Some(state) = app.try_state::<AppState>() else { return };
     let settings = config_from_path(&state.config_path).settings;
     let wanted = events
@@ -526,6 +534,20 @@ pub fn run() {
             config_edit::get_wifi_profile_details,
             config_edit::preview_wifi_profile_change,
             config_edit::apply_wifi_profile_change,
+            advanced::preview_network_trigger,
+            advanced::save_network_trigger,
+            advanced::remove_network_trigger,
+            advanced::preview_connect_new_wifi,
+            advanced::connect_new_wifi,
+            advanced::get_vpn_connections,
+            advanced::preview_vpn_action,
+            advanced::apply_vpn_action,
+            advanced::open_vpn_settings,
+            advanced::preview_domain_route,
+            advanced::apply_domain_route,
+            advanced::get_hosts_file,
+            advanced::preview_hosts_change,
+            advanced::apply_hosts_change,
             restart_as_administrator
         ])
         .run(tauri::generate_context!())
@@ -1440,8 +1462,10 @@ fn validate_auto_target(rule: &AutoConnectRule) -> AppResult<()> {
     let adapters = wifi_windows::discover_adapters().map_err(|message| err("WIFI_DISCOVERY_FAILED", message))?;
     let adapter = adapters.iter().find(|a| normalized_wifi_guid(&a.adapter_guid).ok().as_deref() == Some(rule.adapter_guid.as_str()))
         .ok_or_else(|| err("NOT_FOUND", "The selected Wi-Fi adapter is unavailable."))?;
-    if !adapter.profiles.iter().any(|profile| profile == &rule.profile_name) {
-        return Err(err("NOT_FOUND", "The selected saved Wi-Fi profile is unavailable."));
+    for name in std::iter::once(&rule.profile_name).chain(rule.fallback_profiles.iter()) {
+        if !adapter.profiles.iter().any(|profile| profile == name) {
+            return Err(err("NOT_FOUND", "The selected saved Wi-Fi profile is unavailable."));
+        }
     }
     Ok(())
 }
@@ -2330,7 +2354,7 @@ fn apply_adapter_control(state: State<AppState>, input: Value) -> AppResult<Valu
 #[tauri::command]
 fn get_app_config(state: State<AppState>) -> Value {
     let cfg = config(&state);
-    json!({"settings":cfg.settings,"profiles":cfg.profiles,"recentSnapshots":cfg.recent_snapshots,"managedRoutes":cfg.managed_routes,"hasBaseline":cfg.baseline.is_some()})
+    json!({"settings":cfg.settings,"profiles":cfg.profiles,"recentSnapshots":cfg.recent_snapshots,"managedRoutes":cfg.managed_routes,"networkTriggers":cfg.network_triggers,"domainRoutes":cfg.domain_routes,"hasBaseline":cfg.baseline.is_some()})
 }
 fn profile_summary(item: &Value) -> Value {
     json!({"id":field_string(item,"id"),"name":field_string(item,"name"),"createdAt":field_string(item,"createdAt"),"updatedAt":field_string(item,"updatedAt")})
@@ -2674,6 +2698,8 @@ fn restore_snapshot(state: &State<AppState>, snapshot: &Value, scope: &Value) ->
     let target_interfaces = arrays(snapshot.pointer("/overview/interfaces"));
     let current = get_network_overview()?;
     let current_interfaces = arrays(current.get("interfaces"));
+    // Network triggers apply only Metric and app-managed routes.
+    let trigger = field_bool(scope, "trigger");
     let mut results = vec![];
     for target in target_interfaces {
         if !scope_touches_interface(scope, &target) {
@@ -2695,7 +2721,7 @@ fn restore_snapshot(state: &State<AppState>, snapshot: &Value, scope: &Value) ->
         }
         let target_disabled = field_string(&target, "adminStatus").eq_ignore_ascii_case("down");
         let actual_disabled = field_string(actual, "adminStatus").eq_ignore_ascii_case("down");
-        if target_disabled != actual_disabled {
+        if target_disabled != actual_disabled && !trigger {
             if let Some(owner) = coexistence::owner_of(actual) {
                 results.push(json!({"status":"skipped","kind":"adapter","interfaceIndex":index,"message":format!("{} is managed by {owner}; its enabled state was not changed.", field_string(actual,"alias"))}));
             } else if !field_bool(&target, "systemInterface") {
@@ -2707,7 +2733,7 @@ fn restore_snapshot(state: &State<AppState>, snapshot: &Value, scope: &Value) ->
                 }
             }
         }
-        if let Some(wifi) = target.get("wifi") {
+        if let Some(wifi) = target.get("wifi").filter(|_| !trigger) {
             let alias = field_string(actual, "alias");
             let connected = wifi
                 .get("connected")
@@ -2924,7 +2950,10 @@ fn reset_apply(state: State<AppState>, input: Value) -> AppResult<Value> {
     )?;
     let result = restore_snapshot(&state, &baseline.snapshot.state, &baseline.scope)?;
     let route_result = restore_route_scope(&baseline.scope)?;
-    let config_result = json!(config_edit::restore_scope(&baseline.scope));
+    let mut config_items = config_edit::restore_scope(&baseline.scope);
+    config_items.extend(advanced::restore_domain_scope(&baseline.scope)?);
+    config_items.extend(advanced::restore_hosts_scope(&state, &baseline.scope));
+    let config_result = json!(config_items);
     let complete = !has_failed_result(&result) && !has_failed_result(&route_result) && !has_failed_result(&config_result);
     let message = if complete {
         notice("reset.complete", json!({}), "The last app change was undone.")
@@ -3272,6 +3301,7 @@ mod tests {
             profile_name: "转化医学研究中心813".into(),
             interval_seconds: 60,
             enabled: true,
+            fallback_profiles: vec![],
         }).unwrap();
         assert_eq!(rule.adapter_guid, "255bc7a7-a80c-47e6-902b-386aa6ee90db");
         assert_eq!(rule.profile_name, "转化医学研究中心813");

@@ -116,6 +116,7 @@ function autoSummary(app, rule, status) {
     `${rule.enabled ? app.t("enabled") : app.t("disabled")} → ${rule.profileName}`,
     app.tf("everySeconds", { seconds: rule.intervalSeconds }),
   ];
+  if (rule.fallbackProfiles?.length) parts.push(app.tf("fallbackSummary", { names: rule.fallbackProfiles.join(", ") }));
   if (status?.lastCheck)
     parts.push(`${app.t("wifiAutoLastCheck")} ${formatTime(status.lastCheck, app.settings.language)}`);
   if (status?.lastResult) parts.push(app.wifiAutoResultText(status.lastResult));
@@ -220,6 +221,24 @@ export function renderWifiAutoControl(app, item, configuredAdapter = null) {
                 @input=${(event) => app.updateWifiAutoDraft(guid, { intervalSeconds: event.target.value })}
               />
             </label>
+            ${[0, 1, 2]
+              .filter((slot) => slot === 0 || draft.fallbackProfiles?.[slot - 1])
+              .map(
+                (slot) => html`<label class="field"
+                  >${app.tf("fallbackSlot", { number: slot + 1 })}
+                  <select
+                    ?disabled=${!profiles.length || app.isBusy(busyKey)}
+                    @change=${(event) => app.setWifiAutoFallback(guid, slot, event.target.value)}
+                  >
+                    <option value="">${app.t("fallbackNone")}</option>
+                    ${profiles
+                      .filter((profile) => profile !== draft.profileName)
+                      .map(
+                        (profile) => html`<option value=${profile} ?selected=${profile === draft.fallbackProfiles?.[slot]}>${profile}</option>`,
+                      )}
+                  </select>
+                </label>`,
+              )}
             ${switchInput(
               draft.enabled,
               app.t("wifiAutoEnabled"),

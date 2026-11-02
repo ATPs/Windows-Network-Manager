@@ -33,6 +33,10 @@
   --shadow-card: light-dark(0 1px 2px #0000000d, 0 1px 2px #00000040);
   --shadow-flyout: light-dark(0 8px 16px #00000024, 0 8px 16px #00000066);
   --shadow-dialog: light-dark(0 32px 64px #00000038, 0 32px 64px #00000080);
+  /* Disabled controls: readable text (>= 5:1) instead of faded opacity. */
+  --disabled-bg: light-dark(#ececec, #383838);
+  --disabled-text: light-dark(#636363, #ababab);
+  --disabled-stroke: light-dark(#d1d1d1, #ffffff24);
   --radius: 8px;
   --radius-sm: 4px;
   --mono: "Cascadia Mono", Consolas, monospace;
@@ -138,7 +142,7 @@ button {
     color 0.12s;
 }
 button:disabled {
-  opacity: 0.45;
+  color: var(--disabled-text);
   cursor: not-allowed;
 }
 .standard,
@@ -181,6 +185,22 @@ button:disabled {
 }
 .danger-text {
   color: var(--danger);
+}
+/* Disabled buttons keep their shape but switch to neutral, readable colors. */
+button.standard:disabled,
+button.danger:disabled,
+button.accent:disabled,
+button.danger-fill:disabled {
+  background: var(--disabled-bg);
+  border-color: var(--disabled-stroke);
+  color: var(--disabled-text);
+  box-shadow: none;
+  font-weight: inherit;
+  filter: none;
+}
+button.danger-text:disabled,
+button.link-button:disabled {
+  color: var(--disabled-text);
 }
 .compact {
   min-height: 26px;
@@ -249,7 +269,11 @@ select:focus {
 }
 input:disabled,
 select:disabled {
-  opacity: 0.55;
+  background: var(--disabled-bg);
+  border-color: var(--disabled-stroke);
+  color: var(--disabled-text);
+  opacity: 1;
+  cursor: not-allowed;
 }
 input[type="checkbox"] {
   width: 18px;
@@ -335,7 +359,18 @@ input[type="checkbox"] {
   outline-offset: 2px;
 }
 .switch input:disabled + .switch-track {
-  opacity: 0.45;
+  background: var(--disabled-bg);
+  border-color: var(--disabled-text);
+  cursor: not-allowed;
+}
+.switch input:disabled + .switch-track::after {
+  background: var(--disabled-text);
+}
+.switch input:disabled:checked + .switch-track {
+  background: var(--disabled-text);
+}
+.switch input:disabled:checked + .switch-track::after {
+  background: var(--disabled-bg);
 }
 .search-box {
   position: relative;
@@ -1589,6 +1624,25 @@ td.chips .chip {
   font-weight: 600;
   text-align: center;
   font-variant-numeric: tabular-nums;
+}
+
+/* ---- Advanced: hosts, domain routes ------------------------------------- */
+.hosts-table input {
+  width: 100%;
+  min-width: 0;
+}
+.hosts-table input.invalid,
+.tool-form input.invalid {
+  border-color: var(--danger);
+}
+.hosts-add,
+.domain-form {
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+.hosts-add input,
+.domain-form input {
+  flex: 1 1 160px;
 }
 
 /* ---- Backups / diagnostics / recovery ----------------------------------- */

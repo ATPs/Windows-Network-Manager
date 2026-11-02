@@ -560,7 +560,7 @@ fn profile_payload(state: &State<AppState>, input: &Value) -> AppResult<(Value, 
             let rules = wifi_auto_rules(&config(state))?;
             if rules.iter().any(|rule| {
                 normalized_wifi_guid(&rule.adapter_guid).ok().as_deref() == Some(guid.as_str())
-                    && rule.profile_name == name
+                    && (rule.profile_name == name || rule.fallback_profiles.contains(&name))
             }) {
                 return Err(err("IN_USE", "An auto-connect rule uses this profile. Change or remove the rule first."));
             }

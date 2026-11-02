@@ -23,6 +23,7 @@ import { renderDiagnostics } from "./views/diagnostics.js";
 import { renderTools } from "./views/tools.js";
 import { renderMonitor } from "./views/monitor.js";
 import { renderIpDrawer } from "./views/ip-editor.js";
+import { renderHosts } from "./views/hosts.js";
 import { renderMaintenance } from "./views/maintenance.js";
 import { renderSettings } from "./views/settings.js";
 
@@ -34,6 +35,7 @@ export const views = [
   "diagnostics",
   "tools",
   "monitor",
+  "hosts",
   "maintenance",
   "settings",
 ];
@@ -45,6 +47,7 @@ const viewRenderers = {
   diagnostics: renderDiagnostics,
   tools: renderTools,
   monitor: renderMonitor,
+  hosts: renderHosts,
   maintenance: renderMaintenance,
   settings: renderSettings,
 };
@@ -113,6 +116,8 @@ export class NetworkManagerApp extends LitElement {
       profiles: [],
       recentSnapshots: [],
       managedRoutes: [],
+      networkTriggers: [],
+      domainRoutes: [],
       hasBaseline: false,
     };
     this.privilege = { isAdmin: false };
@@ -175,6 +180,12 @@ export class NetworkManagerApp extends LitElement {
     this.wifiProfileDetails = new Map();
     this.wifiProfilesOpen = new Set();
     this.routeDraftFamily = "IPv4";
+    this.triggerDraft = null;
+    this.newWifi = null;
+    this.vpn = null;
+    this.domainDraft = { domain: "", nextHop: "", interfaceIndex: "", routeMetric: "5" };
+    this.hosts = null;
+    this.hostsEdit = null;
     this.refreshTimer = null;
     this.clockTimer = null;
     this.onVisibilityChange = () => {
@@ -264,6 +275,7 @@ export class NetworkManagerApp extends LitElement {
       this.requestUpdate();
       this.syncMonitorPolling();
       this.loadStartupStatus();
+      this.loadVpnConnections();
       this.refreshConfig().catch(() => {});
       await this.refresh(["interfaces", "routes"]);
       this.scheduleRefresh();
@@ -484,6 +496,11 @@ export class NetworkManagerApp extends LitElement {
       ["ip:", "editIpSettings"],
       ["category:", "networkCategory"],
       ["wifi-profile:", "savedNetworks"],
+      ["trigger", "automaticConfigs"],
+      ["wifi-new", "connectNewWifi"],
+      ["vpn:", "vpnConnections"],
+      ["domain:", "domainRoutes"],
+      ["hosts", "hosts"],
       ["revert:keep", "keepSettings"],
       ["revert:now", "revertNow"],
     ];
@@ -588,6 +605,7 @@ export class NetworkManagerApp extends LitElement {
     this.view = view;
     writeStorage("wnm-view", view);
     this.syncMonitorPolling();
+    if (view === "hosts" && !this.hosts) this.loadHosts();
     this.requestUpdate();
     this.updateComplete.then(() =>
       this.querySelector("main")?.scrollTo?.({ top: 0 }),
@@ -608,7 +626,8 @@ export class NetworkManagerApp extends LitElement {
         this.routeDrawerOpen ||
         this.activityOpen ||
         this.ipEditor ||
-        this.pendingRevert,
+        this.pendingRevert ||
+        this.newWifi,
     );
   }
 
@@ -893,6 +912,7 @@ export class NetworkManagerApp extends LitElement {
       profileName: rule?.profileName || item?.wifi?.currentProfile || "",
       intervalSeconds: Number(rule?.intervalSeconds) || 60,
       enabled: Boolean(rule?.enabled),
+      fallbackProfiles: [...(rule?.fallbackProfiles || [])],
     };
     this.wifiAutoDrafts.set(key, draft);
     return draft;
@@ -923,7 +943,18 @@ export class NetworkManagerApp extends LitElement {
       profileName: String(draft.profileName || ""),
       intervalSeconds: Number(draft.intervalSeconds),
       enabled: Boolean(draft.enabled),
+      fallbackProfiles: (draft.fallbackProfiles || []).filter(
+        (name, index, list) => name && name !== draft.profileName && list.indexOf(name) === index,
+      ),
     };
+  }
+
+  setWifiAutoFallback(guid, slot, name) {
+    const draft = this.wifiAutoDrafts.get(autoGuidKey(guid));
+    if (!draft) return;
+    const fallbacks = [...(draft.fallbackProfiles || [])];
+    fallbacks[slot] = name;
+    this.updateWifiAutoDraft(guid, { fallbackProfiles: fallbacks.filter((item, index) => item || index < slot) });
   }
 
   async saveWifiAuto(draft) {
@@ -1021,6 +1052,8 @@ export class NetworkManagerApp extends LitElement {
       "observe-failed": "wifiAutoResultCheckFailed",
       "connect-request-failed": "wifiAutoResultRequestFailed",
       "verification-timeout": "wifiAutoResultTimeout",
+      "connected-fallback": "wifiAutoResultFallback",
+      "on-fallback": "wifiAutoResultOnFallback",
     };
     return labels[result] ? this.t(labels[result]) : autoResultText(result);
   }
@@ -1736,6 +1769,207 @@ export class NetworkManagerApp extends LitElement {
     );
   }
 
+  // ---- Automatic configurations (network triggers) ----------------------
+
+  openTriggerEditor() {
+    const adapter = this.wifiAdapters()[0];
+    this.triggerDraft = {
+      adapterGuid: adapter?.guid || "",
+      profileName: adapter?.wifi?.currentProfile || "",
+      savedConfigId: (this.config.profiles || [])[0]?.id || "",
+      enabled: true,
+    };
+    this.requestUpdate();
+  }
+
+  updateTriggerDraft(change) {
+    this.triggerDraft = { ...this.triggerDraft, ...change };
+    this.requestUpdate();
+  }
+
+  async saveTrigger(draft = this.triggerDraft) {
+    if (!draft?.adapterGuid || !draft.profileName || !draft.savedConfigId)
+      return this.notify(this.t("triggerIncomplete"), "error");
+    const preview = await this.preview("trigger:preview", () => api.previewNetworkTrigger(draft));
+    if (!preview) return;
+    const config = (this.config.profiles || []).find((item) => item.id === draft.savedConfigId);
+    this.requestConfirmation(
+      [`${draft.profileName} → ${config?.name || draft.savedConfigId}`, ...this.warningsOf(preview)],
+      async () => {
+        const result = await this.run("trigger", () => api.saveNetworkTrigger(preview.trigger, preview.confirmationToken), [], this.t("automaticConfigs"));
+        if (result) this.triggerDraft = null;
+      },
+      false,
+      { title: this.t("confirmTriggerTitle"), confirmLabel: this.t("save"), acknowledge: this.t("triggerAcknowledge") },
+    );
+  }
+
+  toggleTrigger(trigger, enabled) {
+    return this.saveTrigger({ ...trigger, enabled });
+  }
+
+  removeTrigger(trigger) {
+    this.requestConfirmation(
+      [trigger.profileName, this.t("triggerRemoveHelp")],
+      () => this.run(`trigger:remove:${trigger.id}`, () => api.removeNetworkTrigger(trigger.id), [], this.t("automaticConfigs")),
+      true,
+      { title: this.t("confirmRemoveTriggerTitle"), confirmLabel: this.t("remove") },
+    );
+  }
+
+  // ---- Connect to a new Wi-Fi network -------------------------------------
+
+  canConnectNew(ap) {
+    return Boolean(ap?.ssid && !ap.savedProfile && !ap.connected && ["Open", "WPA2-Personal", "WPA3-Personal"].includes(ap.security));
+  }
+
+  async startConnectNew(ap) {
+    const adapterGuid = this.tools.wifiScan?.adapterGuid;
+    if (!adapterGuid || !this.canConnectNew(ap)) return;
+    const network = { adapterGuid, ssid: ap.ssid, security: ap.security };
+    const preview = await this.preview(`wifi-new:preview:${ap.ssid}`, () => api.previewConnectNewWifi(network));
+    if (!preview) return;
+    this.newWifi = { network: preview.network, preview, password: "", show: false };
+    this.requestUpdate();
+  }
+
+  closeNewWifi() {
+    if (this.newWifi) this.newWifi.password = "";
+    this.newWifi = null;
+    this.requestUpdate();
+  }
+
+  async submitNewWifi() {
+    const dialog = this.newWifi;
+    if (!dialog) return;
+    const open = dialog.network.security === "Open";
+    const password = open ? "" : dialog.password;
+    if (!open && (password.length < 8 || password.length > 64)) return this.notify(this.t("wifiPasswordInvalid"), "error");
+    // The password leaves the UI state before the request is sent.
+    dialog.password = "";
+    this.newWifi = null;
+    this.requestUpdate();
+    await this.run(
+      "wifi-new",
+      () => api.connectNewWifi({ ...dialog.network, confirmationToken: dialog.preview.confirmationToken }, password),
+      ["interfaces"],
+      `${this.t("connectNewWifi")} · ${dialog.network.ssid}`,
+    );
+  }
+
+  // ---- Built-in VPN -------------------------------------------------------
+
+  async loadVpnConnections() {
+    try {
+      this.vpn = (await api.vpnConnections())?.connections || [];
+    } catch {
+      this.vpn = this.vpn || [];
+    }
+    this.requestUpdate();
+  }
+
+  async vpnAction(connection, action) {
+    const key = `vpn:${connection.name}`;
+    const input = { name: connection.name, action };
+    const preview = await this.preview(`${key}:preview`, () => api.previewVpnAction(input));
+    if (!preview) return;
+    this.requestConfirmation(
+      [connection.name, ...this.warningsOf(preview)],
+      async () => {
+        await this.run(key, () => api.applyVpnAction(input, preview.confirmationToken), ["interfaces", "routes"], `${this.t(action)} · ${connection.name}`);
+        await this.loadVpnConnections();
+      },
+      action === "disconnect",
+      { title: this.t(action === "connect" ? "confirmVpnConnectTitle" : "confirmVpnDisconnectTitle"), confirmLabel: this.t(action) },
+    );
+  }
+
+  async openVpnSettings() {
+    await this.preview("vpn:settings", () => api.openVpnSettings());
+  }
+
+  // ---- Domain routes ------------------------------------------------------
+
+  updateDomainDraft(change) {
+    this.domainDraft = { ...this.domainDraft, ...change };
+    this.requestUpdate();
+  }
+
+  async domainRoute(request, mode = "save") {
+    const input = { ...request, mode };
+    const key = `domain:${request.domain}`;
+    const preview = await this.preview(`${key}:preview`, () => api.previewDomainRoute(input));
+    if (!preview) return;
+    if (preview.unchanged) return this.notify(this.t("domainUnchanged"));
+    const plan = preview.plan;
+    const rows = [
+      ...(plan.add || []).map((route) => ({ label: this.t("changeRouteAdd"), after: `${route.destinationPrefix} → ${route.nextHop}`, kind: "add" })),
+      ...(plan.remove || []).map((route) => ({ label: this.t("changeRouteRemove"), after: `${route.destinationPrefix} → ${route.nextHop}`, kind: "remove" })),
+    ];
+    this.requestConfirmation(
+      [plan.domain, ...this.warningsOf(preview)],
+      async () => {
+        const result = await this.run(key, () => api.applyDomainRoute(plan, preview.confirmationToken), ["routes"], `${this.t("domainRoutes")} · ${plan.domain}`);
+        if (result && mode === "save") this.domainDraft = { ...this.domainDraft, domain: "" };
+      },
+      true,
+      { title: this.t(mode === "remove" ? "confirmDomainRemoveTitle" : "confirmDomainTitle"), confirmLabel: this.t(mode === "remove" ? "remove" : "apply"), rows },
+    );
+  }
+
+  // ---- Hosts file ---------------------------------------------------------
+
+  async loadHosts() {
+    const result = await this.preview("hosts:load", () => api.hostsFile());
+    if (result) {
+      this.hosts = result;
+      this.hostsEdit = (result.lines || []).map((line, index) => ({ ...line, key: index }));
+      this.requestUpdate();
+    }
+  }
+
+  hostsDirty() {
+    if (!this.hosts || !this.hostsEdit) return false;
+    const strip = (lines) => JSON.stringify(lines.map(({ key, ...line }) => line));
+    return strip(this.hostsEdit) !== strip(this.hosts.lines || []);
+  }
+
+  updateHostsLine(key, change) {
+    this.hostsEdit = this.hostsEdit.map((line) => (line.key === key ? { ...line, ...change } : line));
+    this.requestUpdate();
+  }
+
+  addHostsLine(entry) {
+    const key = Math.max(-1, ...this.hostsEdit.map((line) => line.key)) + 1;
+    this.hostsEdit = [...this.hostsEdit, { kind: "entry", enabled: true, comment: "", ...entry, key }];
+    this.requestUpdate();
+  }
+
+  removeHostsLine(key) {
+    this.hostsEdit = this.hostsEdit.filter((line) => line.key !== key);
+    this.requestUpdate();
+  }
+
+  async saveHosts() {
+    if (!this.hostsDirty()) return;
+    const input = { lines: this.hostsEdit.map(({ key, ...line }) => line), baseHash: this.hosts.hash };
+    const preview = await this.preview("hosts:preview", () => api.previewHostsChange(input));
+    if (!preview) return;
+    const rows = [
+      ...(preview.diff?.added || []).map((text) => ({ label: this.t("hostsAdded"), after: text, kind: "add" })),
+      ...(preview.diff?.removed || []).map((text) => ({ label: this.t("hostsRemoved"), after: text, kind: "remove" })),
+    ];
+    this.requestConfirmation(
+      this.warningsOf(preview),
+      async () => {
+        const result = await this.run("hosts", () => api.applyHostsChange(input, preview.confirmationToken), [], this.t("hosts"));
+        if (result) await this.loadHosts();
+      },
+      true,
+      { title: this.t("confirmHostsTitle"), confirmLabel: this.t("apply"), rows, acknowledge: this.t("hostsAcknowledge") },
+    );
+  }
+
   // ---- Monitoring (read-only) --------------------------------------------
 
   syncMonitorPolling() {
@@ -2175,6 +2409,54 @@ export class NetworkManagerApp extends LitElement {
     </form>`;
   }
 
+  renderNewWifiDialog() {
+    const dialog = this.newWifi;
+    const open = dialog.network.security === "Open";
+    return html`<form
+      class="dialog-body"
+      autocomplete="off"
+      @submit=${(event) => {
+        event.preventDefault();
+        this.submitNewWifi();
+      }}
+    >
+      <h2 id="dialog-heading" class="dialog-title">${icon("wifi")}${this.t("connectNewWifi")}</h2>
+      <p><strong>${dialog.network.ssid}</strong> · ${dialog.network.security} · ${dialog.preview.interfaceName}</p>
+      <ul class="confirm-lines">
+        ${this.warningsOf(dialog.preview).map((line) => html`<li>${line}</li>`)}
+      </ul>
+      ${open
+        ? nothing
+        : html`<label class="field"
+              >${this.t("wifiPassword")}<input
+                type=${dialog.show ? "text" : "password"}
+                autocomplete="new-password"
+                spellcheck="false"
+                maxlength="64"
+                data-autofocus
+                .value=${dialog.password}
+                @input=${(event) => {
+                  dialog.password = event.target.value;
+                  this.requestUpdate();
+                }}
+            /></label>
+            <label class="check"
+              ><input
+                type="checkbox"
+                .checked=${dialog.show}
+                @change=${(event) => {
+                  dialog.show = event.target.checked;
+                  this.requestUpdate();
+                }}
+              /><span>${this.t("showPassword")}</span></label
+            >`}
+      <div class="dialog-actions">
+        <button type="button" class="standard" @click=${() => this.closeNewWifi()}>${this.t("cancel")}</button>
+        <button type="submit" class="accent" ?disabled=${!open && dialog.password.length < 8}>${this.t("connect")}</button>
+      </div>
+    </form>`;
+  }
+
   renderRevertDialog() {
     const seconds = this.revertSecondsLeft();
     return html`<div class="dialog-body">
@@ -2200,7 +2482,9 @@ export class NetworkManagerApp extends LitElement {
         ? this.renderNameDialog()
         : this.pendingRevert
           ? this.renderRevertDialog()
-          : nothing;
+          : this.newWifi
+            ? this.renderNewWifiDialog()
+            : nothing;
     return html`<dialog
       id="app-dialog"
       class="modal"
@@ -2211,6 +2495,7 @@ export class NetworkManagerApp extends LitElement {
         if (!this.confirmation && !this.nameDialog && this.pendingRevert) return this.revertChange();
         this.closeConfirmation();
         this.closeNameDialog();
+        this.closeNewWifi();
       }}
       @click=${(event) => {
         if (event.target === event.currentTarget && !(this.pendingRevert && !this.confirmation)) {
@@ -2286,7 +2571,7 @@ export class NetworkManagerApp extends LitElement {
     this.syncDialog("#route-drawer", this.routeDrawerOpen);
     this.syncDialog("#activity-drawer", this.activityOpen);
     this.syncDialog("#ip-drawer", Boolean(this.ipEditor));
-    this.syncDialog("#app-dialog", Boolean(this.confirmation || this.nameDialog || this.pendingRevert));
+    this.syncDialog("#app-dialog", Boolean(this.confirmation || this.nameDialog || this.pendingRevert || this.newWifi));
   }
 
   render() {

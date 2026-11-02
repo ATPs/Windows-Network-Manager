@@ -88,6 +88,75 @@ function renderRow(app, route, managed, showFamily) {
   </tr>`;
 }
 
+function renderDomainRoutes(app) {
+  const entries = app.config.domainRoutes || [];
+  const draft = app.domainDraft;
+  const interfaces = app.interfaces().filter((item) => item.metrics?.ipv4);
+  const index = draft.interfaceIndex || String(interfaces[0]?.interfaceIndex ?? "");
+  const busy = app.isBusyPrefix("domain:");
+  const ready = draft.domain.trim() && isIpv4(draft.nextHop) && index;
+  return html`<section class="card">
+    ${cardHeader(app.t("domainRoutes"), app.t("domainRoutesHelp"))}
+    ${entries.length
+      ? html`<div class="row-list">
+          ${entries.map(
+            (entry) => html`<div class="list-row">
+              ${icon("globe")}
+              <span class="list-main">
+                <strong>${entry.domain}</strong>
+                <small>${entry.nextHop} · #${entry.interfaceIndex} · ${app.tf("domainAddresses", { count: (entry.addresses || []).length })}</small>
+              </span>
+              <span class="row-buttons">
+                <button class="subtle compact" ?disabled=${busy || !app.privilege.isAdmin} @click=${() => app.domainRoute(entry, "save")}>
+                  ${icon("refresh")}${app.t("refresh")}
+                </button>
+                <button
+                  class="icon-button subtle danger-text"
+                  title=${app.t("remove")}
+                  aria-label=${`${app.t("remove")} ${entry.domain}`}
+                  ?disabled=${busy || !app.privilege.isAdmin}
+                  @click=${() => app.domainRoute(entry, "remove")}
+                >
+                  ${icon("trash")}
+                </button>
+              </span>
+            </div>`,
+          )}
+        </div>`
+      : nothing}
+    <form
+      class="tool-form domain-form"
+      @submit=${(event) => {
+        event.preventDefault();
+        app.domainRoute({ domain: draft.domain.trim(), nextHop: draft.nextHop.trim(), interfaceIndex: Number(index), routeMetric: Number(draft.routeMetric) || 5 });
+      }}
+    >
+      <input
+        class="mono"
+        spellcheck="false"
+        placeholder="example.com"
+        aria-label=${app.t("domain")}
+        .value=${draft.domain}
+        @input=${(event) => app.updateDomainDraft({ domain: event.target.value })}
+      />
+      <input
+        class="mono"
+        spellcheck="false"
+        placeholder=${app.t("nextHop")}
+        aria-label=${app.t("nextHop")}
+        .value=${draft.nextHop}
+        @input=${(event) => app.updateDomainDraft({ nextHop: event.target.value })}
+      />
+      <select aria-label=${app.t("interface")} @change=${(event) => app.updateDomainDraft({ interfaceIndex: event.target.value })}>
+        ${interfaces.map((item) => html`<option value=${item.interfaceIndex} ?selected=${String(item.interfaceIndex) === index}>${item.alias} (#${item.interfaceIndex})</option>`)}
+      </select>
+      <button class="standard" type="submit" ?disabled=${!ready || busy || !app.privilege.isAdmin}>
+        ${buttonContent(app.isBusyPrefix(`domain:${draft.domain.trim()}`), "plus", app.t("addDomainRoute"))}
+      </button>
+    </form>
+  </section>`;
+}
+
 export function renderRoutes(app) {
   const all = app.network.routes?.routes || [];
   const rows = app.routeRows();
@@ -174,6 +243,7 @@ export function renderRoutes(app) {
           </table>`}
     </div>
     <p class="help-text">${app.t("routeMetricHelp")}</p>
+    ${renderDomainRoutes(app)}
   </div>`;
 }
 

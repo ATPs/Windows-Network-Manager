@@ -96,5 +96,23 @@ export const api = {
   previewWifiProfileChange: (input) => call("preview_wifi_profile_change", { input }),
   applyWifiProfileChange: (change, confirmationToken) =>
     call("apply_wifi_profile_change", { input: { change, confirmationToken } }),
+  previewNetworkTrigger: (input) => call("preview_network_trigger", { input }),
+  saveNetworkTrigger: (trigger, confirmationToken) =>
+    call("save_network_trigger", { input: { trigger, confirmationToken } }),
+  removeNetworkTrigger: (id) => call("remove_network_trigger", { id }),
+  previewConnectNewWifi: (input) => call("preview_connect_new_wifi", { input }),
+  connectNewWifi: (input, password) => call("connect_new_wifi", { input, password }),
+  vpnConnections: () => call("get_vpn_connections"),
+  previewVpnAction: (input) => call("preview_vpn_action", { input }),
+  applyVpnAction: (vpn, confirmationToken) =>
+    call("apply_vpn_action", { input: { vpn, confirmationToken } }),
+  openVpnSettings: () => call("open_vpn_settings"),
+  previewDomainRoute: (input) => call("preview_domain_route", { input }),
+  applyDomainRoute: (plan, confirmationToken) =>
+    call("apply_domain_route", { input: { plan, confirmationToken } }),
+  hostsFile: () => call("get_hosts_file"),
+  previewHostsChange: (input) => call("preview_hosts_change", { input }),
+  applyHostsChange: (input, confirmationToken) =>
+    call("apply_hosts_change", { input: { ...input, confirmationToken } }),
   restartAsAdmin: () => call("restart_as_administrator"),
 };

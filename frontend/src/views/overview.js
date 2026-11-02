@@ -10,7 +10,7 @@ import {
   sortAdapters,
   sortDefaultCandidates,
 } from "../format.js";
-import { cardHeader, chip, emptyState, fact, pill, signalBars, skeletonRows } from "../ui.js";
+import { buttonContent, cardHeader, chip, emptyState, fact, pill, signalBars, skeletonRows } from "../ui.js";
 
 function renderHero(app, active) {
   if (!app.network.overview)
@@ -262,6 +262,37 @@ function renderCoexistence(app) {
   </section>`;
 }
 
+function renderVpn(app) {
+  const connections = app.vpn || [];
+  return html`<section class="card">
+    ${cardHeader(
+      app.t("vpnConnections"),
+      connections.length ? app.t("vpnHelp") : app.t("vpnNone"),
+      html`<button class="subtle" @click=${() => app.openVpnSettings()}>${app.t("vpnSettings")}${icon("chevronRight")}</button>`,
+    )}
+    ${connections.length
+      ? html`<div class="row-list">
+          ${connections.map((connection) => {
+            const connected = String(connection.status).toLowerCase() === "connected";
+            const key = `vpn:${connection.name}`;
+            const busy = app.isBusy(key) || app.isBusy(`${key}:preview`);
+            return html`<div class="list-row">
+              ${icon("vpn")}
+              <span class="list-main">
+                <strong>${connection.name}</strong>
+                <small>${connection.serverAddress || "—"} · ${connection.tunnelType || ""}${connection.allUsers ? ` · ${app.t("allUsers")}` : ""}</small>
+              </span>
+              ${pill(connected ? "success" : "neutral", connected ? app.t("connected") : app.t("disconnected"))}
+              <button class="standard compact" ?disabled=${busy} @click=${() => app.vpnAction(connection, connected ? "disconnect" : "connect")}>
+                ${buttonContent(busy, connected ? "close" : "vpn", app.t(connected ? "disconnect" : "connect"))}
+              </button>
+            </div>`;
+          })}
+        </div>`
+      : nothing}
+  </section>`;
+}
+
 export function renderOverview(app) {
   const adapters = app.interfaces();
   const routes = app.network.routes;
@@ -279,6 +310,6 @@ export function renderOverview(app) {
   return html`<div class="dashboard">
     <div class="span-2">${renderHero(app, active)}</div>
     ${renderDefaultRoutes(app)} ${renderDeviationTiles(app, adapters)}
-    ${renderAdapterList(app, adapters)} ${renderAutoConnect(app)} ${renderCoexistence(app)}
+    ${renderAdapterList(app, adapters)} ${renderAutoConnect(app)} ${renderCoexistence(app)} ${renderVpn(app)}
   </div>`;
 }

@@ -30,7 +30,9 @@ use windows_sys::{
                 dot11_BSS_type_any, wlan_intf_opcode_radio_state, WlanCloseHandle,
                 WlanEnumInterfaces, WlanFreeMemory, WlanGetAvailableNetworkList,
                 WlanGetNetworkBssList, WlanGetProfileList, WlanOpenHandle, WlanQueryInterface,
-                WlanScan, DOT11_SSID, WLAN_AVAILABLE_NETWORK_CONNECTED,
+                WlanScan, WlanConnect, WlanSetProfile, dot11_BSS_type_infrastructure,
+                wlan_connection_mode_profile, DOT11_SSID, WLAN_AVAILABLE_NETWORK_CONNECTED,
+                WLAN_CONNECTION_PARAMETERS, WLAN_PROFILE_USER,
                 WLAN_AVAILABLE_NETWORK_HAS_PROFILE, WLAN_AVAILABLE_NETWORK_LIST, WLAN_BSS_LIST,
                 WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO, WLAN_INTERFACE_INFO_LIST,
                 WLAN_PROFILE_INFO_LIST, WLAN_RADIO_STATE,
@@ -447,7 +449,160 @@ pub fn connection_samples() -> Result<Vec<WifiConnection>, String> {
         .collect())
 }
 
+/// Saved profiles that Windows currently sees in range (cached list, no scan).
+fn visible_saved_profiles(adapter_guid: &str) -> Result<Vec<String>, String> {
+    ensure_wifi_access()?;
+    let client = WlanClient::open()?;
+    let info = interface_infos(&client)?
+        .into_iter()
+        .find(|info| same_guid(&guid_string(&info.InterfaceGuid), adapter_guid))
+        .ok_or_else(|| "The configured Wi-Fi adapter is unavailable.".to_string())?;
+    let mut available: *mut WLAN_AVAILABLE_NETWORK_LIST = ptr::null_mut();
+    let code = unsafe { WlanGetAvailableNetworkList(client.0, &info.InterfaceGuid, 0, ptr::null(), &mut available) };
+    let _available = WlanBuffer(available.cast());
+    if code != 0 || available.is_null() {
+        return Err(format!("Cannot read networks in range (error {code})."));
+    }
+    let count = unsafe { (*available).dwNumberOfItems as usize }.min(4096);
+    let items = unsafe { std::slice::from_raw_parts((*available).Network.as_ptr(), count) };
+    let mut names = items
+        .iter()
+        .map(|item| utf16_string(&item.strProfileName))
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    names.dedup();
+    Ok(names)
+}
+
+// ---------------------------------------------------------------------------
+// Connecting to a new network
+// ---------------------------------------------------------------------------
+
+pub const NEW_NETWORK_SECURITY: &[&str] = &["Open", "WPA2-Personal", "WPA3-Personal"];
+
+/// Validate a new-network request. The password is checked, never stored.
+pub fn validate_new_network(ssid: &str, security: &str, password: &str) -> Result<(), String> {
+    if ssid.is_empty() || ssid.len() > 32 || ssid.chars().any(char::is_control) {
+        return Err("The network name is not supported.".into());
+    }
+    if !NEW_NETWORK_SECURITY.contains(&security) {
+        return Err("Only open, WPA2-Personal and WPA3-Personal networks can be added here. Use Windows Settings for others.".into());
+    }
+    if security == "Open" {
+        return if password.is_empty() { Ok(()) } else { Err("Open networks do not use a password.".into()) };
+    }
+    let hex_key = password.len() == 64 && password.chars().all(|c| c.is_ascii_hexdigit());
+    let passphrase = (8..=63).contains(&password.len()) && password.chars().all(|c| (' '..='~').contains(&c));
+    if hex_key || passphrase {
+        Ok(())
+    } else {
+        Err("The password must be 8 to 63 printable ASCII characters (or a 64-digit hex key).".into())
+    }
+}
+
+pub fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// An in-memory WLAN profile. The SSID is also given as hex so any bytes
+/// are matched exactly; the caller wipes the returned string after use.
+pub fn new_profile_xml(ssid: &str, security: &str, password: &str) -> String {
+    let hex = ssid.as_bytes().iter().map(|b| format!("{b:02X}")).collect::<String>();
+    let name = xml_escape(ssid);
+    let (authentication, encryption) = match security {
+        "WPA3-Personal" => ("WPA3SAE", "AES"),
+        "WPA2-Personal" => ("WPA2PSK", "AES"),
+        _ => ("open", "none"),
+    };
+    let shared_key = if security == "Open" {
+        String::new()
+    } else {
+        let key_type = if password.len() == 64 { "networkKey" } else { "passPhrase" };
+        format!(
+            "<sharedKey><keyType>{key_type}</keyType><protected>false</protected><keyMaterial>{}</keyMaterial></sharedKey>",
+            xml_escape(password)
+        )
+    };
+    format!(
+        "<?xml version=\"1.0\"?><WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\"><name>{name}</name><SSIDConfig><SSID><hex>{hex}</hex><name>{name}</name></SSID></SSIDConfig><connectionType>ESS</connectionType><connectionMode>auto</connectionMode><MSM><security><authEncryption><authentication>{authentication}</authentication><encryption>{encryption}</encryption><useOneX>false</useOneX></authEncryption>{shared_key}</security></MSM></WLANProfile>"
+    )
+}
+
+/// Overwrite secret text in place before it is dropped.
+pub fn wipe(value: &mut String) {
+    // Zero bytes are valid UTF-8, so the String stays well formed.
+    unsafe { value.as_bytes_mut().fill(0) };
+}
+
+/// Whether `ssid` is in range on the adapter and has no saved profile yet.
+pub fn new_network_status(adapter_guid: &str, ssid: &str) -> Result<(String, bool, bool), String> {
+    ensure_wifi_access()?;
+    let client = WlanClient::open()?;
+    let info = interface_infos(&client)?
+        .into_iter()
+        .find(|info| same_guid(&guid_string(&info.InterfaceGuid), adapter_guid))
+        .ok_or_else(|| "The selected Wi-Fi adapter is unavailable.".to_string())?;
+    let mut available: *mut WLAN_AVAILABLE_NETWORK_LIST = ptr::null_mut();
+    let code = unsafe { WlanGetAvailableNetworkList(client.0, &info.InterfaceGuid, 0, ptr::null(), &mut available) };
+    let _available = WlanBuffer(available.cast());
+    if code != 0 || available.is_null() {
+        return Err(format!("Cannot read networks in range (error {code})."));
+    }
+    let count = unsafe { (*available).dwNumberOfItems as usize }.min(4096);
+    let items = unsafe { std::slice::from_raw_parts((*available).Network.as_ptr(), count) };
+    let matches = items.iter().filter(|item| ssid_text(&item.dot11Ssid) == ssid).collect::<Vec<_>>();
+    let saved = matches.iter().any(|item| item.dwFlags & WLAN_AVAILABLE_NETWORK_HAS_PROFILE != 0)
+        || profiles(&client, &info.InterfaceGuid)?.iter().any(|name| name == ssid);
+    Ok((alias_for_guid(&info.InterfaceGuid)?, !matches.is_empty(), saved))
+}
+
+/// Create a profile from in-memory XML and request a connection. The XML
+/// (which contains the password) is wiped afterwards and never logged.
+pub fn connect_new_network(adapter_guid: &str, ssid: &str, security: &str, password: &str, all_users: bool) -> Result<(), String> {
+    validate_new_network(ssid, security, password)?;
+    let client = WlanClient::open()?;
+    let info = interface_infos(&client)?
+        .into_iter()
+        .find(|info| same_guid(&guid_string(&info.InterfaceGuid), adapter_guid))
+        .ok_or_else(|| "The selected Wi-Fi adapter is unavailable.".to_string())?;
+    let mut xml = new_profile_xml(ssid, security, password);
+    let mut wide: Vec<u16> = xml.encode_utf16().chain(Some(0)).collect();
+    wipe(&mut xml);
+    let mut reason = 0u32;
+    let flags = if all_users { 0 } else { WLAN_PROFILE_USER };
+    let code = unsafe {
+        WlanSetProfile(client.0, &info.InterfaceGuid, flags, wide.as_ptr(), ptr::null(), 0, ptr::null(), &mut reason)
+    };
+    wide.fill(0);
+    if code != 0 {
+        return Err(format!("Windows rejected the new network profile (error {code}, reason {reason})."));
+    }
+    let name: Vec<u16> = ssid.encode_utf16().chain(Some(0)).collect();
+    let parameters = WLAN_CONNECTION_PARAMETERS {
+        wlanConnectionMode: wlan_connection_mode_profile,
+        strProfile: name.as_ptr(),
+        pDot11Ssid: ptr::null_mut(),
+        pDesiredBssidList: ptr::null_mut(),
+        dot11BssType: dot11_BSS_type_infrastructure,
+        dwFlags: 0,
+    };
+    let code = unsafe { WlanConnect(client.0, &info.InterfaceGuid, &parameters, ptr::null()) };
+    if code != 0 {
+        return Err(format!("The profile was saved, but Windows could not start the connection (error {code})."));
+    }
+    Ok(())
+}
+
 impl WifiBackend for WindowsWifi {
+    fn visible_profiles(&self, rule: &AutoConnectRule) -> Result<Vec<String>, String> {
+        visible_saved_profiles(&rule.adapter_guid)
+    }
+
     fn observe(&self, rule: &AutoConnectRule) -> Result<WifiObservation, String> {
         let adapter = selected_adapter(rule)?;
         Ok(WifiObservation {
@@ -533,6 +688,31 @@ mod tests {
         bytes[..4].copy_from_slice(b"Home");
         assert_eq!(ssid_text(&DOT11_SSID { uSSIDLength: 4, ucSSID: bytes }), "Home");
         assert_eq!(ssid_text(&DOT11_SSID { uSSIDLength: 99, ucSSID: bytes }).len(), 32);
+    }
+
+    #[test]
+    fn new_network_profiles_are_validated_and_escaped() {
+        assert!(validate_new_network("Home", "WPA2-Personal", "correct horse").is_ok());
+        assert!(validate_new_network("Home", "WPA3-Personal", &"a".repeat(63)).is_ok());
+        assert!(validate_new_network("Home", "WPA2-Personal", &"0f".repeat(32)).is_ok());
+        assert!(validate_new_network("Cafe", "Open", "").is_ok());
+        assert!(validate_new_network("Cafe", "Open", "secret12").is_err());
+        assert!(validate_new_network("Home", "WPA2-Personal", "short").is_err());
+        assert!(validate_new_network("Home", "WPA2-Personal", &"z".repeat(64)).is_err());
+        assert!(validate_new_network("Home", "WPA2-Personal", "pass\nword1").is_err());
+        assert!(validate_new_network("Home", "WPA2-Enterprise", "password1").is_err());
+        assert!(validate_new_network("", "Open", "").is_err());
+        assert!(validate_new_network(&"x".repeat(33), "Open", "").is_err());
+        let xml = new_profile_xml("A&B <Lab>", "WPA2-Personal", "p<a>ss&\"word'");
+        assert!(xml.contains("<name>A&amp;B &lt;Lab&gt;</name>"));
+        assert!(xml.contains("<hex>412642203C4C61623E</hex>"));
+        assert!(xml.contains("<keyMaterial>p&lt;a&gt;ss&amp;&quot;word&apos;</keyMaterial>"));
+        assert!(xml.contains("<authentication>WPA2PSK</authentication>"));
+        assert!(!new_profile_xml("Cafe", "Open", "").contains("sharedKey"));
+        assert!(new_profile_xml("Home", "WPA3-Personal", "password1").contains("WPA3SAE"));
+        let mut secret = String::from("password1");
+        wipe(&mut secret);
+        assert!(secret.bytes().all(|b| b == 0));
     }
 
     #[test]
