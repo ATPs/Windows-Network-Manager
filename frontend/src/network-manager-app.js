@@ -22,6 +22,7 @@ import { renderProfiles } from "./views/profiles.js";
 import { renderDiagnostics } from "./views/diagnostics.js";
 import { renderTools } from "./views/tools.js";
 import { renderMonitor } from "./views/monitor.js";
+import { renderIpDrawer } from "./views/ip-editor.js";
 import { renderMaintenance } from "./views/maintenance.js";
 import { renderSettings } from "./views/settings.js";
 
@@ -168,6 +169,12 @@ export class NetworkManagerApp extends LitElement {
     };
     this.monitorTimer = null;
     this.startup = null;
+    this.ipEditor = null;
+    this.pendingRevert = null;
+    this.revertTimer = null;
+    this.wifiProfileDetails = new Map();
+    this.wifiProfilesOpen = new Set();
+    this.routeDraftFamily = "IPv4";
     this.refreshTimer = null;
     this.clockTimer = null;
     this.onVisibilityChange = () => {
@@ -190,6 +197,7 @@ export class NetworkManagerApp extends LitElement {
     document.removeEventListener("keydown", this.onKeydown);
     clearTimeout(this.refreshTimer);
     clearInterval(this.clockTimer);
+    clearInterval(this.revertTimer);
     this.stopMonitorPolling();
     if (this.wifiAutoEventUnlisten) {
       this.wifiAutoEventUnlisten();
@@ -363,6 +371,7 @@ export class NetworkManagerApp extends LitElement {
         await listen("trace-hop", (event) => this.onTraceHop(event.payload)),
         await listen("trace-done", (event) => this.onTraceDone(event.payload)),
         await listen("network-event", (event) => this.onNetworkEvents(event.payload)),
+        await listen("config-reverted", (event) => this.onConfigReverted(event.payload)),
       ];
     } catch {
       // The event bridge is unavailable in browser and unit-test environments.
@@ -472,6 +481,11 @@ export class NetworkManagerApp extends LitElement {
       ["fix:restartAdapter", "restartAdapter"],
       ["startup", "startWithWindows"],
       ["import", "importConfig"],
+      ["ip:", "editIpSettings"],
+      ["category:", "networkCategory"],
+      ["wifi-profile:", "savedNetworks"],
+      ["revert:keep", "keepSettings"],
+      ["revert:now", "revertNow"],
     ];
     const match = labels.find(([prefix]) => key.startsWith(prefix));
     return match ? this.t(match[1]) : key;
@@ -539,6 +553,10 @@ export class NetworkManagerApp extends LitElement {
       rows: options.rows || [],
       note: options.note || "",
       confirmLabel: options.confirmLabel || this.t("confirm"),
+      acknowledge: options.acknowledge || "",
+      acknowledged: false,
+      typeToConfirm: options.typeToConfirm || "",
+      typed: "",
     };
     this.requestUpdate();
   }
@@ -547,7 +565,17 @@ export class NetworkManagerApp extends LitElement {
     this.confirmation = null;
     this.requestUpdate();
   }
+  /** True once the extra acknowledgement or typed confirmation is satisfied. */
+  confirmationReady() {
+    const confirmation = this.confirmation;
+    if (!confirmation) return false;
+    if (confirmation.acknowledge && !confirmation.acknowledged) return false;
+    if (confirmation.typeToConfirm && confirmation.typed.trim() !== confirmation.typeToConfirm) return false;
+    return true;
+  }
+
   async confirm() {
+    if (!this.confirmationReady()) return;
     const action = this.confirmation?.confirm;
     this.closeConfirmation();
     if (action) await action();
@@ -575,7 +603,12 @@ export class NetworkManagerApp extends LitElement {
 
   anyDialogOpen() {
     return Boolean(
-      this.confirmation || this.nameDialog || this.routeDrawerOpen || this.activityOpen,
+      this.confirmation ||
+        this.nameDialog ||
+        this.routeDrawerOpen ||
+        this.activityOpen ||
+        this.ipEditor ||
+        this.pendingRevert,
     );
   }
 
@@ -1001,6 +1034,7 @@ export class NetworkManagerApp extends LitElement {
   routeFormValues(form) {
     const data = new FormData(form);
     return {
+      addressFamily: data.get("addressFamily") || "IPv4",
       destinationPrefix: data.get("destinationPrefix"),
       nextHop: data.get("nextHop"),
       interfaceIndex: data.get("interfaceIndex"),
@@ -1054,6 +1088,7 @@ export class NetworkManagerApp extends LitElement {
 
   openRouteDrawer(route = null) {
     this.editingRoute = route ? { ...route } : null;
+    this.routeDraftFamily = route?.addressFamily || (this.routeFamily === "IPv6" ? "IPv6" : "IPv4");
     this.routeDraft = route
       ? {
           destinationPrefix: route.destinationPrefix,
@@ -1071,6 +1106,13 @@ export class NetworkManagerApp extends LitElement {
     this.routeDrawerOpen = false;
     this.editingRoute = null;
     this.routeDraft = null;
+    this.requestUpdate();
+  }
+
+  setRouteDraftFamily(family) {
+    this.routeDraftFamily = family;
+    this.routeDraft = null;
+    this.routeFormVersion += 1;
     this.requestUpdate();
   }
 
@@ -1476,6 +1518,224 @@ export class NetworkManagerApp extends LitElement {
     );
   }
 
+  // ---- Configuration editing (preview, confirm, keep-or-revert) ----------
+
+  /** Starts the "Keep these settings?" countdown for an applied change. */
+  startRevertCountdown(revert, label) {
+    if (!revert?.revertId) return;
+    this.pendingRevert = {
+      revertId: revert.revertId,
+      deadline: Date.now() + (revert.seconds || 60) * 1000,
+      label,
+    };
+    clearInterval(this.revertTimer);
+    this.revertTimer = setInterval(() => {
+      if (!this.pendingRevert) clearInterval(this.revertTimer);
+      this.requestUpdate();
+    }, 1000);
+    this.requestUpdate();
+  }
+
+  revertSecondsLeft(now = Date.now()) {
+    if (!this.pendingRevert) return 0;
+    return Math.max(0, Math.ceil((this.pendingRevert.deadline - now) / 1000));
+  }
+
+  clearPendingRevert() {
+    this.pendingRevert = null;
+    clearInterval(this.revertTimer);
+    this.revertTimer = null;
+    this.requestUpdate();
+  }
+
+  async keepChange() {
+    const pending = this.pendingRevert;
+    if (!pending) return;
+    const result = await this.run("revert:keep", () => api.keepConfigChange(pending.revertId), [], `${this.t("keepSettings")} · ${pending.label}`);
+    this.clearPendingRevert();
+    if (!result) await this.refresh(["interfaces", "routes"], true, true);
+  }
+
+  async revertChange() {
+    const pending = this.pendingRevert;
+    if (!pending) return;
+    this.clearPendingRevert();
+    await this.run("revert:now", () => api.revertConfigChange(pending.revertId), ["interfaces", "routes"], `${this.t("revertNow")} · ${pending.label}`);
+  }
+
+  onConfigReverted(payload) {
+    if (this.pendingRevert && payload?.revertId === this.pendingRevert.revertId) this.clearPendingRevert();
+    this.notify(this.t("autoReverted"), "warning");
+    this.refresh(["interfaces", "routes"], true, true);
+  }
+
+  canEditIp(item) {
+    return Boolean(item && !item.managedBy && !item.systemInterface && item.metrics?.ipv4);
+  }
+
+  async openIpEditor(item) {
+    this.ipEditor = { item, loading: true, draft: null, errors: {} };
+    this.requestUpdate();
+    const result = await this.preview(`ip:load:${item.interfaceIndex}`, () => api.ipSettings(item.interfaceIndex));
+    if (!this.ipEditor || this.ipEditor.item !== item) return;
+    if (!result) return this.closeIpEditor();
+    const target = result.target || {};
+    this.ipEditor = {
+      item,
+      loading: false,
+      current: target,
+      draft: {
+        ipv4Mode: target.ipv4?.mode === "static" ? "static" : "dhcp",
+        address: target.ipv4?.address || "",
+        prefixLength: String(target.ipv4?.prefixLength ?? 24),
+        gateway: target.ipv4?.gateway || "",
+        dnsMode: target.dns?.mode === "manual" ? "manual" : "automatic",
+        dnsServers: (target.dns?.servers || []).join(", "),
+      },
+    };
+    this.requestUpdate();
+  }
+
+  updateIpDraft(change) {
+    if (!this.ipEditor?.draft) return;
+    this.ipEditor.draft = { ...this.ipEditor.draft, ...change };
+    if (change.ipv4Mode === "static" && this.ipEditor.draft.dnsMode === "automatic")
+      this.ipEditor.draft.dnsMode = "manual";
+    this.requestUpdate();
+  }
+
+  closeIpEditor() {
+    this.ipEditor = null;
+    this.requestUpdate();
+  }
+
+  ipRequest(item, draft) {
+    return {
+      interfaceIndex: item.interfaceIndex,
+      ipv4:
+        draft.ipv4Mode === "static"
+          ? { mode: "static", address: draft.address.trim(), prefixLength: Number(draft.prefixLength), gateway: draft.gateway.trim() }
+          : { mode: "dhcp" },
+      dns:
+        draft.dnsMode === "manual"
+          ? { mode: "manual", servers: draft.dnsServers.split(/[\s,;]+/).filter(Boolean) }
+          : { mode: "automatic" },
+    };
+  }
+
+  describeIpv4(value) {
+    if (!value) return "—";
+    if (value.mode === "dhcp") return this.t("ipAutomatic");
+    return `${value.address || "—"}/${value.prefixLength ?? "—"}${value.gateway ? ` · ${this.t("gateway")} ${value.gateway}` : ` · ${this.t("noGateway")}`}`;
+  }
+
+  describeDns(value) {
+    if (!value) return "—";
+    return value.mode === "manual" ? (value.servers || []).join(", ") : this.t("dnsAutomatic");
+  }
+
+  async saveIpSettings() {
+    const editor = this.ipEditor;
+    if (!editor?.draft) return;
+    const item = editor.item;
+    const request = this.ipRequest(item, editor.draft);
+    const preview = await this.preview(`ip:preview:${item.interfaceIndex}`, () => api.previewIpSettings(request));
+    if (!preview) return;
+    if (preview.settings?.unchanged) return this.notify(this.t("ipUnchanged"));
+    const { target, before } = preview.settings;
+    const rows = [
+      target.ipv4 ? { label: `${item.alias} · IPv4`, before: this.describeIpv4(before.ipv4), after: this.describeIpv4(target.ipv4) } : null,
+      target.dns ? { label: `${item.alias} · DNS`, before: this.describeDns(before.dns), after: this.describeDns(target.dns) } : null,
+    ].filter(Boolean);
+    this.requestConfirmation(
+      [`${item.alias} (#${item.interfaceIndex})`, ...this.warningsOf(preview)],
+      async () => {
+        const result = await this.run(
+          `ip:${item.interfaceIndex}`,
+          () => api.applyIpSettings(request, preview.confirmationToken),
+          ["interfaces", "routes"],
+          `${this.t("editIpSettings")} · ${item.alias}`,
+        );
+        if (result) {
+          this.closeIpEditor();
+          this.startRevertCountdown(result.revert, `${this.t("editIpSettings")} · ${item.alias}`);
+        }
+      },
+      true,
+      {
+        title: this.t("confirmIpTitle"),
+        confirmLabel: this.t("apply"),
+        rows,
+        acknowledge: this.t("ipAcknowledge"),
+      },
+    );
+  }
+
+  async changeNetworkCategory(item, category) {
+    const key = `category:${item.interfaceIndex}`;
+    const input = { interfaceIndex: item.interfaceIndex, category };
+    const preview = await this.preview(`${key}:preview`, () => api.previewNetworkCategory(input));
+    if (!preview) return;
+    if (preview.unchanged) return this.notify(this.t("categoryUnchanged"));
+    this.requestConfirmation(
+      [`${item.alias} (#${item.interfaceIndex})`, ...this.warningsOf(preview)],
+      async () => {
+        const result = await this.run(key, () => api.applyNetworkCategory(input, preview.confirmationToken), ["interfaces"], `${this.t("networkCategory")} · ${item.alias}`);
+        if (result) this.startRevertCountdown(result.revert, `${this.t("networkCategory")} · ${item.alias}`);
+      },
+      true,
+      {
+        title: this.t("confirmCategoryTitle"),
+        confirmLabel: this.t("apply"),
+        rows: [{ label: item.alias, before: this.t(`category${preview.category.before}`), after: this.t(`category${category}`) }],
+        acknowledge: this.t("categoryAcknowledge"),
+      },
+    );
+  }
+
+  async toggleWifiProfiles(item) {
+    const guid = item.guid;
+    if (this.wifiProfilesOpen.has(guid)) {
+      this.wifiProfilesOpen.delete(guid);
+      return this.requestUpdate();
+    }
+    this.wifiProfilesOpen.add(guid);
+    await this.loadWifiProfileDetails(guid);
+  }
+
+  async loadWifiProfileDetails(guid) {
+    this.wifiProfileDetails.set(guid, null);
+    this.requestUpdate();
+    const result = await this.preview(`wifi-profiles:${guid}`, () => api.wifiProfileDetails(guid));
+    this.wifiProfileDetails.set(guid, result || { profiles: [] });
+    this.requestUpdate();
+  }
+
+  async wifiProfileAction(item, profile, action, mode = null) {
+    const key = `wifi-profile:${item.guid}:${profile.name}`;
+    const input = { adapterGuid: item.guid, profileName: profile.name, action, mode };
+    const preview = await this.preview(`${key}:preview`, () => api.previewWifiProfileChange(input));
+    if (!preview) return;
+    const forget = action === "forget";
+    this.requestConfirmation(
+      [`${item.alias} · ${profile.name}`, ...this.warningsOf(preview)],
+      async () => {
+        const result = await this.run(key, () => api.applyWifiProfileChange(input, preview.confirmationToken), ["interfaces"], `${this.t("savedNetworks")} · ${profile.name}`);
+        if (result) {
+          this.wifiProfiles.delete(item.alias);
+          await this.loadWifiProfileDetails(item.guid);
+          this.loadWifiProfiles();
+        }
+      },
+      forget,
+      {
+        title: this.t(forget ? "confirmForgetTitle" : "confirmProfileTitle"),
+        confirmLabel: this.t(forget ? "forget" : "apply"),
+        typeToConfirm: forget ? profile.name : "",
+      },
+    );
+  }
+
   // ---- Monitoring (read-only) --------------------------------------------
 
   syncMonitorPolling() {
@@ -1847,6 +2107,30 @@ export class NetworkManagerApp extends LitElement {
         ${confirmation.lines.map((line) => html`<li>${line}</li>`)}
       </ul>
       ${confirmation.note ? html`<p class="help-text">${confirmation.note}</p>` : nothing}
+      ${confirmation.acknowledge
+        ? html`<label class="check acknowledge"
+            ><input
+              type="checkbox"
+              .checked=${confirmation.acknowledged}
+              @change=${(event) => {
+                confirmation.acknowledged = event.target.checked;
+                this.requestUpdate();
+              }}
+            /><span>${confirmation.acknowledge}</span></label
+          >`
+        : nothing}
+      ${confirmation.typeToConfirm
+        ? html`<label class="field"
+            >${this.tf("typeToConfirm", { value: confirmation.typeToConfirm })}<input
+              autocomplete="off"
+              spellcheck="false"
+              .value=${confirmation.typed}
+              @input=${(event) => {
+                confirmation.typed = event.target.value;
+                this.requestUpdate();
+              }}
+          /></label>`
+        : nothing}
       <div class="dialog-actions">
         <button
           type="button"
@@ -1860,6 +2144,7 @@ export class NetworkManagerApp extends LitElement {
           type="submit"
           class=${confirmation.destructive ? "danger-fill" : "accent"}
           ?data-autofocus=${!confirmation.destructive}
+          ?disabled=${!this.confirmationReady()}
         >
           ${confirmation.confirmLabel}
         </button>
@@ -1890,23 +2175,45 @@ export class NetworkManagerApp extends LitElement {
     </form>`;
   }
 
+  renderRevertDialog() {
+    const seconds = this.revertSecondsLeft();
+    return html`<div class="dialog-body">
+      <h2 id="dialog-heading" class="dialog-title">${icon("clock")}${this.t("keepSettingsTitle")}</h2>
+      <p>${this.pendingRevert.label}</p>
+      <p class="help-text">${this.tf("keepSettingsHelp", { seconds })}</p>
+      <div class="revert-countdown" role="timer" aria-live="polite">${seconds}</div>
+      <div class="dialog-actions">
+        <button type="button" class="standard" ?disabled=${this.isBusy("revert:now")} @click=${() => this.revertChange()}>
+          ${this.t("revertNow")}
+        </button>
+        <button type="button" class="accent" data-autofocus ?disabled=${this.isBusy("revert:keep")} @click=${() => this.keepChange()}>
+          ${this.t("keepSettings")}
+        </button>
+      </div>
+    </div>`;
+  }
+
   renderDialog() {
     const content = this.confirmation
       ? this.renderConfirmation()
       : this.nameDialog
         ? this.renderNameDialog()
-        : nothing;
+        : this.pendingRevert
+          ? this.renderRevertDialog()
+          : nothing;
     return html`<dialog
       id="app-dialog"
       class="modal"
       aria-labelledby="dialog-heading"
       @cancel=${(event) => {
         event.preventDefault();
+        // Escape on "Keep these settings?" means revert, the safe choice.
+        if (!this.confirmation && !this.nameDialog && this.pendingRevert) return this.revertChange();
         this.closeConfirmation();
         this.closeNameDialog();
       }}
       @click=${(event) => {
-        if (event.target === event.currentTarget) {
+        if (event.target === event.currentTarget && !(this.pendingRevert && !this.confirmation)) {
           this.closeConfirmation();
           this.closeNameDialog();
         }
@@ -1931,6 +2238,17 @@ export class NetworkManagerApp extends LitElement {
         }}
       >
         ${this.routeDrawerOpen ? renderRouteDrawer(this) : nothing}
+      </dialog>
+      <dialog
+        id="ip-drawer"
+        class="drawer"
+        aria-labelledby="ip-drawer-heading"
+        @cancel=${(event) => close(event, () => this.closeIpEditor())}
+        @click=${(event) => {
+          if (event.target === event.currentTarget) this.closeIpEditor();
+        }}
+      >
+        ${this.ipEditor ? renderIpDrawer(this) : nothing}
       </dialog>
       <dialog
         id="activity-drawer"
@@ -1967,7 +2285,8 @@ export class NetworkManagerApp extends LitElement {
     // Modal dialogs are stacked: the confirmation can open above the route drawer.
     this.syncDialog("#route-drawer", this.routeDrawerOpen);
     this.syncDialog("#activity-drawer", this.activityOpen);
-    this.syncDialog("#app-dialog", Boolean(this.confirmation || this.nameDialog));
+    this.syncDialog("#ip-drawer", Boolean(this.ipEditor));
+    this.syncDialog("#app-dialog", Boolean(this.confirmation || this.nameDialog || this.pendingRevert));
   }
 
   render() {

@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn exports_omit_machine_specific_records() {
         let mut cfg = crate::AppConfig::default();
-        cfg.managed_routes.push(json!({"destinationPrefix":"[IP]/8"}));
+        cfg.managed_routes.push(json!({"destinationPrefix":format!("{}/8", std::net::Ipv4Addr::new(10, 0, 0, 0))}));
         cfg.profiles.push(json!({"id":"a","name":"Office"}));
         let document = export_document(&cfg, "2.5.0", "now");
         assert!(document.get("managedRoutes").is_none());

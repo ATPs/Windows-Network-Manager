@@ -1521,6 +1521,76 @@ td.chips .chip {
   flex: none;
 }
 
+/* ---- Configuration editing ---------------------------------------------- */
+.notice.warning {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  background: var(--warning-soft);
+  color: var(--text);
+}
+.notice.warning .icon {
+  flex: none;
+  color: var(--warning);
+}
+.config-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+.inline-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.inline-control label {
+  color: var(--text-2);
+  font-size: 0.86rem;
+}
+.form-section {
+  margin-top: 8px;
+  font-size: 0.93rem;
+  font-weight: 600;
+}
+.saved-networks {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+}
+.saved-networks > button {
+  justify-self: start;
+}
+.profile-list {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.profile-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+.check.acknowledge {
+  align-items: flex-start;
+  padding: 10px 12px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-sm);
+  background: var(--layer);
+}
+.revert-countdown {
+  margin: 8px 0;
+  font-size: 2.5rem;
+  font-weight: 600;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---- Backups / diagnostics / recovery ----------------------------------- */
 .finding-list {
   display: grid;

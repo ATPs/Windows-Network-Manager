@@ -68,6 +68,22 @@ export function isIpv4Cidr(value) {
   );
 }
 
+/** A plain IPv6 literal (no zone index); validated again in Rust. */
+export function isIpv6(value) {
+  const text = String(value || "").trim();
+  if (!/^[0-9a-f:]+$/i.test(text) || !text.includes(":")) return false;
+  const halves = text.split("::");
+  if (halves.length > 2) return false;
+  const groups = halves.flatMap((half) => (half ? half.split(":") : []));
+  if (groups.some((group) => group.length < 1 || group.length > 4)) return false;
+  return halves.length === 2 ? groups.length < 8 : groups.length === 8;
+}
+
+export function isIpv6Cidr(value) {
+  const [address, prefix, extra] = String(value || "").trim().split("/");
+  return extra === undefined && isIpv6(address) && /^\d{1,3}$/.test(prefix || "") && Number(prefix) <= 128;
+}
+
 export const isDefaultPrefix = (prefix) =>
   prefix === "0.0.0.0/0" || prefix === "::/0";
 

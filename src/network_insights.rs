@@ -498,6 +498,38 @@ pub fn scope_items(
             format!("Restored history snapshot \"{name}\"."),
         ));
     }
+    if let Some(item) = scope.get("ipSettings") {
+        let alias = field_string(item, "alias");
+        items.push(notice(
+            "scope.ipSettings",
+            json!({"alias":alias}),
+            format!("Changed IP address or DNS settings on {alias}."),
+        ));
+    }
+    if let Some(item) = scope.get("networkCategory") {
+        let (alias, category) = (field_string(item, "alias"), field_string(item, "category"));
+        items.push(notice(
+            "scope.networkCategory",
+            json!({"alias":alias,"category":category}),
+            format!("Changed the network category of {alias} to {category}."),
+        ));
+    }
+    if let Some(item) = scope.get("wifiProfileMode") {
+        let name = field_string(item, "profileName");
+        items.push(notice(
+            "scope.wifiProfileMode",
+            json!({"profileName":name}),
+            format!("Changed how Windows connects to saved Wi-Fi \"{name}\"."),
+        ));
+    }
+    if let Some(item) = scope.get("wifiProfileOrder") {
+        let name = field_string(item, "interfaceName");
+        items.push(notice(
+            "scope.wifiProfileOrder",
+            json!({"interfaceName":name}),
+            format!("Changed the saved Wi-Fi priority order on {name}."),
+        ));
+    }
     if let Some(defaults) = scope.get("windowsDefaults") {
         let count = arrays(defaults.get("interfaces")).len();
         let routes = arrays(defaults.get("managedRoutes")).len();

@@ -1,5 +1,6 @@
 mod app_automation;
 mod coexistence;
+mod config_edit;
 mod monitor;
 mod net_tools;
 mod network_insights;
@@ -367,7 +368,7 @@ $Metrics=@(Get-NetIPInterface | ForEach-Object { [PSCustomObject]@{ addressFamil
 // New-NetRoute defaults to both stores. Explicit PersistentStore is unsupported.
 const ADD_ROUTE_SCRIPT: &str = r#"
 $p=@{
-    AddressFamily='IPv4'
+    AddressFamily=$(if($InputData.addressFamily){[string]$InputData.addressFamily}else{'IPv4'})
     DestinationPrefix=[string]$InputData.destinationPrefix
     NextHop=[string]$InputData.nextHop
     InterfaceIndex=[int]$InputData.interfaceIndex
@@ -515,6 +516,16 @@ pub fn run() {
             app_automation::export_config,
             app_automation::import_config_preview,
             app_automation::import_config_apply,
+            config_edit::get_ip_settings,
+            config_edit::preview_ip_settings,
+            config_edit::apply_ip_settings,
+            config_edit::preview_network_category,
+            config_edit::apply_network_category,
+            config_edit::keep_config_change,
+            config_edit::revert_config_change,
+            config_edit::get_wifi_profile_details,
+            config_edit::preview_wifi_profile_change,
+            config_edit::apply_wifi_profile_change,
             restart_as_administrator
         ])
         .run(tauri::generate_context!())
@@ -1350,6 +1361,21 @@ fn normalize_cidr(value: &str) -> AppResult<String> {
     ))
 }
 
+/// Normalize an IPv6 CIDR (host bits cleared, compressed lowercase form).
+fn normalize_cidr6(value: &str) -> AppResult<String> {
+    let (ip, prefix) = value
+        .trim()
+        .split_once('/')
+        .ok_or_else(|| err("VALIDATION_ERROR", "DestinationPrefix must be IPv6 CIDR."))?;
+    let ip: Ipv6Addr = ip.trim().parse().map_err(|_| err("VALIDATION_ERROR", "Invalid IPv6 CIDR."))?;
+    let prefix: u32 = prefix.trim().parse().map_err(|_| err("VALIDATION_ERROR", "Invalid CIDR prefix."))?;
+    if prefix > 128 {
+        return Err(err("VALIDATION_ERROR", "Invalid IPv6 CIDR."));
+    }
+    let mask = if prefix == 0 { 0 } else { u128::MAX << (128 - prefix) };
+    Ok(format!("{}/{}", Ipv6Addr::from(u128::from(ip) & mask), prefix))
+}
+
 fn get_network_overview() -> AppResult<Value> {
     let raw = run_powershell_json(OVERVIEW_SCRIPT, None)?;
     let wifi = wifi_overview().unwrap_or_default();
@@ -1547,7 +1573,7 @@ fn get_routes() -> AppResult<Value> {
         let on_link = next == "0.0.0.0" || next == "::";
         let multicast = dest == "224.0.0.0/4" || dest.to_lowercase() == "ff00::/8";
         let managed = is_persistent || protocol == "NetMgmt";
-        let identity_editable = family == "IPv4" && managed && !on_link && !multicast;
+        let identity_editable = (family == "IPv4" || family == "IPv6") && managed && !on_link && !multicast;
         let removable = identity_editable && !default_route;
         routes.insert(key,json!({"addressFamily":family,"destinationPrefix":dest,"nextHop":next,"interfaceAlias":field_string(&route,"interfaceAlias"),"interfaceIndex":index,"routeMetric":field_i64(&route,"routeMetric"),"interfaceMetric":metric,"effectiveMetric":metric.map(|m|m+field_i64(&route,"routeMetric")),"protocol":protocol,"policyStores":stores,"persistent":is_persistent,"temporary":!is_persistent,"state":field_string(&route,"state"),"publish":field_string(&route,"publish"),"validLifetime":field_string(&route,"validLifetime"),"preferredLifetime":field_string(&route,"preferredLifetime"),"defaultRoute":default_route,"onLink":on_link,"systemManaged":!managed,"editable":true,"identityEditable":identity_editable,"removable":removable,"hiddenByDefault":multicast||(on_link&&!default_route&&!managed)}));
     }
@@ -1585,7 +1611,7 @@ fn persistable_route_payload(route: &Value) -> AppResult<Value> {
     if !is_removable_route(route) || field_bool(route, "persistent") {
         return Err(err(
             "VALIDATION_ERROR",
-            "Only temporary static IPv4 routes can be made persistent.",
+            "Only temporary static routes can be made persistent.",
         ));
     }
     let mut payload = route_payload(route)?;
@@ -1614,12 +1640,16 @@ fn metric_payload(input: &Value) -> AppResult<Value> {
     Ok(json!({"interfaceIndex":index,"addressFamily":family,"automatic":automatic,"metric":metric}))
 }
 fn route_payload(input: &Value) -> AppResult<Value> {
-    let destination = normalize_cidr(
-        input
-            .get("destinationPrefix")
-            .and_then(Value::as_str)
-            .ok_or_else(|| err("VALIDATION_ERROR", "DestinationPrefix is required."))?,
-    )?;
+    let family = input.get("addressFamily").and_then(Value::as_str).unwrap_or("IPv4");
+    if family != "IPv4" && family != "IPv6" {
+        return Err(err("VALIDATION_ERROR", "Address family must be IPv4 or IPv6."));
+    }
+    let ipv6 = family == "IPv6";
+    let raw_destination = input
+        .get("destinationPrefix")
+        .and_then(Value::as_str)
+        .ok_or_else(|| err("VALIDATION_ERROR", "DestinationPrefix is required."))?;
+    let destination = if ipv6 { normalize_cidr6(raw_destination)? } else { normalize_cidr(raw_destination)? };
     if coexistence::is_capture_prefix(&destination) {
         return Err(err(
             "PROTECTED_ROUTE",
@@ -1629,12 +1659,21 @@ fn route_payload(input: &Value) -> AppResult<Value> {
     let next = input
         .get("nextHop")
         .and_then(Value::as_str)
-        .filter(|x| valid_ipv4(x))
-        .ok_or_else(|| err("VALIDATION_ERROR", "NextHop must be an IPv4 address."))?;
+        .map(str::trim)
+        .and_then(|x| {
+            if ipv6 {
+                x.parse::<Ipv6Addr>().ok().filter(|ip| !ip.is_unspecified() && !ip.is_multicast()).map(|ip| ip.to_string())
+            } else {
+                valid_ipv4(x).then(|| x.to_string())
+            }
+        })
+        .ok_or_else(|| {
+            err("VALIDATION_ERROR", if ipv6 { "NextHop must be an IPv6 address." } else { "NextHop must be an IPv4 address." })
+        })?;
     let index = valid_index(input.get("interfaceIndex").unwrap_or(&Value::Null))?;
     let metric = valid_metric(input.get("routeMetric").unwrap_or(&Value::Null))?;
     Ok(
-        json!({"addressFamily":"IPv4","destinationPrefix":destination,"nextHop":next,"interfaceIndex":index,"routeMetric":metric,"persistent":input.get("persistent").and_then(Value::as_bool).unwrap_or(false),"note":input.get("note").and_then(Value::as_str).unwrap_or("")}),
+        json!({"addressFamily":family,"destinationPrefix":destination,"nextHop":next,"interfaceIndex":index,"routeMetric":metric,"persistent":input.get("persistent").and_then(Value::as_bool).unwrap_or(false),"note":input.get("note").and_then(Value::as_str).unwrap_or("")}),
     )
 }
 fn capture_baseline(state: &State<AppState>, scope: Value) -> AppResult<()> {
@@ -1774,7 +1813,7 @@ fn preview_add_route(state: State<AppState>, input: Value) -> AppResult<Value> {
         })
         .collect::<Vec<_>>();
     let mut notices = vec![];
-    if field_string(&payload, "destinationPrefix") == "0.0.0.0/0" {
+    if ["0.0.0.0/0", "::/0"].contains(&field_string(&payload, "destinationPrefix").as_str()) {
         notices.push(notice(
             "route.add.defaultRoute",
             json!({}),
@@ -1821,7 +1860,7 @@ fn add_route(state: State<AppState>, input: Value) -> AppResult<Value> {
         .unwrap_or(false)
         || true
     {
-        cfg.managed_routes.push(json!({"addressFamily":"IPv4","destinationPrefix":field_string(&payload,"destinationPrefix"),"nextHop":field_string(&payload,"nextHop"),"interfaceIndex":field_i64(&payload,"interfaceIndex")}));
+        cfg.managed_routes.push(json!({"addressFamily":field_string(&payload,"addressFamily"),"destinationPrefix":field_string(&payload,"destinationPrefix"),"nextHop":field_string(&payload,"nextHop"),"interfaceIndex":field_i64(&payload,"interfaceIndex")}));
     }
     persist(&state, &cfg)?;
     Ok(result)
@@ -1839,7 +1878,7 @@ fn prepare_route_edit(routes: &[Value], original: &Value, input: &Value) -> AppR
     if !is_removable_route(target) {
         return Err(err(
             "VALIDATION_ERROR",
-            "Only manual non-default IPv4 routes can be edited.",
+            "Only manual non-default routes can be edited.",
         ));
     }
     let replacement = route_payload(input)?;
@@ -1849,10 +1888,13 @@ fn prepare_route_edit(routes: &[Value], original: &Value, input: &Value) -> AppR
         .next()
         .and_then(|v| v.parse::<u8>().ok())
         .unwrap_or(255);
-    if destination == "0.0.0.0/0"
-        || first_octet >= 224
-        || field_string(&replacement, "nextHop") == "0.0.0.0"
-    {
+    let ipv6 = field_string(&replacement, "addressFamily") == "IPv6";
+    let unsupported = if ipv6 {
+        destination == "::/0" || destination.starts_with("ff")
+    } else {
+        destination == "0.0.0.0/0" || first_octet >= 224 || field_string(&replacement, "nextHop") == "0.0.0.0"
+    };
+    if unsupported {
         return Err(err(
             "VALIDATION_ERROR",
             "Editing into a default, on-link, or multicast route is not supported.",
@@ -1886,9 +1928,9 @@ function Add-EditedRoute($record) {{
 }}
 function Remove-EditedRoute($record, $stores) {{
     foreach($store in $stores){{
-        $existing=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix ([string]$record.destinationPrefix) -NextHop ([string]$record.nextHop) -InterfaceIndex ([int]$record.interfaceIndex) -PolicyStore $store -ErrorAction SilentlyContinue)
+        $existing=@(Get-NetRoute -AddressFamily ([string]$record.addressFamily) -DestinationPrefix ([string]$record.destinationPrefix) -NextHop ([string]$record.nextHop) -InterfaceIndex ([int]$record.interfaceIndex) -PolicyStore $store -ErrorAction SilentlyContinue)
         if($existing.Count -gt 0){{
-            Remove-NetRoute -AddressFamily IPv4 -DestinationPrefix ([string]$record.destinationPrefix) -NextHop ([string]$record.nextHop) -InterfaceIndex ([int]$record.interfaceIndex) -PolicyStore $store -Confirm:$false -ErrorAction Stop
+            Remove-NetRoute -AddressFamily ([string]$record.addressFamily) -DestinationPrefix ([string]$record.destinationPrefix) -NextHop ([string]$record.nextHop) -InterfaceIndex ([int]$record.interfaceIndex) -PolicyStore $store -Confirm:$false -ErrorAction Stop
         }}
     }}
 }}
@@ -1990,13 +2032,13 @@ fn persist_route_script() -> String {
     // Recreate with the default stores; restore the active route on failure.
     format!(
         r#"
-Remove-NetRoute -AddressFamily IPv4 -DestinationPrefix ([string]$InputData.destinationPrefix) -NextHop ([string]$InputData.nextHop) -InterfaceIndex ([int]$InputData.interfaceIndex) -PolicyStore ActiveStore -Confirm:$false -ErrorAction Stop
+Remove-NetRoute -AddressFamily ([string]$InputData.addressFamily) -DestinationPrefix ([string]$InputData.destinationPrefix) -NextHop ([string]$InputData.nextHop) -InterfaceIndex ([int]$InputData.interfaceIndex) -PolicyStore ActiveStore -Confirm:$false -ErrorAction Stop
 try {{
 {ADD_ROUTE_SCRIPT}
 }} catch {{
     $failure=$_.Exception.Message
     try {{
-        $active=@(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix ([string]$InputData.destinationPrefix) -NextHop ([string]$InputData.nextHop) -InterfaceIndex ([int]$InputData.interfaceIndex) -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
+        $active=@(Get-NetRoute -AddressFamily ([string]$InputData.addressFamily) -DestinationPrefix ([string]$InputData.destinationPrefix) -NextHop ([string]$InputData.nextHop) -InterfaceIndex ([int]$InputData.interfaceIndex) -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
         if($active.Count -eq 0){{
             $InputData.persistent=$false
             & {{ {ADD_ROUTE_SCRIPT} }} | Out-Null
@@ -2046,7 +2088,7 @@ fn preview_remove_route(state: State<AppState>, route: Value) -> AppResult<Value
         .find(|r| route_key(r) == route_key(&route))
         .ok_or_else(|| err("NOT_FOUND", "Route no longer exists."))?;
     if !is_removable_route(&target) {
-        return Err(err("VALIDATION_ERROR","This route is Windows-managed, on-link, multicast, IPv6, or a default route and cannot be safely removed."));
+        return Err(err("VALIDATION_ERROR","This route is Windows-managed, on-link, multicast, or a default route and cannot be safely removed."));
     }
     ensure_route_not_protected(&state, &target)?;
     let payload = route_remove_payload(&target);
@@ -2720,7 +2762,7 @@ fn restore_snapshot(state: &State<AppState>, snapshot: &Value, scope: &Value) ->
             results.extend(arrays(Some(&remove_route_record(&remove)?)));
         } else if current_item.is_none() {
             if let Some(route) = target_item {
-                let add = json!({"destinationPrefix":field_string(route,"destinationPrefix"),"nextHop":field_string(route,"nextHop"),"interfaceIndex":field_i64(route,"interfaceIndex"),"routeMetric":field_i64(route,"routeMetric"),"persistent":route.get("persistent").and_then(Value::as_bool).unwrap_or(false)});
+                let add = json!({"addressFamily":non_empty_or(field_string(route,"addressFamily"),"IPv4"),"destinationPrefix":field_string(route,"destinationPrefix"),"nextHop":field_string(route,"nextHop"),"interfaceIndex":field_i64(route,"interfaceIndex"),"routeMetric":field_i64(route,"routeMetric"),"persistent":route.get("persistent").and_then(Value::as_bool).unwrap_or(false)});
                 match add_route_record(&add) {
                     Ok(value) => {
                         results.push(json!({"status":"success","kind":"route","result":value}))
@@ -2882,7 +2924,8 @@ fn reset_apply(state: State<AppState>, input: Value) -> AppResult<Value> {
     )?;
     let result = restore_snapshot(&state, &baseline.snapshot.state, &baseline.scope)?;
     let route_result = restore_route_scope(&baseline.scope)?;
-    let complete = !has_failed_result(&result) && !has_failed_result(&route_result);
+    let config_result = json!(config_edit::restore_scope(&baseline.scope));
+    let complete = !has_failed_result(&result) && !has_failed_result(&route_result) && !has_failed_result(&config_result);
     let message = if complete {
         notice("reset.complete", json!({}), "The last app change was undone.")
     } else {
@@ -2893,7 +2936,7 @@ fn reset_apply(state: State<AppState>, input: Value) -> AppResult<Value> {
         persist(&state, &cfg)?;
     }
     Ok(
-        json!({"reset":complete,"partial":!complete,"result":result,"routeResult":route_result,"message":message["text"],"messageCode":message}),
+        json!({"reset":complete,"partial":!complete,"result":result,"routeResult":route_result,"configResult":config_result,"message":message["text"],"messageCode":message}),
     )
 }
 fn windows_defaults_payload(state: &State<AppState>, input: &Value) -> AppResult<Value> {
@@ -3242,6 +3285,37 @@ mod tests {
         assert_eq!(merged.settings.theme, "light");
         assert_eq!(wifi_auto_rules(&merged).unwrap(), vec![rule]);
         assert_eq!(merged.profiles.len(), 1);
+    }
+    #[test]
+    fn ipv6_routes_are_normalized_and_validated() {
+        assert_eq!(normalize_cidr6("2001:DB8:0:0:1::5/64").unwrap(), "2001:db8::/64");
+        assert_eq!(normalize_cidr6("::/0").unwrap(), "::/0");
+        assert!(normalize_cidr6("2001:db8::/129").is_err());
+        assert!(normalize_cidr6("2001:db8::").is_err());
+        let route = json!({"addressFamily":"IPv6","destinationPrefix":"2001:db8:1::/48","nextHop":"fe80::1","interfaceIndex":5,"routeMetric":10});
+        let payload = route_payload(&route).unwrap();
+        assert_eq!(payload["addressFamily"], "IPv6");
+        assert_eq!(payload["nextHop"], "fe80::1");
+        let mut bad = route.clone();
+        bad["nextHop"] = json!("::");
+        assert!(route_payload(&bad).is_err(), "on-link IPv6 routes are not created");
+        bad["nextHop"] = json!("ff02::1");
+        assert!(route_payload(&bad).is_err());
+        let mut capture = route.clone();
+        capture["destinationPrefix"] = json!("8000::/1");
+        assert_eq!(route_payload(&capture).unwrap_err().code, "PROTECTED_ROUTE");
+        let mut family = route.clone();
+        family["addressFamily"] = json!("IPX");
+        assert!(route_payload(&family).is_err());
+        let existing = json!({"addressFamily":"IPv6","destinationPrefix":"2001:db8:1::/48","nextHop":"fe80::1","interfaceIndex":5,"routeMetric":10,"persistent":false,"removable":true,"policyStores":["ActiveStore"]});
+        let mut edited = route.clone();
+        edited["routeMetric"] = json!(20);
+        let payload = prepare_route_edit(&[existing.clone()], &existing, &edited).unwrap();
+        assert_eq!(payload["oldRoute"]["addressFamily"], "IPv6");
+        edited["destinationPrefix"] = json!("::/0");
+        assert!(prepare_route_edit(&[existing.clone()], &existing, &edited).is_err());
+        edited["destinationPrefix"] = json!("ff00::/8");
+        assert!(prepare_route_edit(&[existing.clone()], &existing, &edited).is_err());
     }
     #[test]
     fn route_edit_validation_and_live_state_are_checked() {

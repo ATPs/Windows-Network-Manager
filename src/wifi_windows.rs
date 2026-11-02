@@ -392,6 +392,17 @@ pub fn scan_networks(adapter_guid: &str) -> Result<Value, String> {
     }))
 }
 
+/// The interface alias and saved profile names (in Windows priority order)
+/// of one Wi-Fi adapter. Profile names only; no profile XML is read.
+pub fn adapter_profiles(adapter_guid: &str) -> Result<(String, Vec<String>), String> {
+    let client = WlanClient::open()?;
+    let info = interface_infos(&client)?
+        .into_iter()
+        .find(|info| same_guid(&guid_string(&info.InterfaceGuid), adapter_guid))
+        .ok_or_else(|| "The selected Wi-Fi adapter is unavailable.".to_string())?;
+    Ok((alias_for_guid(&info.InterfaceGuid)?, profiles(&client, &info.InterfaceGuid)?))
+}
+
 /// The current connection of one Wi-Fi adapter, for background monitoring.
 pub struct WifiConnection {
     pub adapter_guid: String,

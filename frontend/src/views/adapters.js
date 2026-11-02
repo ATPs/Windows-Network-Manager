@@ -311,6 +311,7 @@ function renderWifiSection(app, item) {
         </button>
       </div>
     </div>
+    ${renderSavedNetworks(app, item)}
     <h5>${app.t("wifiAutoConnect")}</h5>
     ${renderWifiAutoControl(app, item)}
   </section>`;
@@ -326,6 +327,99 @@ function addressList(app, addresses) {
         >`,
     )}</span
   >`;
+}
+
+function renderConfigControls(app, item) {
+  if (item.systemInterface) return nothing;
+  const categoryKey = `category:${item.interfaceIndex}`;
+  const categoryBusy = app.isBusy(categoryKey) || app.isBusy(`${categoryKey}:preview`);
+  const editableCategory = ["Private", "Public"].includes(item.networkCategory);
+  const id = `category-${item.interfaceIndex}`;
+  return html`<div class="config-controls">
+    ${app.canEditIp(item)
+      ? html`<button
+          class="standard"
+          ?disabled=${!app.privilege.isAdmin || app.isBusyPrefix(`ip:`)}
+          title=${app.privilege.isAdmin ? "" : app.t("permissionHelp")}
+          @click=${() => app.openIpEditor(item)}
+        >
+          ${buttonContent(app.isBusy(`ip:load:${item.interfaceIndex}`), "edit", app.t("editIpSettings"))}
+        </button>`
+      : item.managedBy
+        ? html`<small class="muted">${app.tf("ipProtectedHelp", { owner: app.ownerLabel(item.managedBy) })}</small>`
+        : nothing}
+    ${editableCategory
+      ? html`<span class="inline-control">
+          <label for=${id}>${app.t("networkCategory")}</label>
+          <select id=${id} ?disabled=${categoryBusy}>
+            ${["Private", "Public"].map(
+              (category) => html`<option value=${category} ?selected=${category === item.networkCategory}>${app.t(`category${category}`)}</option>`,
+            )}
+          </select>
+          <button
+            class="subtle compact"
+            ?disabled=${!app.privilege.isAdmin || categoryBusy}
+            @click=${() => app.changeNetworkCategory(item, app.querySelector(`#${id}`)?.value)}
+          >
+            ${buttonContent(categoryBusy, null, app.t("apply"))}
+          </button>
+        </span>`
+      : nothing}
+  </div>`;
+}
+
+function renderSavedNetworks(app, item) {
+  if (!item.guid) return nothing;
+  const open = app.wifiProfilesOpen.has(item.guid);
+  const details = app.wifiProfileDetails.get(item.guid);
+  const profiles = details?.profiles || [];
+  const busyPrefix = `wifi-profile:${item.guid}:`;
+  const rowButton = (profile, action, iconName, label, disabled = false, mode = null) => html`<button
+    class="icon-button subtle ${action === "forget" ? "danger-text" : ""}"
+    title=${label}
+    aria-label=${`${label} ${profile.name}`}
+    ?disabled=${disabled || !profile.editable || app.isBusyPrefix(busyPrefix)}
+    @click=${() => app.wifiProfileAction(item, profile, action, mode)}
+  >
+    ${icon(iconName)}
+  </button>`;
+  return html`<div class="saved-networks">
+    <button class="subtle compact" aria-expanded=${String(open)} @click=${() => app.toggleWifiProfiles(item)}>
+      ${icon(open ? "chevronUp" : "chevronDown")}${app.t("manageSavedNetworks")}
+    </button>
+    ${open
+      ? details == null
+        ? skeletonRows(2)
+        : html`<p class="help-text">${app.t("savedNetworksHelp")}</p>
+            <ol class="profile-list">
+              ${profiles.map(
+                (profile, index) => html`<li>
+                  <span class="rank">${profile.priority}</span>
+                  <span class="list-main">
+                    <strong>${profile.name}</strong>
+                    <small>${profile.connectionMode === "auto" ? app.t("connectAuto") : profile.connectionMode === "manual" ? app.t("connectManual") : "—"}</small>
+                  </span>
+                  ${item.wifi?.currentProfile === profile.name ? chip(app.t("connected"), "accent") : nothing}
+                  <span class="row-buttons">
+                    ${rowButton(profile, "moveUp", "chevronUp", app.t("moveUp"), index === 0)}
+                    ${rowButton(profile, "moveDown", "chevronDown", app.t("moveDown"), index === profiles.length - 1)}
+                    ${profile.connectionMode
+                      ? rowButton(
+                          profile,
+                          "setMode",
+                          "power",
+                          profile.connectionMode === "auto" ? app.t("setManual") : app.t("setAuto"),
+                          false,
+                          profile.connectionMode === "auto" ? "manual" : "auto",
+                        )
+                      : nothing}
+                    ${rowButton(profile, "forget", "trash", app.t("forget"))}
+                  </span>
+                </li>`,
+              )}
+            </ol>`
+      : nothing}
+  </div>`;
 }
 
 function renderQuickFixes(app, item) {
@@ -366,6 +460,7 @@ function renderAdapterBody(app, item) {
         ${fact(app.t("linkSpeed"), item.linkSpeed)}
         ${fact(app.t("operationalStatus"), item.operationalStatus)}
       </div>
+      ${renderConfigControls(app, item)}
     </section>
     <section class="detail-section">
       <h4>${icon("routes")}${app.t("priority")}</h4>

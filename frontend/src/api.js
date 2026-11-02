@@ -83,5 +83,18 @@ export const api = {
   importConfigPreview: () => call("import_config_preview"),
   importConfigApply: (data, confirmationToken) =>
     call("import_config_apply", { input: { import: data, confirmationToken } }),
+  ipSettings: (interfaceIndex) => call("get_ip_settings", { interfaceIndex }),
+  previewIpSettings: (input) => call("preview_ip_settings", { input }),
+  applyIpSettings: (settings, confirmationToken) =>
+    call("apply_ip_settings", { input: { settings, confirmationToken } }),
+  previewNetworkCategory: (input) => call("preview_network_category", { input }),
+  applyNetworkCategory: (category, confirmationToken) =>
+    call("apply_network_category", { input: { category, confirmationToken } }),
+  keepConfigChange: (revertId) => call("keep_config_change", { revertId }),
+  revertConfigChange: (revertId) => call("revert_config_change", { revertId }),
+  wifiProfileDetails: (adapterGuid) => call("get_wifi_profile_details", { adapterGuid }),
+  previewWifiProfileChange: (input) => call("preview_wifi_profile_change", { input }),
+  applyWifiProfileChange: (change, confirmationToken) =>
+    call("apply_wifi_profile_change", { input: { change, confirmationToken } }),
   restartAsAdmin: () => call("restart_as_administrator"),
 };

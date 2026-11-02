@@ -1,7 +1,7 @@
 import { html, nothing } from "lit";
 import { keyed } from "lit/directives/keyed.js";
 import { icon } from "../icons.js";
-import { isIpv4, isIpv4Cidr, routeIdentity } from "../format.js";
+import { isIpv4, isIpv4Cidr, isIpv6, isIpv6Cidr, routeIdentity } from "../format.js";
 import { buttonContent, chip, emptyState, segmented, skeletonRows, switchInput } from "../ui.js";
 
 function sortHeader(app, key, label) {
@@ -180,9 +180,11 @@ export function renderRoutes(app) {
 function validateRoute(app, draft) {
   if (!draft) return {};
   const errors = {};
-  if (draft.destinationPrefix && !isIpv4Cidr(draft.destinationPrefix))
+  const ipv6 = draft.addressFamily === "IPv6";
+  if (draft.destinationPrefix && !(ipv6 ? isIpv6Cidr : isIpv4Cidr)(draft.destinationPrefix))
     errors.destinationPrefix = app.t("invalidCidr");
-  if (draft.nextHop && !isIpv4(draft.nextHop)) errors.nextHop = app.t("invalidIpv4");
+  if (draft.nextHop && !(ipv6 ? isIpv6 : isIpv4)(draft.nextHop))
+    errors.nextHop = app.t(ipv6 ? "invalidIpv6" : "invalidIpv4");
   const metric = Number(draft.routeMetric);
   if (draft.routeMetric !== "" && draft.routeMetric != null && (!Number.isInteger(metric) || metric < 1 || metric > 9999))
     errors.routeMetric = app.t("invalidMetric");
@@ -191,14 +193,17 @@ function validateRoute(app, draft) {
 
 export function renderRouteDrawer(app) {
   const route = app.editingRoute;
-  const routeInterfaces = app.interfaces().filter((item) => item.metrics?.ipv4);
+  const family = route?.addressFamily || app.routeDraftFamily || "IPv4";
+  const ipv6 = family === "IPv6";
+  const metricKey = ipv6 ? "ipv6" : "ipv4";
+  const routeInterfaces = app.interfaces().filter((item) => item.metrics?.[metricKey]);
   const draft = app.routeDraft;
   const errors = validateRoute(app, draft);
   const invalid = Object.keys(errors).length > 0;
   const busy = app.routeBusy() || app.isBusyPrefix("route:add:preview") || app.isBusyPrefix("route:edit:preview");
   const selectedIndex = Number(draft?.interfaceIndex ?? route?.interfaceIndex ?? routeInterfaces[0]?.interfaceIndex);
   const selectedInterface = app.interfaces().find((item) => item.interfaceIndex === selectedIndex);
-  const interfaceMetric = selectedInterface?.metrics?.ipv4?.interfaceMetric;
+  const interfaceMetric = selectedInterface?.metrics?.[metricKey]?.interfaceMetric;
   const routeMetric = Number(draft?.routeMetric ?? route?.routeMetric ?? 5);
   const field = (name, label, input, help = "") => html`<label class="field ${errors[name] ? "invalid" : ""}"
     >${label}${input}${errors[name]
@@ -225,6 +230,18 @@ export function renderRouteDrawer(app) {
         }}
       >
         <p class="help-text">${app.t(route ? "editRouteHelp" : "addRouteHelp")}</p>
+        <input type="hidden" name="addressFamily" .value=${family} />
+        ${route
+          ? nothing
+          : segmented(
+              [
+                ["IPv4", "IPv4"],
+                ["IPv6", "IPv6"],
+              ],
+              family,
+              (value) => app.setRouteDraftFamily(value),
+              app.t("addressFamily"),
+            )}
         ${field(
           "destinationPrefix",
           app.t("destination"),
@@ -232,7 +249,7 @@ export function renderRouteDrawer(app) {
             name="destinationPrefix"
             class="mono"
             .value=${route?.destinationPrefix || ""}
-            placeholder="10.0.0.0/8"
+            placeholder=${ipv6 ? "2001:db8::/32" : "10.0.0.0/8"}
             autocomplete="off"
             spellcheck="false"
             required
@@ -246,7 +263,7 @@ export function renderRouteDrawer(app) {
             name="nextHop"
             class="mono"
             .value=${route?.nextHop || ""}
-            placeholder="192.168.1.1"
+            placeholder=${ipv6 ? "fe80::1" : "192.168.1.1"}
             autocomplete="off"
             spellcheck="false"
             required
