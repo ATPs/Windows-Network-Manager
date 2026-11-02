@@ -114,6 +114,13 @@ pub fn proxy_product(software: &[Value]) -> String {
         .unwrap_or_else(|| "Proxy TUN".into())
 }
 
+/// The displayed owner of an adapter, with proxy TUN adapters attributed to
+/// the running proxy product.
+pub fn resolve_owner(alias: &str, description: &str, if_type: i64, proxy_product: &str) -> Option<String> {
+    tunnel_owner(alias, description, if_type)
+        .map(|owner| if owner == PROXY_OWNER { proxy_product.to_string() } else { owner.to_string() })
+}
+
 /// Set `managedBy` on every interface (null when the app may manage it).
 pub fn annotate_overview(overview: &mut Value, proxy_product: &str) {
     let Some(items) = overview.get_mut("interfaces").and_then(Value::as_array_mut) else {

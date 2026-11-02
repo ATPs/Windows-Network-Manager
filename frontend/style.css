@@ -1415,6 +1415,112 @@ td.chips .chip {
   font-size: 0.86rem;
 }
 
+/* ---- Monitor charts (validated series colors, light and dark) ----------- */
+:root {
+  --series-1: light-dark(#005fb8, #2f95d3);
+  --series-2: light-dark(#c75000, #d9732b);
+}
+.line-chart {
+  position: relative;
+  margin: 0;
+}
+.line-chart svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  touch-action: none;
+}
+.line-chart .grid {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+.line-chart .axis {
+  fill: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.line-chart .line {
+  fill: none;
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+.line-chart .area {
+  stroke: none;
+  opacity: 0.1;
+}
+.line-chart .line.series-1 { stroke: var(--series-1); }
+.line-chart .line.series-2 { stroke: var(--series-2); }
+.line-chart .area.series-1 { fill: var(--series-1); }
+.line-chart .area.series-2 { fill: var(--series-2); }
+.line-chart .crosshair {
+  stroke: var(--stroke-strong);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+.key {
+  display: inline-block;
+  width: 12px;
+  height: 2px;
+  margin-right: 6px;
+  vertical-align: middle;
+  border-radius: 1px;
+}
+.key.series-1 { background: var(--series-1); }
+.key.series-2 { background: var(--series-2); }
+.chart-legend,
+.stat-pair {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  color: var(--text-2);
+  font-size: 0.86rem;
+}
+.stat-pair {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.chart-tooltip {
+  position: absolute;
+  top: 4px;
+  display: grid;
+  gap: 2px;
+  padding: 6px 10px;
+  background: var(--card);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-flyout);
+  font-size: 0.8rem;
+  pointer-events: none;
+}
+.chart-tooltip.at-start { left: 60px; }
+.chart-tooltip.at-end { right: 12px; }
+.compact-table tr.muted td { color: var(--muted); }
+.event-list {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 420px;
+  overflow: auto;
+}
+.event-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.event-list li > span { flex: 1; }
+.event-list .icon {
+  width: 16px;
+  height: 16px;
+  color: var(--text-2);
+  flex: none;
+}
+
 /* ---- Backups / diagnostics / recovery ----------------------------------- */
 .finding-list {
   display: grid;

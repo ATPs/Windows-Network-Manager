@@ -392,6 +392,50 @@ pub fn scan_networks(adapter_guid: &str) -> Result<Value, String> {
     }))
 }
 
+/// The current connection of one Wi-Fi adapter, for background monitoring.
+pub struct WifiConnection {
+    pub adapter_guid: String,
+    pub alias: String,
+    pub ssid: Option<String>,
+    pub profile: Option<String>,
+    pub signal: Option<u32>,
+}
+
+/// Current connection and signal of every Wi-Fi adapter. Uses the same
+/// no-prompt access check as auto-connect and never scans or connects.
+pub fn connection_samples() -> Result<Vec<WifiConnection>, String> {
+    ensure_wifi_access()?;
+    let client = WlanClient::open()?;
+    Ok(interface_infos(&client)?
+        .into_iter()
+        .map(|info| {
+            let connection = (info.isState == wlan_interface_state_connected)
+                .then(|| {
+                    query_copy::<WLAN_CONNECTION_ATTRIBUTES>(
+                        &client,
+                        &info.InterfaceGuid,
+                        wlan_intf_opcode_current_connection,
+                    )
+                    .ok()
+                })
+                .flatten();
+            WifiConnection {
+                adapter_guid: guid_string(&info.InterfaceGuid),
+                alias: alias_for_guid(&info.InterfaceGuid).unwrap_or_default(),
+                ssid: connection
+                    .as_ref()
+                    .map(|item| ssid_text(&item.wlanAssociationAttributes.dot11Ssid))
+                    .filter(|ssid| !ssid.is_empty()),
+                profile: connection
+                    .as_ref()
+                    .map(|item| utf16_string(&item.strProfileName))
+                    .filter(|name| !name.is_empty()),
+                signal: connection.as_ref().map(|item| item.wlanAssociationAttributes.wlanSignalQuality.min(100)),
+            }
+        })
+        .collect())
+}
+
 impl WifiBackend for WindowsWifi {
     fn observe(&self, rule: &AutoConnectRule) -> Result<WifiObservation, String> {
         let adapter = selected_adapter(rule)?;

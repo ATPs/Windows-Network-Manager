@@ -21,6 +21,7 @@ import { renderRoutes, renderRouteDrawer } from "./views/routes.js";
 import { renderProfiles } from "./views/profiles.js";
 import { renderDiagnostics } from "./views/diagnostics.js";
 import { renderTools } from "./views/tools.js";
+import { renderMonitor } from "./views/monitor.js";
 import { renderMaintenance } from "./views/maintenance.js";
 import { renderSettings } from "./views/settings.js";
 
@@ -31,6 +32,7 @@ export const views = [
   "profiles",
   "diagnostics",
   "tools",
+  "monitor",
   "maintenance",
   "settings",
 ];
@@ -41,10 +43,19 @@ const viewRenderers = {
   profiles: renderProfiles,
   diagnostics: renderDiagnostics,
   tools: renderTools,
+  monitor: renderMonitor,
   maintenance: renderMaintenance,
   settings: renderSettings,
 };
 const TOAST_TIMEOUT = { success: 4000, info: 5000 };
+const MONITOR_POLL_MS = 2000;
+export const defaultNotifications = {
+  enabled: false,
+  adapters: true,
+  wifi: true,
+  defaultRoute: true,
+  tunnels: false,
+};
 
 const readStorage = (key) => {
   try {
@@ -88,6 +99,7 @@ export class NetworkManagerApp extends LitElement {
       theme: readStorage("wnm-theme") || "system",
       showSystemInterfaces: false,
       showAllRoutes: false,
+      notifications: { ...defaultNotifications },
     };
     this.network = {
       overview: null,
@@ -148,9 +160,19 @@ export class NetworkManagerApp extends LitElement {
       wifiScan: null,
     };
     this.toolEventUnlisten = [];
+    this.monitor = {
+      snapshot: null,
+      events: null,
+      eventFilters: { kind: "all", tunnels: false },
+      hover: null,
+    };
+    this.monitorTimer = null;
     this.refreshTimer = null;
     this.clockTimer = null;
-    this.onVisibilityChange = () => this.scheduleRefresh();
+    this.onVisibilityChange = () => {
+      this.scheduleRefresh();
+      this.syncMonitorPolling();
+    };
     this.onKeydown = (event) => this.handleShortcut(event);
   }
 
@@ -167,6 +189,7 @@ export class NetworkManagerApp extends LitElement {
     document.removeEventListener("keydown", this.onKeydown);
     clearTimeout(this.refreshTimer);
     clearInterval(this.clockTimer);
+    this.stopMonitorPolling();
     if (this.wifiAutoEventUnlisten) {
       this.wifiAutoEventUnlisten();
       this.wifiAutoEventUnlisten = null;
@@ -227,8 +250,10 @@ export class NetworkManagerApp extends LitElement {
       this.privilege = bootstrap.privilege || this.privilege;
       if (bootstrap.cachedNetworkState)
         this.applyNetwork(bootstrap.cachedNetworkState);
+      this.settings.notifications = { ...defaultNotifications, ...(this.settings.notifications || {}) };
       this.applyTheme();
       this.requestUpdate();
+      this.syncMonitorPolling();
       this.refreshConfig().catch(() => {});
       await this.refresh(["interfaces", "routes"]);
       this.scheduleRefresh();
@@ -335,6 +360,7 @@ export class NetworkManagerApp extends LitElement {
       this.toolEventUnlisten = [
         await listen("trace-hop", (event) => this.onTraceHop(event.payload)),
         await listen("trace-done", (event) => this.onTraceDone(event.payload)),
+        await listen("network-event", (event) => this.onNetworkEvents(event.payload)),
       ];
     } catch {
       // The event bridge is unavailable in browser and unit-test environments.
@@ -526,6 +552,7 @@ export class NetworkManagerApp extends LitElement {
     if (!views.includes(view)) return;
     this.view = view;
     writeStorage("wnm-view", view);
+    this.syncMonitorPolling();
     this.requestUpdate();
     this.updateComplete.then(() =>
       this.querySelector("main")?.scrollTo?.({ top: 0 }),
@@ -552,7 +579,7 @@ export class NetworkManagerApp extends LitElement {
       return;
     }
     if (this.anyDialogOpen()) return;
-    if (event.ctrlKey && !event.altKey && /^[1-8]$/.test(event.key)) {
+    if (event.ctrlKey && !event.altKey && /^[1-9]$/.test(event.key)) {
       event.preventDefault();
       this.setView(views[Number(event.key) - 1]);
       return;
@@ -1360,6 +1387,76 @@ export class NetworkManagerApp extends LitElement {
     }
   }
 
+  // ---- Monitoring (read-only) --------------------------------------------
+
+  syncMonitorPolling() {
+    const wanted = this.view === "monitor" && !globalThis.document?.hidden;
+    if (wanted && !this.monitorTimer) {
+      this.loadMonitorSnapshot();
+      if (this.monitor.events == null) this.loadNetworkEvents();
+      this.monitorTimer = setInterval(() => this.loadMonitorSnapshot(), MONITOR_POLL_MS);
+    } else if (!wanted) {
+      this.stopMonitorPolling();
+    }
+  }
+
+  stopMonitorPolling() {
+    clearInterval(this.monitorTimer);
+    this.monitorTimer = null;
+  }
+
+  async loadMonitorSnapshot() {
+    try {
+      this.monitor.snapshot = await api.monitorSnapshot();
+      this.requestUpdate();
+    } catch {
+      // Sampling resumes on the next poll.
+    }
+  }
+
+  async loadNetworkEvents() {
+    const result = await this.preview("monitor:events", () => api.networkEvents());
+    if (result) {
+      this.monitor.events = result.events || [];
+      this.requestUpdate();
+    }
+  }
+
+  onNetworkEvents(events) {
+    if (!Array.isArray(events) || this.monitor.events == null) return;
+    this.monitor.events = [...[...events].reverse(), ...this.monitor.events].slice(0, 500);
+    this.requestUpdate();
+  }
+
+  clearNetworkEvents() {
+    this.requestConfirmation(
+      [this.t("clearHistoryHelp")],
+      async () => {
+        const result = await this.run("monitor:clear", () => api.clearNetworkEvents(), [], this.t("clearHistory"));
+        if (result) {
+          this.monitor.events = [];
+          this.requestUpdate();
+        }
+      },
+      true,
+      { title: this.t("clearHistory"), confirmLabel: this.t("delete") },
+    );
+  }
+
+  setEventFilter(change) {
+    this.monitor.eventFilters = { ...this.monitor.eventFilters, ...change };
+    this.requestUpdate();
+  }
+
+  setMonitorHover(hover) {
+    this.monitor.hover = hover;
+    this.requestUpdate();
+  }
+
+  updateNotifications(change) {
+    return this.updateSettings({ notifications: { ...this.settings.notifications, ...change } });
+  }
+
   selectedDefaults() {
     if (!this.defaultsSelection)
       this.defaultsSelection = new Set(
@@ -1435,7 +1532,7 @@ export class NetworkManagerApp extends LitElement {
       html`<button
         class="nav-item ${this.view === view ? "selected" : ""}"
         aria-current=${this.view === view ? "page" : "false"}
-        title=${`${this.t(view)} (Ctrl+${views.indexOf(view) + 1})`}
+        title=${views.indexOf(view) < 9 ? `${this.t(view)} (Ctrl+${views.indexOf(view) + 1})` : this.t(view)}
         @click=${() => this.setView(view)}
       >
         ${icon(view)}<span class="nav-label">${this.t(view)}</span>

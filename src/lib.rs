@@ -1,4 +1,5 @@
 mod coexistence;
+mod monitor;
 mod net_tools;
 mod network_insights;
 mod wifi_auto_connect;
@@ -54,6 +55,7 @@ use windows_sys::Win32::{
 
 const CONFIG_FILE: &str = "network-profiles.json";
 const CACHE_FILE: &str = "network-state-cache.json";
+const EVENTS_FILE: &str = "network-events.json";
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(5);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -95,6 +97,8 @@ struct Settings {
     show_system_interfaces: bool,
     #[serde(default)]
     show_all_routes: bool,
+    #[serde(default)]
+    notifications: monitor::NotificationSettings,
 }
 fn default_language() -> String {
     "en".into()
@@ -109,6 +113,7 @@ impl Default for Settings {
             theme: default_theme(),
             show_system_interfaces: false,
             show_all_routes: false,
+            notifications: monitor::NotificationSettings::default(),
         }
     }
 }
@@ -188,6 +193,7 @@ struct AppState {
     config_lock: Mutex<()>,
     tray_items: Mutex<Option<TrayItems>>,
     wifi_auto_supervisor: Arc<AutoConnectSupervisor>,
+    monitor: Arc<monitor::Monitor>,
 }
 
 struct TrayItems {
@@ -233,6 +239,30 @@ fn update_tray_tooltip(app: &AppHandle) {
     );
     if let Some(tray) = app.tray_by_id("main-tray") {
         let _ = tray.set_tooltip(Some(text));
+    }
+}
+
+fn stop_workers(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    state.wifi_auto_supervisor.stop_all();
+    state.monitor.stop();
+}
+
+/// Forward new monitor events to the UI and, when opted in, to the tray.
+fn on_network_events(app: &AppHandle, events: &[Value]) {
+    let _ = app.emit("network-event", events);
+    let Some(state) = app.try_state::<AppState>() else { return };
+    let settings = config_from_path(&state.config_path).settings;
+    let wanted = events
+        .iter()
+        .filter(|event| monitor::should_notify(&settings.notifications, event))
+        .collect::<Vec<_>>();
+    if wanted.is_empty() {
+        return;
+    }
+    use tauri_plugin_notification::NotificationExt;
+    for body in monitor::notification_bodies(&settings.language, &wanted) {
+        let _ = app.notification().builder().title("Windows Network Manager").body(body).show();
     }
 }
 
@@ -357,11 +387,13 @@ pub fn run() {
         Err(error) => { eprintln!("Cannot initialize the single-instance guard: {error}"); return; }
     };
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
             fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
             let config_path = config_dir.join(CONFIG_FILE);
             let cache_path = config_dir.join(CACHE_FILE);
+            let network_monitor = monitor::Monitor::new(config_dir.join(EVENTS_FILE));
             let initial_rules = wifi_auto_rules(&config_from_path(&config_path)).unwrap_or_default();
             let event_app = app.handle().clone();
             let supervisor = AutoConnectSupervisor::new(Arc::new(wifi_windows::WindowsWifi), move |status| {
@@ -376,7 +408,12 @@ pub fn run() {
                 config_lock: Mutex::new(()),
                 tray_items: Mutex::new(None),
                 wifi_auto_supervisor: supervisor,
+                monitor: network_monitor.clone(),
             });
+            let monitor_app = app.handle().clone();
+            network_monitor
+                .spawn(move |events| on_network_events(&monitor_app, events))
+                .map_err(|e| e.to_string())?;
             let language = config_from_path(&app.state::<AppState>().config_path).settings.language;
             let (open_label, quit_label) = tray_labels(&language);
             let open = MenuItem::with_id(app, "tray-open", open_label, true, None::<&str>)?;
@@ -390,7 +427,7 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "tray-open" => show_main_window(app),
-                    "tray-quit" => { app.state::<AppState>().wifi_auto_supervisor.stop_all(); app.exit(0); },
+                    "tray-quit" => { stop_workers(app); app.exit(0); },
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -460,6 +497,9 @@ pub fn run() {
             cancel_trace,
             get_active_connections,
             scan_wifi_networks,
+            get_monitor_snapshot,
+            get_network_events,
+            clear_network_events,
             restart_as_administrator
         ])
         .run(tauri::generate_context!())
@@ -2283,6 +2323,7 @@ fn update_settings(app: AppHandle, state: State<AppState>, settings: Settings) -
         theme,
         show_system_interfaces: settings.show_system_interfaces,
         show_all_routes: settings.show_all_routes,
+        notifications: settings.notifications,
     };
     persist(&state, &cfg)?;
     if let Ok(items) = state.tray_items.lock() {
@@ -3031,6 +3072,25 @@ async fn scan_wifi_networks(adapter_guid: String) -> AppResult<Value> {
     blocking(move || wifi_windows::scan_networks(&adapter_guid).map_err(|message| err("WIFI_SCAN_FAILED", message))).await
 }
 
+// ---- Monitoring (read-only background sampling) ----
+
+#[tauri::command]
+fn get_monitor_snapshot(state: State<AppState>) -> Value {
+    state.monitor.snapshot()
+}
+
+#[tauri::command]
+fn get_network_events(state: State<AppState>) -> Value {
+    json!({"events":state.monitor.events(),"max":monitor::MAX_EVENTS})
+}
+
+// Configuration-only write: clears the local event history.
+#[tauri::command]
+fn clear_network_events(state: State<AppState>) -> Value {
+    state.monitor.clear_events();
+    json!({"cleared":true})
+}
+
 #[tauri::command]
 fn get_diagnostics(state: State<AppState>) -> AppResult<Value> {
     let overview = get_network_overview()?;
@@ -3096,7 +3156,7 @@ fn restart_as_administrator(app: AppHandle) -> AppResult<Value> {
             json!({"shellExecuteCode":result as isize,"hint":"Accept the Windows UAC prompt. Installation in a user folder is supported."}),
         ));
     }
-    app.state::<AppState>().wifi_auto_supervisor.stop_all();
+    stop_workers(&app);
     app.exit(0);
     Ok(json!({"started":true}))
 }

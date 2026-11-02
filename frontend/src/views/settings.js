@@ -3,11 +3,31 @@ import { icon } from "../icons.js";
 import { cardHeader, segmented, switchInput } from "../ui.js";
 
 const shortcuts = [
-  ["Ctrl+1 … Ctrl+7", "shortcutViews"],
+  ["Ctrl+1 … Ctrl+9", "shortcutViews"],
   ["F5", "shortcutRefresh"],
   ["/", "shortcutSearch"],
   ["Esc", "shortcutClose"],
 ];
+
+/** Opt-in tray notifications for network events (shared with Monitor). */
+export function renderNotificationSettings(app) {
+  const options = app.settings.notifications || {};
+  const row = (key, label, help) => html`<div class="setting-row">
+    <div><strong>${app.t(label)}</strong><small>${app.t(help)}</small></div>
+    ${switchInput(Boolean(options[key]), "", (checked) => app.updateNotifications({ [key]: checked }), !options.enabled)}
+  </div>`;
+  return html`<section class="card">
+    ${cardHeader(app.t("notifications"), app.t("notificationsHelp"))}
+    <div class="setting-row">
+      <div><strong>${app.t("notificationsEnabled")}</strong><small>${app.t("notificationsEnabledHelp")}</small></div>
+      ${switchInput(Boolean(options.enabled), "", (checked) => app.updateNotifications({ enabled: checked }))}
+    </div>
+    ${row("adapters", "notifyAdapters", "notifyAdaptersHelp")}
+    ${row("wifi", "notifyWifi", "notifyWifiHelp")}
+    ${row("defaultRoute", "notifyDefaultRoute", "notifyDefaultRouteHelp")}
+    ${row("tunnels", "notifyTunnels", "notifyTunnelsHelp")}
+  </section>`;
+}
 
 export function renderSettings(app) {
   return html`<div class="stack settings">
@@ -53,6 +73,7 @@ export function renderSettings(app) {
         )}
       </div>
     </section>
+    ${renderNotificationSettings(app)}
     <section class="card">
       ${cardHeader(app.t("keyboardShortcuts"))}
       <dl class="shortcut-list">

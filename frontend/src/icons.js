@@ -12,6 +12,7 @@ const paths = {
   profiles: "M3 4h18v4H3zM5 8v12h14V8M10 12h4",
   diagnostics: "M3 12h4l2-6 4 12 2-6h6",
   tools: "M14.5 4a4.5 4.5 0 0 0-4.2 6.1L4 16.4V20h3.6l6.3-6.3A4.5 4.5 0 0 0 20 9.5l-2.8 2.8-3.5-3.5L16.5 6A4.5 4.5 0 0 0 14.5 4z",
+  monitor: "M3 20h18M5 16l4-5 4 3 6-8M17 6h2v2",
   maintenance: "M9 14 4 9l5-5M4 9h10a6 6 0 0 1 0 12h-3",
   settings:
     "M4 6h9M17 6h3M15 4v4M4 12h3M11 12h9M9 10v4M4 18h11M19 18h1M17 16v4",

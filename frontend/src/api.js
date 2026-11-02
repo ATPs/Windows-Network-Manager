@@ -71,5 +71,8 @@ export const api = {
   cancelTrace: () => call("cancel_trace"),
   activeConnections: () => call("get_active_connections"),
   scanWifi: (adapterGuid) => call("scan_wifi_networks", { adapterGuid }),
+  monitorSnapshot: () => call("get_monitor_snapshot"),
+  networkEvents: () => call("get_network_events"),
+  clearNetworkEvents: () => call("clear_network_events"),
   restartAsAdmin: () => call("restart_as_administrator"),
 };
