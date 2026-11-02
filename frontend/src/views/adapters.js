@@ -500,23 +500,23 @@ function renderAdapterBody(app, item) {
         </section>`
       : !item.systemInterface
       ? html`<section class="detail-section span-2 advanced">
-          <h4>${icon("power")}${app.t("advanced")}</h4>
+          <h4>${icon("power")}${app.tf("adapterPowerOf", { name: item.alias })}</h4>
           <div class="advanced-row">
-            <p class="help-text">${app.t(disabled ? "enableHelp" : "disableHelp")}</p>
+            <p class="help-text">${app.tf(disabled ? "enableHelp" : "disableHelp", { name: item.alias })}</p>
             ${disabled
               ? html`<button
                   class="standard"
                   ?disabled=${!app.privilege.isAdmin || adapterBusy}
                   @click=${() => app.adapterAction(item, "enable")}
                 >
-                  ${buttonContent(adapterBusy, "power", app.t("enable"))}
+                  ${buttonContent(adapterBusy, "power", app.tf("enableNamed", { name: item.alias }))}
                 </button>`
               : html`<button
                   class="danger"
                   ?disabled=${!app.privilege.isAdmin || adapterBusy}
                   @click=${() => app.adapterAction(item, "disable")}
                 >
-                  ${buttonContent(adapterBusy, "power", app.t("disable"))}
+                  ${buttonContent(adapterBusy, "power", app.tf("disableNamed", { name: item.alias }))}
                 </button>`}
           </div>
           ${disabled ? nothing : renderQuickFixes(app, item)}

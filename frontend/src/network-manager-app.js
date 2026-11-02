@@ -833,7 +833,7 @@ export class NetworkManagerApp extends LitElement {
     );
     if (preview)
       this.requestConfirmation(
-        [`${item.alias} (#${item.interfaceIndex})`, ...this.warningsOf(preview)],
+        [`${item.alias} (#${item.interfaceIndex})`, this.tf("powerOnlyThis", { name: item.alias }), ...this.warningsOf(preview)],
         () =>
           this.run(
             key,
@@ -847,8 +847,8 @@ export class NetworkManagerApp extends LitElement {
           ),
         true,
         {
-          title: this.t(action === "enable" ? "confirmEnableTitle" : "confirmDisableTitle"),
-          confirmLabel: this.t(action),
+          title: this.tf(action === "enable" ? "confirmEnableTitle" : "confirmDisableTitle", { name: item.alias }),
+          confirmLabel: this.tf(action === "enable" ? "enableNamed" : "disableNamed", { name: item.alias }),
         },
       );
   }

@@ -2,7 +2,7 @@ import { html, nothing } from "lit";
 import { keyed } from "lit/directives/keyed.js";
 import { icon } from "../icons.js";
 import { isIpv4, isIpv4Cidr, isIpv6, isIpv6Cidr, routeIdentity } from "../format.js";
-import { buttonContent, chip, emptyState, segmented, skeletonRows, switchInput } from "../ui.js";
+import { buttonContent, cardHeader, chip, emptyState, segmented, skeletonRows, switchInput } from "../ui.js";
 
 function sortHeader(app, key, label) {
   const active = app.routeSort.key === key;
