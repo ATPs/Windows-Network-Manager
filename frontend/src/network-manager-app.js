@@ -24,6 +24,7 @@ import { renderTools } from "./views/tools.js";
 import { renderMonitor } from "./views/monitor.js";
 import { renderIpDrawer } from "./views/ip-editor.js";
 import { renderHosts } from "./views/hosts.js";
+import { renderApps, normalizeProgramEntry, appRuleErrors } from "./views/apps.js";
 import { renderMaintenance } from "./views/maintenance.js";
 import { renderSettings } from "./views/settings.js";
 
@@ -34,6 +35,7 @@ export const views = [
   "profiles",
   "diagnostics",
   "tools",
+  "apps",
   "monitor",
   "hosts",
   "maintenance",
@@ -46,6 +48,7 @@ const viewRenderers = {
   profiles: renderProfiles,
   diagnostics: renderDiagnostics,
   tools: renderTools,
+  apps: renderApps,
   monitor: renderMonitor,
   hosts: renderHosts,
   maintenance: renderMaintenance,
@@ -185,6 +188,11 @@ export class NetworkManagerApp extends LitElement {
     this.vpn = null;
     this.domainDraft = { domain: "", nextHop: "", interfaceIndex: "", routeMetric: "5" };
     this.hosts = null;
+    this.appRules = null;
+    this.appRuleDraft = null;
+    this.runningPrograms = null;
+    this.portCheck = null;
+    this.appRulesOthersDirect = readStorage("wnm-app-rules-others-direct") === "1";
     this.hostsEdit = null;
     this.refreshTimer = null;
     this.clockTimer = null;
@@ -501,6 +509,7 @@ export class NetworkManagerApp extends LitElement {
       ["vpn:", "vpnConnections"],
       ["domain:", "domainRoutes"],
       ["hosts", "hosts"],
+      ["apps:", "apps"],
       ["revert:keep", "keepSettings"],
       ["revert:now", "revertNow"],
     ];
@@ -606,6 +615,7 @@ export class NetworkManagerApp extends LitElement {
     writeStorage("wnm-view", view);
     this.syncMonitorPolling();
     if (view === "hosts" && !this.hosts) this.loadHosts();
+    if (view === "apps" && !this.appRules) this.loadAppRules();
     this.requestUpdate();
     this.updateComplete.then(() =>
       this.querySelector("main")?.scrollTo?.({ top: 0 }),
@@ -1914,6 +1924,158 @@ export class NetworkManagerApp extends LitElement {
       },
       true,
       { title: this.t(mode === "remove" ? "confirmDomainRemoveTitle" : "confirmDomainTitle"), confirmLabel: this.t(mode === "remove" ? "remove" : "apply"), rows },
+    );
+  }
+
+  // ---- Per-app rules (v2rayN) ---------------------------------------------
+
+  async loadAppRules() {
+    const result = await this.preview("apps:load", () => api.appRules(this.appRulesOthersDirect));
+    if (result) {
+      this.appRules = result;
+      this.requestUpdate();
+    }
+  }
+
+  setAppRulesOthersDirect(enabled) {
+    this.appRulesOthersDirect = Boolean(enabled);
+    writeStorage("wnm-app-rules-others-direct", enabled ? "1" : "0");
+    this.loadAppRules();
+  }
+
+  newAppRule() {
+    const id = `rule-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    this.appRuleDraft = {
+      id,
+      name: "",
+      programs: [],
+      target: "proxy",
+      localProxy: { protocol: "socks", host: ["127", "0", "0", "1"].join("."), port: "" },
+      enabled: true,
+      entry: "",
+      isNew: true,
+    };
+    this.portCheck = null;
+    this.requestUpdate();
+  }
+
+  editAppRule(rule) {
+    this.appRuleDraft = {
+      ...rule,
+      programs: [...rule.programs],
+      localProxy: rule.localProxy
+        ? { ...rule.localProxy, port: String(rule.localProxy.port) }
+        : { protocol: "socks", host: ["127", "0", "0", "1"].join("."), port: "" },
+      entry: "",
+      isNew: false,
+    };
+    this.portCheck = null;
+    this.requestUpdate();
+  }
+
+  closeAppRuleDraft() {
+    this.appRuleDraft = null;
+    this.portCheck = null;
+    this.requestUpdate();
+  }
+
+  updateAppRuleDraft(change) {
+    if (!this.appRuleDraft) return;
+    this.appRuleDraft = { ...this.appRuleDraft, ...change };
+    if (change.localProxy) this.portCheck = null;
+    this.requestUpdate();
+  }
+
+  /** Adds a program entry; a typed file name takes the exact case of a running program. */
+  addAppRuleProgram(entry) {
+    const draft = this.appRuleDraft;
+    let program = normalizeProgramEntry(entry);
+    if (!draft || !program) return false;
+    if (!program.includes("/")) {
+      const running = (this.runningPrograms || []).find((item) => item.name.toLowerCase() === program.toLowerCase());
+      if (running) program = running.name;
+    }
+    if (!draft.programs.includes(program)) draft.programs = [...draft.programs, program];
+    draft.entry = "";
+    this.requestUpdate();
+    return true;
+  }
+
+  removeAppRuleProgram(program) {
+    if (!this.appRuleDraft) return;
+    this.appRuleDraft.programs = this.appRuleDraft.programs.filter((item) => item !== program);
+    this.requestUpdate();
+  }
+
+  /** Replaces a program path with its folder, which also matches helper programs there. */
+  useProgramFolder(program) {
+    const draft = this.appRuleDraft;
+    if (!draft || !program.includes("/") || program.endsWith("/")) return;
+    const folder = program.slice(0, program.lastIndexOf("/") + 1);
+    draft.programs = [...new Set(draft.programs.map((item) => (item === program ? folder : item)))];
+    this.requestUpdate();
+  }
+
+  async browseProgram() {
+    const result = await this.preview("apps:pick", () => api.pickProgram());
+    if (result?.path) this.addAppRuleProgram(result.path);
+  }
+
+  async loadRunningPrograms() {
+    const result = await this.preview("apps:running", () => api.runningPrograms());
+    if (result) {
+      this.runningPrograms = result.programs || [];
+      this.requestUpdate();
+    }
+  }
+
+  async checkLocalProxyPort() {
+    const port = Number(this.appRuleDraft?.localProxy?.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return;
+    const result = await this.preview("apps:port", () => api.checkLocalProxy(port));
+    if (result) {
+      this.portCheck = { port, ...result };
+      this.requestUpdate();
+    }
+  }
+
+  appRuleInput(draft) {
+    const rule = {
+      id: draft.id,
+      name: draft.name.trim(),
+      programs: draft.programs,
+      target: draft.target,
+      enabled: draft.enabled !== false,
+    };
+    if (draft.target === "local")
+      rule.localProxy = {
+        protocol: draft.localProxy.protocol,
+        host: draft.localProxy.host.trim(),
+        port: Number(draft.localProxy.port),
+      };
+    return rule;
+  }
+
+  async saveAppRule(rule = null) {
+    const input = rule || (this.appRuleDraft && this.appRuleInput(this.appRuleDraft));
+    if (!input || (!rule && Object.keys(appRuleErrors(this.appRuleDraft)).length)) return;
+    const result = await this.run("apps:save", () => api.saveAppRule(input), [], `${this.t("appRules")} · ${input.name}`);
+    if (result) {
+      if (!rule) this.appRuleDraft = null;
+      this.portCheck = null;
+      await this.loadAppRules();
+    }
+  }
+
+  removeAppRule(rule) {
+    this.requestConfirmation(
+      [rule.name, ...rule.programs],
+      async () => {
+        const result = await this.run(`apps:remove:${rule.id}`, () => api.removeAppRule(rule.id), [], `${this.t("remove")} · ${rule.name}`);
+        if (result) await this.loadAppRules();
+      },
+      true,
+      { title: this.t("removeAppRuleTitle"), confirmLabel: this.t("remove") },
     );
   }
 

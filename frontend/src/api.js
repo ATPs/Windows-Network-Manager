@@ -111,6 +111,12 @@ export const api = {
   applyDomainRoute: (plan, confirmationToken) =>
     call("apply_domain_route", { input: { plan, confirmationToken } }),
   hostsFile: () => call("get_hosts_file"),
+  appRules: (othersDirect = false) => call("get_app_rules", { othersDirect }),
+  saveAppRule: (rule) => call("save_app_rule", { rule }),
+  removeAppRule: (id) => call("remove_app_rule", { id }),
+  pickProgram: () => call("pick_program"),
+  runningPrograms: () => call("list_running_programs"),
+  checkLocalProxy: (port) => call("check_local_proxy", { port }),
   previewHostsChange: (input) => call("preview_hosts_change", { input }),
   applyHostsChange: (input, confirmationToken) =>
     call("apply_hosts_change", { input: { ...input, confirmationToken } }),

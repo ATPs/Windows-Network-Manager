@@ -2134,3 +2134,36 @@ dialog.drawer[open] {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ---- Per-app rules --------------------------------------------------------- */
+.app-rule-editor .field {
+  margin-bottom: 14px;
+}
+.app-rule-editor .row-list {
+  margin-bottom: 8px;
+}
+.app-rule .list-main small {
+  overflow-wrap: anywhere;
+}
+.local-proxy-form {
+  flex-wrap: wrap;
+}
+.local-proxy-form input {
+  flex: 1 1 140px;
+}
+.steps {
+  display: grid;
+  gap: 12px;
+  margin: 12px 0;
+  padding-left: 22px;
+}
+.copy-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.copy-row code {
+  overflow-wrap: anywhere;
+}

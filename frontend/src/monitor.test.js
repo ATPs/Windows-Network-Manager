@@ -61,8 +61,8 @@ describe("chart helpers", () => {
 });
 
 describe("Monitor page", () => {
-  it("follows Tools in the navigation", () => {
-    expect(views.indexOf("monitor")).toBe(views.indexOf("tools") + 1);
+  it("follows Tools and Per-app in the navigation", () => {
+    expect(views.indexOf("monitor")).toBe(views.indexOf("apps") + 1);
     expect(app().t("monitor")).toBe("Monitor");
   });
 

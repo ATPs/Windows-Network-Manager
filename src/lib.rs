@@ -1,4 +1,5 @@
 mod advanced;
+mod app_rules;
 mod app_automation;
 mod coexistence;
 mod config_edit;
@@ -165,6 +166,8 @@ struct AppConfig {
     network_triggers: Vec<Value>,
     #[serde(default)]
     domain_routes: Vec<Value>,
+    #[serde(default)]
+    app_rules: Vec<Value>,
 }
 fn schema_version() -> u32 {
     3
@@ -182,6 +185,7 @@ impl Default for AppConfig {
             wifi_auto_connect: vec![],
             network_triggers: vec![],
             domain_routes: vec![],
+            app_rules: vec![],
         }
     }
 }
@@ -546,6 +550,12 @@ pub fn run() {
             advanced::preview_domain_route,
             advanced::apply_domain_route,
             advanced::get_hosts_file,
+            app_rules::get_app_rules,
+            app_rules::save_app_rule,
+            app_rules::remove_app_rule,
+            app_rules::pick_program,
+            app_rules::list_running_programs,
+            app_rules::check_local_proxy,
             advanced::preview_hosts_change,
             advanced::apply_hosts_change,
             restart_as_administrator
@@ -572,13 +582,14 @@ fn run_powershell_json(script: &str, input: Option<&Value>) -> AppResult<Value> 
             .flat_map(|x| x.to_le_bytes())
             .collect::<Vec<_>>(),
     );
+    // CREATE_NO_WINDOW already hides the console. "-WindowStyle Hidden" is not
+    // passed: it makes PowerShell look for a console window, and on some PCs
+    // that stalls for 30 seconds and then fails.
     let mut command = hidden_command("powershell.exe");
     command.args([
         "-NoLogo",
         "-NoProfile",
         "-NonInteractive",
-        "-WindowStyle",
-        "Hidden",
         "-EncodedCommand",
         &encoded,
     ]);

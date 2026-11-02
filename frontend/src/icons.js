@@ -14,6 +14,7 @@ const paths = {
   tools: "M14.5 4a4.5 4.5 0 0 0-4.2 6.1L4 16.4V20h3.6l6.3-6.3A4.5 4.5 0 0 0 20 9.5l-2.8 2.8-3.5-3.5L16.5 6A4.5 4.5 0 0 0 14.5 4z",
   monitor: "M3 20h18M5 16l4-5 4 3 6-8M17 6h2v2",
   hosts: "M6 3h9l4 4v14H6zM14 3v5h5M9 12h7M9 16h7",
+  apps: "M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 17h6M17 14v6",
   maintenance: "M9 14 4 9l5-5M4 9h10a6 6 0 0 1 0 12h-3",
   settings:
     "M4 6h9M17 6h3M15 4v4M4 12h3M11 12h9M9 10v4M4 18h11M19 18h1M17 16v4",
