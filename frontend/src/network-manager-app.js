@@ -1342,9 +1342,10 @@ export class NetworkManagerApp extends LitElement {
                 <small class="side-action">${this.t("restartAdmin")}</small>
               </div>
             </button>`}
-        <div
-          class="side-status"
-          title=${activeRules ? this.tf("autoActiveCount", { count: activeRules }) : this.t("autoNone")}
+        <button
+          class="side-status side-auto"
+          aria-describedby="side-auto-tip"
+          @click=${() => this.goToAdapters("wifi")}
         >
           ${icon("wifi")}
           <div class="nav-label">
@@ -1355,7 +1356,13 @@ export class NetworkManagerApp extends LitElement {
                 : this.t("autoNone")}</small
             >
           </div>
-        </div>
+          <div class="side-tip" id="side-auto-tip" role="tooltip">
+            <strong>${this.t("wifiAutoConnect")}</strong>
+            <p>${this.t("autoTipWhat")}</p>
+            <p>${this.t("autoTipHow")}</p>
+            <p class="side-tip-note">${this.t("autoTipTray")}</p>
+          </div>
+        </button>
         ${navButton("settings")}
       </div>
     </aside>`;

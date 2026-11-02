@@ -519,6 +519,42 @@ button.side-status .icon {
 .side-action {
   color: var(--accent) !important;
 }
+button.side-auto {
+  position: relative;
+  cursor: pointer;
+}
+button.side-auto .icon {
+  color: var(--accent);
+}
+.side-tip {
+  position: absolute;
+  left: calc(100% + 8px);
+  bottom: 0;
+  z-index: 20;
+  display: none;
+  width: 280px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.25);
+  color: var(--text-2);
+  font-size: 0.86rem;
+  font-weight: 400;
+  line-height: 1.45;
+  text-align: left;
+  pointer-events: none;
+}
+.side-tip p {
+  margin: 6px 0 0;
+}
+.side-tip .side-tip-note {
+  color: var(--muted);
+}
+button.side-auto:hover .side-tip,
+button.side-auto:focus-visible .side-tip {
+  display: block;
+}
 .side-status strong,
 .side-status small {
   display: block;
