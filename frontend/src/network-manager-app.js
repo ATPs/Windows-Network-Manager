@@ -167,6 +167,7 @@ export class NetworkManagerApp extends LitElement {
       hover: null,
     };
     this.monitorTimer = null;
+    this.startup = null;
     this.refreshTimer = null;
     this.clockTimer = null;
     this.onVisibilityChange = () => {
@@ -254,6 +255,7 @@ export class NetworkManagerApp extends LitElement {
       this.applyTheme();
       this.requestUpdate();
       this.syncMonitorPolling();
+      this.loadStartupStatus();
       this.refreshConfig().catch(() => {});
       await this.refresh(["interfaces", "routes"]);
       this.scheduleRefresh();
@@ -465,6 +467,11 @@ export class NetworkManagerApp extends LitElement {
       ["reset", "undoLastChange"],
       ["defaults", "restoreDefaults"],
       ["elevation", "restartAdmin"],
+      ["fix:flushDns", "flushDns"],
+      ["fix:renewDhcp", "renewDhcp"],
+      ["fix:restartAdapter", "restartAdapter"],
+      ["startup", "startWithWindows"],
+      ["import", "importConfig"],
     ];
     const match = labels.find(([prefix]) => key.startsWith(prefix));
     return match ? this.t(match[1]) : key;
@@ -1385,6 +1392,88 @@ export class NetworkManagerApp extends LitElement {
       this.tools.wifiScan = result;
       this.requestUpdate();
     }
+  }
+
+  // ---- Quick fixes and app automation ------------------------------------
+
+  async quickFix(action, item = null) {
+    const key = item ? `fix:${action}:${item.interfaceIndex}` : `fix:${action}`;
+    const preview = await this.preview(`${key}:preview`, () =>
+      api.previewQuickFix({ action, interfaceIndex: item?.interfaceIndex ?? null }),
+    );
+    if (!preview) return;
+    const adapterScoped = action !== "flushDns";
+    this.requestConfirmation(
+      [item ? `${item.alias} (#${item.interfaceIndex})` : "", ...this.warningsOf(preview)],
+      () =>
+        this.run(
+          key,
+          () => api.applyQuickFix(preview.fix, preview.confirmationToken),
+          adapterScoped ? ["interfaces", "routes"] : [],
+          `${this.t(action)}${item ? ` · ${item.alias}` : ""}`,
+        ),
+      adapterScoped,
+      { title: this.t(`${action}Title`), confirmLabel: this.t(action) },
+    );
+  }
+
+  async loadStartupStatus() {
+    try {
+      this.startup = await api.startupStatus();
+      this.requestUpdate();
+    } catch {
+      // Startup status is unavailable outside the Tauri runtime.
+    }
+  }
+
+  async setStartWithWindows(enabled) {
+    const result = await this.run(
+      "startup",
+      () => api.setStartWithWindows(enabled),
+      [],
+      this.t("startWithWindows"),
+    );
+    if (result) {
+      this.startup = result;
+      this.requestUpdate();
+    }
+  }
+
+  async exportConfig() {
+    const result = await this.preview("export", () => api.exportConfig());
+    if (result?.exported) this.notify(this.summaryOf(result), "success");
+  }
+
+  async importConfig() {
+    const preview = await this.preview("import:preview", () => api.importConfigPreview());
+    if (!preview || preview.cancelled) return;
+    const summary = preview.summary || {};
+    const rows = [
+      summary.settings ? { label: this.t("settings"), after: this.t("importReplaced") } : null,
+      summary.profilesAdded ? { label: this.t("savedProfiles"), after: this.tf("importAdded", { count: summary.profilesAdded }), kind: "add" } : null,
+      summary.profilesReplaced ? { label: this.t("savedProfiles"), after: this.tf("importReplacedCount", { count: summary.profilesReplaced }) } : null,
+      summary.rules ? { label: this.t("wifiAutoConnect"), after: this.tf("importRules", { count: summary.rules }) } : null,
+    ].filter(Boolean);
+    this.requestConfirmation(
+      [preview.fileName || "", this.t("importHelp")],
+      async () => {
+        const result = await this.run(
+          "import",
+          () => api.importConfigApply(preview.import, preview.confirmationToken),
+          [],
+          this.t("importConfig"),
+        );
+        if (result?.settings) {
+          this.settings = { ...this.settings, ...result.settings };
+          this.settings.notifications = { ...defaultNotifications, ...(result.settings.notifications || {}) };
+          this.applyTheme();
+          await this.loadWifiAutoStatus();
+          this.requestUpdate();
+        }
+      },
+      false,
+      { title: this.t("importConfigTitle"), confirmLabel: this.t("importConfig"), rows },
+    );
   }
 
   // ---- Monitoring (read-only) --------------------------------------------

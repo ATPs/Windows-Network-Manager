@@ -13,7 +13,22 @@ export function renderMaintenance(app) {
     app.defaultsSelection = new Set(value ? candidates.map((item) => item.interfaceIndex) : []);
     app.requestUpdate();
   };
+  const flushBusy = app.isBusy("fix:flushDns") || app.isBusy("fix:flushDns:preview");
   return html`<div class="stack">
+    <section class="card recovery-card">
+      <span class="recovery-icon">${icon("refresh")}</span>
+      <div class="recovery-main">
+        ${cardHeader(app.t("quickFixes"), app.t("quickFixesHelp"))}
+        <div class="button-row">
+          <button class="standard" ?disabled=${flushBusy} @click=${() => app.quickFix("flushDns")}>
+            ${buttonContent(flushBusy, "refresh", app.t("flushDns"))}
+          </button>
+          <button class="subtle" @click=${() => app.goToAdapters("connected")}>
+            ${app.t("adapterQuickFixes")}${icon("chevronRight")}
+          </button>
+        </div>
+      </div>
+    </section>
     ${!app.privilege.isAdmin
       ? html`<p class="permission-note">${icon("shield")}${app.t("recoveryPermissionHelp")}</p>`
       : nothing}

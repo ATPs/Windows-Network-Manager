@@ -74,5 +74,14 @@ export const api = {
   monitorSnapshot: () => call("get_monitor_snapshot"),
   networkEvents: () => call("get_network_events"),
   clearNetworkEvents: () => call("clear_network_events"),
+  previewQuickFix: (input) => call("preview_quick_fix", { input }),
+  applyQuickFix: (fix, confirmationToken) =>
+    call("apply_quick_fix", { input: { fix, confirmationToken } }),
+  startupStatus: () => call("get_startup_status"),
+  setStartWithWindows: (enabled) => call("set_start_with_windows", { enabled }),
+  exportConfig: () => call("export_config"),
+  importConfigPreview: () => call("import_config_preview"),
+  importConfigApply: (data, confirmationToken) =>
+    call("import_config_apply", { input: { import: data, confirmationToken } }),
   restartAsAdmin: () => call("restart_as_administrator"),
 };

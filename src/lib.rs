@@ -1,7 +1,9 @@
+mod app_automation;
 mod coexistence;
 mod monitor;
 mod net_tools;
 mod network_insights;
+mod quick_fixes;
 mod wifi_auto_connect;
 mod wifi_windows;
 
@@ -388,6 +390,7 @@ pub fn run() {
     };
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
             fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
@@ -442,6 +445,11 @@ pub fn run() {
             app.state::<AppState>().wifi_auto_supervisor.apply_rules(runtime_auto_rules(&initial_rules))
                 .map_err(|e| e.to_string())?;
             schedule_tray_update(app.handle());
+            // The window starts hidden; a sign-in launch stays in the tray.
+            let args: Vec<String> = std::env::args().collect();
+            if !app_automation::started_minimized(&args) {
+                show_main_window(app.handle());
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -500,6 +508,13 @@ pub fn run() {
             get_monitor_snapshot,
             get_network_events,
             clear_network_events,
+            quick_fixes::preview_quick_fix,
+            quick_fixes::apply_quick_fix,
+            app_automation::get_startup_status,
+            app_automation::set_start_with_windows,
+            app_automation::export_config,
+            app_automation::import_config_preview,
+            app_automation::import_config_apply,
             restart_as_administrator
         ])
         .run(tauri::generate_context!())

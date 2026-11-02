@@ -73,6 +73,24 @@ export function renderSettings(app) {
         )}
       </div>
     </section>
+    <section class="card">
+      ${cardHeader(app.t("startup"))}
+      <div class="setting-row">
+        <div>
+          <strong>${app.t("startWithWindows")}</strong>
+          <small>${app.startup && !app.startup.available ? app.t("startupDevHelp") : app.t("startWithWindowsHelp")}</small>
+          ${app.startup?.enabled && !app.startup.matchesCurrent && app.startup.available
+            ? html`<small class="inline-error">${icon("warning")}${app.t("startupMismatch")}</small>`
+            : ""}
+        </div>
+        ${switchInput(
+          Boolean(app.startup?.enabled),
+          "",
+          (checked) => app.setStartWithWindows(checked),
+          !app.startup?.available || app.isBusy("startup"),
+        )}
+      </div>
+    </section>
     ${renderNotificationSettings(app)}
     <section class="card">
       ${cardHeader(app.t("keyboardShortcuts"))}

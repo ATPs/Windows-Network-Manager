@@ -328,6 +328,22 @@ function addressList(app, addresses) {
   >`;
 }
 
+function renderQuickFixes(app, item) {
+  const fixButton = (action, iconName) => {
+    const key = `fix:${action}:${item.interfaceIndex}`;
+    const busy = app.isBusy(key) || app.isBusy(`${key}:preview`);
+    return html`<button class="standard" ?disabled=${!app.privilege.isAdmin || busy} @click=${() => app.quickFix(action, item)}>
+      ${buttonContent(busy, iconName, app.t(action))}
+    </button>`;
+  };
+  return html`<div class="advanced-row">
+    <p class="help-text">${app.t("quickFixHelp")}</p>
+    <span class="button-row">
+      ${item.dhcpEnabled ? fixButton("renewDhcp", "refresh") : nothing} ${fixButton("restartAdapter", "power")}
+    </span>
+  </div>`;
+}
+
 function renderAdapterBody(app, item) {
   const disabled = isAdapterDisabled(item);
   const adapterBusy = app.isBusy(`adapter:${item.interfaceIndex}`);
@@ -389,6 +405,7 @@ function renderAdapterBody(app, item) {
                   ${buttonContent(adapterBusy, "power", app.t("disable"))}
                 </button>`}
           </div>
+          ${disabled ? nothing : renderQuickFixes(app, item)}
         </section>`
       : nothing}
   </div>`;

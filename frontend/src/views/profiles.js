@@ -49,7 +49,15 @@ export function renderProfiles(app) {
       >
         ${buttonContent(app.isBusy("profile"), "profiles", app.t("saveProfile"))}
       </button>
+      <span class="toolbar-spacer"></span>
+      <button class="subtle" ?disabled=${app.isBusy("import") || app.isBusy("import:preview")} @click=${() => app.importConfig()}>
+        ${buttonContent(app.isBusy("import:preview"), "save", app.t("importConfig"))}
+      </button>
+      <button class="subtle" ?disabled=${app.isBusy("export")} @click=${() => app.exportConfig()}>
+        ${buttonContent(app.isBusy("export"), "copy", app.t("exportConfig"))}
+      </button>
     </div>
+    <p class="help-text">${app.t("importExportHelp")}</p>
     ${!app.privilege.isAdmin
       ? html`<p class="permission-note">${icon("shield")}${app.t("restorePermissionHelp")}</p>`
       : nothing}
