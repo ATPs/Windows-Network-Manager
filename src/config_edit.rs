@@ -44,7 +44,27 @@ $ns=[string](Get-ItemProperty -LiteralPath ('HKLM:\SYSTEM\CurrentControlSet\Serv
 $d=@(Get-DnsClientServerAddress -InterfaceIndex $i -AddressFamily IPv4 -ErrorAction SilentlyContinue|ForEach-Object{$_.ServerAddresses}|ForEach-Object{[string]$_})
 [PSCustomObject]@{dhcp=([string]$ip.Dhcp -eq 'Enabled');addresses=$a;gateways=$g;dnsServers=$d;dnsStatic=($ns.Trim().Length -gt 0)}|ConvertTo-Json -Compress -Depth 4"#;
 
-const APPLY_IP_SCRIPT: &str = r#"function Set-Target($i,$t){
+/// IPv4/DNS state plus network category for several adapters in one call
+/// (network backups). Each adapter is read independently; a failure is
+/// reported for that adapter only.
+pub(crate) const IP_STATE_ALL_SCRIPT: &str = r#"$out=@()
+foreach($i in @($InputData.indexes)){
+  try {
+    $i=[int]$i
+    $ip=Get-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -ErrorAction Stop
+    $a=@(Get-NetIPAddress -InterfaceIndex $i -AddressFamily IPv4 -ErrorAction SilentlyContinue|Where-Object{[string]$_.PrefixOrigin -ne 'WellKnown'}|ForEach-Object{[PSCustomObject]@{ipAddress=[string]$_.IPAddress;prefixLength=[int]$_.PrefixLength;origin=[string]$_.PrefixOrigin}})
+    $g=@(Get-NetRoute -InterfaceIndex $i -AddressFamily IPv4 -DestinationPrefix "$([IPAddress]::Any)/0" -ErrorAction SilentlyContinue|ForEach-Object{[string]$_.NextHop}|Select-Object -Unique)
+    $guid=[string](Get-NetAdapter -IncludeHidden -InterfaceIndex $i -ErrorAction Stop).InterfaceGuid
+    $ns=[string](Get-ItemProperty -LiteralPath ('HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\'+$guid) -Name NameServer -ErrorAction SilentlyContinue).NameServer
+    $d=@(Get-DnsClientServerAddress -InterfaceIndex $i -AddressFamily IPv4 -ErrorAction SilentlyContinue|ForEach-Object{$_.ServerAddresses}|ForEach-Object{[string]$_})
+    $out+=[PSCustomObject]@{interfaceIndex=$i;state=[PSCustomObject]@{dhcp=([string]$ip.Dhcp -eq 'Enabled');addresses=$a;gateways=$g;dnsServers=$d;dnsStatic=($ns.Trim().Length -gt 0)}}
+  } catch {
+    $out+=[PSCustomObject]@{interfaceIndex=[int]$i;error=$_.Exception.Message}
+  }
+}
+ConvertTo-Json -InputObject @($out) -Compress -Depth 6"#;
+
+pub(crate) const APPLY_IP_SCRIPT: &str = r#"function Set-Target($i,$t){
   $v4=$t.ipv4
   if($v4){
     foreach($s in 'ActiveStore','PersistentStore'){Get-NetRoute -InterfaceIndex $i -AddressFamily IPv4 -DestinationPrefix "$([IPAddress]::Any)/0" -PolicyStore $s -ErrorAction SilentlyContinue|Where-Object{[string]$_.Protocol -eq 'NetMgmt'}|Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue}
@@ -77,7 +97,7 @@ catch {
 }
 [PSCustomObject]@{applied=$true}|ConvertTo-Json -Compress"#;
 
-const CATEGORY_SCRIPT: &str = r#"Set-NetConnectionProfile -InterfaceIndex ([int]$InputData.interfaceIndex) -NetworkCategory ([string]$InputData.category) -ErrorAction Stop
+pub(crate) const CATEGORY_SCRIPT: &str = r#"Set-NetConnectionProfile -InterfaceIndex ([int]$InputData.interfaceIndex) -NetworkCategory ([string]$InputData.category) -ErrorAction Stop
 [PSCustomObject]@{category=[string](Get-NetConnectionProfile -InterfaceIndex ([int]$InputData.interfaceIndex)).NetworkCategory}|ConvertTo-Json -Compress"#;
 
 // ---------------------------------------------------------------------------
@@ -316,6 +336,14 @@ fn address_answers_arp(address: &str) -> bool {
 }
 
 fn ip_notices(adapter: &Value, payload: &Value) -> Vec<Value> {
+    let mut notices = ip_change_notices(adapter, payload);
+    notices.push(revert_notice());
+    notices
+}
+
+/// Warnings for one adapter's IPv4/DNS change, without the revert notice
+/// (shared with network backup restores, which list several adapters).
+pub(crate) fn ip_change_notices(adapter: &Value, payload: &Value) -> Vec<Value> {
     let alias = field_string(adapter, "alias");
     let mut notices = vec![];
     let target_address = field_string(&payload["target"]["ipv4"], "address");
@@ -343,11 +371,10 @@ fn ip_notices(adapter: &Value, payload: &Value) -> Vec<Value> {
             "Name lookups on this adapter will use only the DNS servers you entered.",
         ));
     }
-    notices.push(revert_notice());
     notices
 }
 
-fn revert_notice() -> Value {
+pub(crate) fn revert_notice() -> Value {
     notice(
         "change.autoRevert",
         json!({"seconds":REVERT_SECONDS.to_string()}),
@@ -368,7 +395,7 @@ fn take_pending(id: u64) -> Option<Value> {
     }
 }
 
-fn ensure_no_pending_revert() -> AppResult<()> {
+pub(crate) fn ensure_no_pending_revert() -> AppResult<()> {
     match PENDING_REVERT.lock() {
         Ok(pending) if pending.is_none() => Ok(()),
         _ => Err(err("REVERT_PENDING", "Keep or revert the previous change before making another one.")),
@@ -377,7 +404,7 @@ fn ensure_no_pending_revert() -> AppResult<()> {
 
 /// Register `scope` for automatic restore after `REVERT_SECONDS` unless kept.
 /// The timer runs in Rust, so it also works if the window stops responding.
-fn schedule_revert(app: &AppHandle, scope: Value) -> Value {
+pub(crate) fn schedule_revert(app: &AppHandle, scope: Value) -> Value {
     let id = NEXT_REVERT.fetch_add(1, Ordering::SeqCst) + 1;
     if let Ok(mut pending) = PENDING_REVERT.lock() {
         *pending = Some((id, scope));
@@ -386,7 +413,7 @@ fn schedule_revert(app: &AppHandle, scope: Value) -> Value {
     thread::spawn(move || {
         thread::sleep(Duration::from_secs(REVERT_SECONDS));
         if let Some(scope) = take_pending(id) {
-            let results = restore_scope(&scope);
+            let results = crate::run_revert(&handle, &scope);
             let _ = handle.emit("config-reverted", json!({"revertId":id,"automatic":true,"results":results}));
         }
     });
@@ -404,10 +431,10 @@ pub fn keep_config_change(revert_id: u64) -> AppResult<Value> {
 }
 
 #[tauri::command]
-pub async fn revert_config_change(revert_id: u64) -> AppResult<Value> {
+pub async fn revert_config_change(app: AppHandle, revert_id: u64) -> AppResult<Value> {
     blocking(move || {
         let scope = take_pending(revert_id).ok_or_else(|| err("NOT_FOUND", "This change was already kept or reverted."))?;
-        let results = restore_scope(&scope);
+        let results = crate::run_revert(&app, &scope);
         let message = notice("change.reverted", json!({}), "The previous settings were restored.");
         Ok(json!({"reverted":true,"results":results,"message":message["text"],"messageCode":message}))
     })
@@ -654,9 +681,16 @@ fn prepare_category(input: &Value) -> AppResult<(Value, Vec<Value>)> {
     let index = valid_index(input.get("interfaceIndex").unwrap_or(&Value::Null))?;
     let adapter = live_adapter(index)?;
     let payload = category_payload(input, &adapter)?;
-    let alias = field_string(&adapter, "alias");
+    let mut notices = category_notices(&adapter, &field_string(&payload, "category"));
+    notices.push(revert_notice());
+    Ok((payload, notices))
+}
+
+/// Warnings for a network category change, without the revert notice.
+pub(crate) fn category_notices(adapter: &Value, category: &str) -> Vec<Value> {
+    let alias = field_string(adapter, "alias");
     let mut notices = vec![];
-    if field_string(&payload, "category") == "Private" {
+    if category == "Private" {
         notices.push(notice(
             "category.private",
             json!({"alias":alias}),
@@ -676,8 +710,7 @@ fn prepare_category(input: &Value) -> AppResult<(Value, Vec<Value>)> {
             format!("{alias} is managed by {owner}. {owner} may reset the category when it recreates the adapter."),
         ));
     }
-    notices.push(revert_notice());
-    Ok((payload, notices))
+    notices
 }
 
 #[tauri::command]

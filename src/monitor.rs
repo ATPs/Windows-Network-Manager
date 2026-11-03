@@ -1,6 +1,8 @@
-//! Background, read-only monitoring: traffic counters, Wi-Fi signal history
-//! and a persisted, capped history of network events. Sampling never changes
-//! the network and never contacts outside hosts.
+//! Background, read-only monitoring: traffic counters, Wi-Fi signal history,
+//! latency to the local gateway and DNS servers, a persisted, capped history
+//! of network events and saved per-minute history (see `monitor_history`).
+//! Sampling never changes the network; latency pings stay on the local
+//! network unless the user opts in to public DNS servers.
 //!
 //! Coexistence: tunnel traffic (EasyTier, v2rayN TUN, ...) is already counted
 //! on the physical adapter, so the total only sums hardware adapters. Tunnel
@@ -8,7 +10,13 @@
 //! events are marked `tunnel` and are not notified by default. A default
 //! route captured by a TUN (split `/1` routes) is one event, not one per route.
 
-use crate::{coexistence, network_insights::notice};
+use crate::{
+    arrays, coexistence,
+    latency::{self, Target},
+    monitor_history::{self, History, MonitorSettings},
+    net_tools::IcmpHandle,
+    network_insights::notice,
+};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -38,6 +46,10 @@ pub const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 const SLOW_EVERY: u64 = 5;
 const TRAFFIC_SAMPLES: usize = 150;
 const SIGNAL_SAMPLES: usize = 360;
+/// Live latency readings kept per target (15 minutes at 10 s).
+const LATENCY_SAMPLES: usize = 90;
+/// Latency targets are re-selected this often (adapters and DNS change).
+const LATENCY_RESELECT: Duration = Duration::from_secs(60);
 pub const MAX_EVENTS: usize = 500;
 /// More events than this in one check are notified as a single summary.
 const MAX_NOTIFICATIONS: usize = 3;
@@ -337,6 +349,13 @@ struct SignalSeries {
     samples: VecDeque<(u64, Option<u32>, Option<String>)>,
 }
 
+struct LatencySeries {
+    kind: &'static str,
+    address: String,
+    alias: String,
+    samples: VecDeque<(u64, Option<u32>)>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Counter {
     pub index: u32,
@@ -354,6 +373,7 @@ struct MonitorState {
     traffic: HashMap<String, Series>,
     total: VecDeque<[u64; 3]>,
     signal: HashMap<String, SignalSeries>,
+    latency: BTreeMap<String, LatencySeries>,
     events: Vec<Value>,
     observation: Option<Observation>,
     next_id: u64,
@@ -431,12 +451,13 @@ impl MonitorState {
 pub struct Monitor {
     events_path: PathBuf,
     state: Mutex<MonitorState>,
+    history: Mutex<History>,
     stop: Mutex<bool>,
     wake: Condvar,
 }
 
 impl Monitor {
-    pub fn new(events_path: PathBuf) -> Arc<Self> {
+    pub fn new(events_path: PathBuf, history: History) -> Arc<Self> {
         let events = fs::read_to_string(&events_path)
             .ok()
             .and_then(|text| serde_json::from_str::<Vec<Value>>(&text).ok())
@@ -445,6 +466,7 @@ impl Monitor {
         Arc::new(Self {
             events_path,
             state: Mutex::new(MonitorState { events: events[excess..].to_vec(), ..Default::default() }),
+            history: Mutex::new(history),
             stop: Mutex::new(false),
             wake: Condvar::new(),
         })
@@ -455,6 +477,8 @@ impl Monitor {
     where
         F: Fn(&[Value]) + Send + 'static,
     {
+        let pinger = Arc::clone(self);
+        thread::Builder::new().name("network-latency".into()).spawn(move || pinger.run_latency())?;
         let monitor = Arc::clone(self);
         thread::Builder::new().name("network-monitor".into()).spawn(move || {
             let started = Instant::now();
@@ -489,6 +513,123 @@ impl Monitor {
             *stop = true;
             self.wake.notify_all();
         }
+        // Keep the minute in progress.
+        if let Ok(mut history) = self.history.lock() {
+            let minute = history.acc.take();
+            history.write(minute);
+        }
+    }
+
+    /// Wait up to `duration`; false once the monitor is stopping.
+    fn pause(&self, duration: Duration) -> bool {
+        let Ok(stop) = self.stop.lock() else { return false };
+        if *stop {
+            return false;
+        }
+        match self.wake.wait_timeout(stop, duration) {
+            Ok((stop, _)) => !*stop,
+            Err(_) => false,
+        }
+    }
+
+    /// Latency loop: one echo per target per interval, on its own thread so
+    /// a slow reply never delays traffic sampling.
+    fn run_latency(&self) {
+        let handle = IcmpHandle::open().ok();
+        let mut targets: Vec<Target> = vec![];
+        let mut chosen: Option<(Instant, bool)> = None;
+        loop {
+            let settings = self.history.lock().map(|history| history.settings.clone()).unwrap_or_default();
+            match (&handle, settings.latency_enabled) {
+                (Some(handle), true) => {
+                    let stale = chosen.is_none_or(|(at, public)| at.elapsed() >= LATENCY_RESELECT || public != settings.latency_public_dns);
+                    if stale {
+                        targets = crate::native_network_overview()
+                            .map(|overview| latency::select_targets(&arrays(overview.get("interfaces")), settings.latency_public_dns))
+                            .unwrap_or_default();
+                        chosen = Some((Instant::now(), settings.latency_public_dns));
+                        self.keep_latency_targets(&targets);
+                    }
+                    for target in &targets {
+                        let rtt = latency::ping_once(handle, target);
+                        self.record_latency(target, rtt);
+                    }
+                }
+                _ => {
+                    chosen = None;
+                    self.keep_latency_targets(&[]);
+                }
+            }
+            if !self.pause(Duration::from_secs(u64::from(settings.latency_interval_seconds.max(10)))) {
+                return;
+            }
+        }
+    }
+
+    fn keep_latency_targets(&self, targets: &[Target]) {
+        if let Ok(mut state) = self.state.lock() {
+            state.latency.retain(|key, _| targets.iter().any(|target| format!("{}:{}", target.kind, target.address) == *key));
+        }
+    }
+
+    fn record_latency(&self, target: &Target, rtt: Option<u32>) {
+        let wall_ms = Utc::now().timestamp_millis().max(0) as u64;
+        let address = target.address.to_string();
+        if let Ok(mut state) = self.state.lock() {
+            let series = state.latency.entry(format!("{}:{address}", target.kind)).or_insert_with(|| LatencySeries {
+                kind: target.kind,
+                address: address.clone(),
+                alias: target.alias.clone(),
+                samples: VecDeque::new(),
+            });
+            series.alias = target.alias.clone();
+            push_capped(&mut series.samples, (wall_ms, rtt), LATENCY_SAMPLES);
+        }
+        if let Ok(mut history) = self.history.lock() {
+            let minute = history.acc.record_latency(wall_ms, target.kind, &address, &target.alias, rtt);
+            history.write(minute);
+        }
+    }
+
+    /// Apply new monitor settings (folder, retention, latency).
+    pub fn apply_settings(&self, settings: &MonitorSettings) {
+        if let Ok(mut history) = self.history.lock() {
+            history.apply_settings(settings.clone());
+        }
+        self.wake.notify_all();
+    }
+
+    /// The history folder in use, its default and its size.
+    pub fn storage_info(&self) -> Value {
+        let Ok(history) = self.history.lock() else { return json!({}) };
+        let default_path = history.default_path();
+        let mut info = monitor_history::storage_info(&history.storage, &default_path, history.settings.retention_days);
+        info["historyEnabled"] = json!(history.settings.history_enabled);
+        info
+    }
+
+    pub fn history_dir(&self) -> Option<PathBuf> {
+        self.history.lock().ok().map(|history| history.storage.path.clone())
+    }
+
+    /// Saved history for a range ("1h", "24h", "7d", "30d").
+    pub fn query_history(&self, range: &str, selected: &[String]) -> Option<Value> {
+        let seconds = monitor_history::range_seconds(range)?;
+        let dir = self.history_dir()?;
+        let to = Utc::now().timestamp() / 60 * 60 + 60;
+        let from = to - seconds;
+        let minutes = monitor_history::read_minutes(&dir, from, to);
+        let mut result = monitor_history::summarize(&minutes, from, to, selected);
+        result["range"] = json!(range);
+        result["storage"] = self.storage_info();
+        Some(result)
+    }
+
+    fn history_events(&self, wall_ms: u64, events: &[Value]) {
+        if let Ok(mut history) = self.history.lock() {
+            let minute = history.acc.record_events(wall_ms, events);
+            history.write(minute);
+        }
     }
 
     /// One sampling pass. With `proxy` set (every slow tick) this also checks
@@ -509,6 +650,18 @@ impl Monitor {
             });
             (wifi, read_default_route(&counters))
         });
+        if let Ok(mut history) = self.history.lock() {
+            let minute = history.acc.record_traffic(mono_ms, wall_ms, &counters);
+            history.write(minute);
+            if let Some((wifi, default_route)) = &slow {
+                for (key, (state, signal)) in wifi.iter().flat_map(|items| items.iter()) {
+                    let minute = history.acc.record_wifi(wall_ms, key, &state.alias, *signal, state.ssid.clone());
+                    history.write(minute);
+                }
+                let minute = history.acc.record_default_route(wall_ms, default_route.as_ref().map(|route| route.alias.clone()));
+                history.write(minute);
+            }
+        }
         let Ok(mut state) = self.state.lock() else { return vec![] };
         state.push_traffic(mono_ms, wall_ms, &counters);
         let Some((wifi, default_route)) = slow else { return vec![] };
@@ -535,6 +688,8 @@ impl Monitor {
         }
         let stamped = state.append_events(events);
         self.save(&state.events);
+        drop(state);
+        self.history_events(wall_ms, &stamped);
         stamped
     }
 
@@ -574,6 +729,7 @@ impl Monitor {
     }
 
     pub fn snapshot(&self) -> Value {
+        let settings = self.history.lock().map(|history| history.settings.clone()).unwrap_or_default();
         let Ok(state) = self.state.lock() else { return json!({}) };
         let mut interfaces = state
             .traffic
@@ -616,10 +772,26 @@ impl Monitor {
                 })
             })
             .collect::<Vec<_>>();
+        let latency = state
+            .latency
+            .values()
+            .map(|series| {
+                json!({
+                    "kind":series.kind,
+                    "address":series.address,
+                    "alias":series.alias,
+                    "samples":series.samples.iter().map(|(time, rtt)| json!([time, rtt])).collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
         json!({
             "intervalMs":SAMPLE_INTERVAL.as_millis() as u64,
             "traffic":{"total":state.total,"interfaces":interfaces},
             "signal":signal,
+            "latency":latency,
+            "latencyEnabled":settings.latency_enabled,
+            "latencyIntervalSeconds":settings.latency_interval_seconds,
+            "historyEnabled":settings.history_enabled,
             "eventCount":state.events.len()
         })
     }
@@ -823,10 +995,15 @@ mod tests {
         assert_eq!(event_text("en", &event), "WLAN switched from A to B.");
     }
 
+    fn history(dir: &std::path::Path) -> History {
+        History::new(dir.to_path_buf(), None, MonitorSettings { history_enabled: false, ..Default::default() })
+    }
+
     #[test]
     fn events_are_capped_and_persisted() {
         let path = std::env::temp_dir().join(format!("wnm-events-{}.json", Uuid::new_v4()));
-        let monitor = Monitor::new(path.clone());
+        let dir = std::env::temp_dir().join(format!("wnm-history-{}", Uuid::new_v4()));
+        let monitor = Monitor::new(path.clone(), history(&dir));
         let stamped = {
             let mut state = monitor.state.lock().unwrap();
             let stamped = state.append_events((0..MAX_EVENTS + 20).map(|index| json!({"kind":"adapter","text":index.to_string()})).collect());
@@ -837,10 +1014,11 @@ mod tests {
         let events = monitor.events();
         assert_eq!(events.len(), MAX_EVENTS);
         assert_eq!(events[0]["text"], (MAX_EVENTS + 19).to_string(), "newest first");
-        assert_eq!(Monitor::new(path.clone()).events().len(), MAX_EVENTS);
+        assert_eq!(Monitor::new(path.clone(), history(&dir)).events().len(), MAX_EVENTS);
         monitor.clear_events();
-        assert!(Monitor::new(path.clone()).events().is_empty());
+        assert!(Monitor::new(path.clone(), history(&dir)).events().is_empty());
         let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -1,10 +1,15 @@
 import { html } from "lit";
 import { icon } from "../icons.js";
-import { cardHeader, segmented, switchInput } from "../ui.js";
+import { buttonContent, cardHeader, segmented, switchInput } from "../ui.js";
+import { formatBytes } from "../format.js";
+
+/** Text size steps; Rust maps each to a webview zoom factor. */
+export const FONT_SIZES = ["small", "default", "large", "xlarge"];
 
 const shortcuts = [
   ["Ctrl+1 … Ctrl+9", "shortcutViews"],
   ["F5", "shortcutRefresh"],
+  ["Ctrl+= / Ctrl+- / Ctrl+0", "shortcutFontSize"],
   ["/", "shortcutSearch"],
   ["Esc", "shortcutClose"],
 ];
@@ -29,6 +34,73 @@ export function renderNotificationSettings(app) {
   </section>`;
 }
 
+const RETENTION_DAYS = [1, 7, 14, 30, 90, 180, 365];
+
+/** Saved monitor history: on/off, retention, latency and the storage folder. */
+export function renderMonitorHistorySettings(app) {
+  const options = app.settings.monitor || {};
+  const storage = app.monitor?.storage;
+  const update = (change) => app.updateMonitorSettings(change);
+  const sourceLabel = { install: "storageInstall", appData: "storageAppData", custom: "storageCustom" };
+  return html`<section class="card">
+    ${cardHeader(app.t("monitorHistorySettings"), app.t("monitorHistorySettingsHelp"))}
+    <div class="setting-row">
+      <div><strong>${app.t("historyEnabled")}</strong><small>${app.t("historyEnabledHelp")}</small></div>
+      ${switchInput(options.historyEnabled !== false, "", (checked) => update({ historyEnabled: checked }))}
+    </div>
+    <div class="setting-row">
+      <div><strong>${app.t("retention")}</strong><small>${app.t("retentionHelp")}</small></div>
+      <select
+        aria-label=${app.t("retention")}
+        @change=${(event) => update({ retentionDays: Number(event.target.value) })}
+      >
+        ${RETENTION_DAYS.map(
+          (days) => html`<option value=${days} ?selected=${(options.retentionDays ?? 30) === days}>${app.tf("retentionDays", { days })}</option>`,
+        )}
+      </select>
+    </div>
+    <div class="setting-row">
+      <div><strong>${app.t("latencyEnabled")}</strong><small>${app.t("latencyEnabledHelp")}</small></div>
+      ${switchInput(options.latencyEnabled !== false, "", (checked) => update({ latencyEnabled: checked }))}
+    </div>
+    <div class="setting-row">
+      <div><strong>${app.t("latencyInterval")}</strong><small>${app.t("latencyIntervalHelp")}</small></div>
+      ${segmented(
+        [10, 30, 60].map((seconds) => [seconds, app.tf("everySeconds", { seconds })]),
+        options.latencyIntervalSeconds ?? 10,
+        (seconds) => update({ latencyIntervalSeconds: seconds }),
+        app.t("latencyInterval"),
+      )}
+    </div>
+    <div class="setting-row">
+      <div><strong>${app.t("latencyPublicDns")}</strong><small>${app.t("latencyPublicDnsHelp")}</small></div>
+      ${switchInput(Boolean(options.latencyPublicDns), "", (checked) => update({ latencyPublicDns: checked }), options.latencyEnabled === false)}
+    </div>
+    <div class="setting-row storage-row">
+      <div>
+        <strong>${app.t("historyFolder")}</strong>
+        <small class="mono">${storage?.path || "—"}</small>
+        ${storage
+          ? html`<small>${app.t(sourceLabel[storage.source] || "storageAppData")} · ${app.tf("storageUsage", { size: formatBytes(storage.sizeBytes), days: storage.days })}</small>`
+          : ""}
+        ${storage?.fallbackReason
+          ? html`<small class="inline-error">${icon("warning")}${app.t(`storageFallback_${storage.fallbackReason}`)}</small>`
+          : ""}
+      </div>
+      <span class="button-row">
+        <button class="standard compact" ?disabled=${app.isBusy("monitor:folder")} @click=${() => app.chooseMonitorFolder()}>
+          ${buttonContent(app.isBusy("monitor:folder"), "profiles", app.t("changeFolder"))}
+        </button>
+        ${options.folder
+          ? html`<button class="standard compact" @click=${() => app.resetMonitorFolder()}>${app.t("useDefaultFolder")}</button>`
+          : ""}
+        <button class="standard compact" @click=${() => app.openMonitorFolder()}>${app.t("openFolder")}</button>
+        <button class="danger compact" ?disabled=${!storage?.days} @click=${() => app.clearMonitorHistory()}>${app.t("clearMonitorHistory")}</button>
+      </span>
+    </div>
+  </section>`;
+}
+
 export function renderSettings(app) {
   return html`<div class="stack settings">
     <section class="card">
@@ -44,6 +116,15 @@ export function renderSettings(app) {
           app.settings.theme,
           (theme) => app.updateSettings({ theme }),
           app.t("theme"),
+        )}
+      </div>
+      <div class="setting-row">
+        <div><strong>${app.t("fontSize")}</strong><small>${app.t("fontSizeHelp")}</small></div>
+        ${segmented(
+          FONT_SIZES.map((size) => [size, app.t(`fontSize_${size}`)]),
+          app.settings.fontSize || "default",
+          (fontSize) => app.updateSettings({ fontSize }),
+          app.t("fontSize"),
         )}
       </div>
       <div class="setting-row">
@@ -91,7 +172,7 @@ export function renderSettings(app) {
         )}
       </div>
     </section>
-    ${renderNotificationSettings(app)}
+    ${renderMonitorHistorySettings(app)} ${renderNotificationSettings(app)}
     <section class="card">
       ${cardHeader(app.t("keyboardShortcuts"))}
       <dl class="shortcut-list">

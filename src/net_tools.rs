@@ -38,7 +38,7 @@ const TRACE_PROBES: usize = 2;
 const MAX_CONNECTIONS: usize = 4000;
 
 // IP_STATUS values returned by the ICMP API.
-const IP_SUCCESS: u32 = 0;
+pub(crate) const IP_SUCCESS: u32 = 0;
 const IP_TTL_EXPIRED_TRANSIT: u32 = 11013;
 
 // ---------------------------------------------------------------------------
@@ -98,9 +98,9 @@ fn preferred_ipv4(addresses: &[IpAddr]) -> Option<Ipv4Addr> {
 // ICMP
 // ---------------------------------------------------------------------------
 
-struct IcmpHandle(HANDLE);
+pub(crate) struct IcmpHandle(HANDLE);
 impl IcmpHandle {
-    fn open() -> Result<Self, String> {
+    pub(crate) fn open() -> Result<Self, String> {
         let handle = unsafe { IcmpCreateFile() };
         if handle == INVALID_HANDLE_VALUE || handle.is_null() {
             return Err("Windows ICMP service is unavailable.".into());
@@ -117,13 +117,13 @@ impl Drop for IcmpHandle {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Echo {
-    status: u32,
-    rtt: Option<u32>,
-    from: Option<Ipv4Addr>,
+pub(crate) struct Echo {
+    pub status: u32,
+    pub rtt: Option<u32>,
+    pub from: Option<Ipv4Addr>,
 }
 
-fn echo(handle: &IcmpHandle, source: Option<Ipv4Addr>, destination: Ipv4Addr, ttl: u8, timeout: u32) -> Echo {
+pub(crate) fn echo(handle: &IcmpHandle, source: Option<Ipv4Addr>, destination: Ipv4Addr, ttl: u8, timeout: u32) -> Echo {
     let data = [0x57u8; 32];
     let options = IP_OPTION_INFORMATION { Ttl: ttl, Tos: 0, Flags: 0, OptionsSize: 0, OptionsData: ptr::null_mut() };
     // Room for one reply, the echoed data, an ICMP error and padding.

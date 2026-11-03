@@ -802,7 +802,7 @@ pub fn hosts_diff(before: &[Value], after: &[Value]) -> Value {
     })
 }
 
-fn read_hosts() -> AppResult<String> {
+pub(crate) fn read_hosts() -> AppResult<String> {
     let bytes = fs::read(hosts_path()).map_err(|e| err_with("HOSTS_READ_FAILED", "The hosts file cannot be read.", json!({"reason":e.to_string()})))?;
     if bytes.len() > MAX_HOSTS_BYTES {
         return Err(err("HOSTS_READ_FAILED", "The hosts file is too large to edit here."));
@@ -861,9 +861,14 @@ pub fn apply_hosts_change(state: State<AppState>, input: Value) -> AppResult<Val
         let _ = fs::remove_file(dir.join(old));
     }
     capture_baseline(&state, json!({"hosts":{"backup":backup_name,"hashAfter":payload["newHash"]}}))?;
-    fs::write(hosts_path(), &text).map_err(|e| err_with("HOSTS_WRITE_FAILED", "Windows did not allow writing the hosts file. It may be read-only or locked by security software.", json!({"reason":e.to_string()})))?;
+    write_hosts(&text)?;
     let message = notice("hosts.applied", json!({}), "The hosts file was updated.");
     Ok(json!({"backup":backup_name,"message":message["text"],"messageCode":message}))
+}
+
+/// Replace the hosts file (administrator only; callers confirm first).
+pub(crate) fn write_hosts(text: &str) -> AppResult<()> {
+    fs::write(hosts_path(), text).map_err(|e| err_with("HOSTS_WRITE_FAILED", "Windows did not allow writing the hosts file. It may be read-only or locked by security software.", json!({"reason":e.to_string()})))
 }
 
 /// Undo for the hosts file: restore the backup if the file is unchanged since.

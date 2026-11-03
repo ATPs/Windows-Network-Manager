@@ -121,4 +121,20 @@ export const api = {
   applyHostsChange: (input, confirmationToken) =>
     call("apply_hosts_change", { input: { ...input, confirmationToken } }),
   restartAsAdmin: () => call("restart_as_administrator"),
+  monitorHistory: (query) => call("get_monitor_history", { query }),
+  monitorStorage: () => call("get_monitor_storage"),
+  chooseMonitorFolder: () => call("choose_monitor_folder"),
+  setMonitorFolder: (confirmationToken, copyExisting) =>
+    call("set_monitor_folder", { input: { confirmationToken, copyExisting } }),
+  resetMonitorFolder: () => call("reset_monitor_folder"),
+  clearMonitorHistory: () => call("clear_monitor_history"),
+  openMonitorFolder: () => call("open_monitor_folder"),
+  backups: () => call("list_network_backups"),
+  createBackup: (name) => call("create_network_backup", { input: { name } }),
+  renameBackup: (id, name) => call("rename_network_backup", { input: { id, name } }),
+  keepBackup: (id) => call("keep_network_backup", { input: { id } }),
+  deleteBackup: (id) => call("delete_network_backup", { input: { id } }),
+  previewBackupRestore: (id, include) => call("preview_backup_restore", { input: { id, include } }),
+  applyBackupRestore: (id, include, confirmationToken) =>
+    call("apply_backup_restore", { input: { id, include, confirmationToken, acknowledged: true } }),
 };

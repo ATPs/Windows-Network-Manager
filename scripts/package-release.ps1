@@ -29,6 +29,9 @@ Extract the complete ZIP before running Windows Network Manager.exe.
 Microsoft Edge WebView2 Evergreen Runtime is required.
 Network Metric and route changes require administrator privileges.
 Use the in-app "Restart as administrator" button to request standard Windows UAC elevation.
+Monitor history is saved in a "monitor-data" folder next to the program (about 1 MB per day,
+30 days by default). If this folder cannot be written, the app data folder is used instead.
+Settings shows the folder in use and can move it.
 '@
 
 if (Test-Path -LiteralPath $portableZip) {

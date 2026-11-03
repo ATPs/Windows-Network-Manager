@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { copy } from "./i18n.js";
+import { copy, messages } from "./i18n.js";
 
 describe("interface copy", () => {
   it("keeps every English key available in Chinese", () => {
@@ -21,6 +21,40 @@ describe("interface copy", () => {
     ]) {
       expect(copy.en[key]).toBeTruthy();
       expect(copy["zh-CN"][key]).toBeTruthy();
+    }
+  });
+
+  it("translates the backend notices of network backups", () => {
+    for (const code of [
+      "backup.reason.ipSettings",
+      "backup.reason.category",
+      "backup.reason.metric",
+      "backup.reason.route",
+      "backup.reason.hosts",
+      "backup.reason.trigger",
+      "backup.reason.restore",
+      "backup.reason.defaults",
+      "backup.reason.backupRestore",
+      "backup.created",
+      "backup.renamed",
+      "backup.kept",
+      "backup.deleted",
+      "restore.skip.missing",
+      "restore.skip.protected",
+      "restore.skip.system",
+      "restore.skip.invalid",
+      "restore.skip.unreadable",
+      "restore.skip.domain",
+      "restore.skip.routeAdapter",
+      "restore.skip.hostsUnreadable",
+      "restore.skip.hostsUnavailable",
+      "restore.hostsOverwrite",
+      "restore.notIncluded",
+      "restore.backup.complete",
+      "restore.backup.partial",
+      "scope.backupRestore",
+    ]) {
+      expect(messages["zh-CN"][code], code).toBeTruthy();
     }
   });
 });

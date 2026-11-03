@@ -158,3 +158,44 @@ export function sortDefaultCandidates(routes) {
         (b.effectiveMetric ?? b.routeMetric ?? Infinity),
   );
 }
+
+/** Byte counts as KB/MB/GB (1024 steps, as File Explorer shows them). */
+export function formatBytes(bytes) {
+  let value = Math.max(0, Number(bytes) || 0);
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(value >= 100 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+export const formatMs = (value) => (value == null || !Number.isFinite(Number(value)) ? "—" : `${Math.round(Number(value))} ms`);
+
+/** Average, peak and transferred bytes for rate samples `[time, bytesPerSecond]`. */
+export function summarizeRates(points = []) {
+  const values = points.map(([, value]) => value).filter((value) => value != null);
+  if (!values.length) return { avg: null, peak: null, total: 0 };
+  let total = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    const [time, value] = points[index];
+    if (value != null) total += (value * Math.max(0, time - points[index - 1][0])) / 1000;
+  }
+  return { avg: values.reduce((sum, value) => sum + value, 0) / values.length, peak: Math.max(...values), total };
+}
+
+/** Latency statistics for round-trip times (null = no reply). */
+export function summarizeLatency(samples = []) {
+  const received = samples.filter((value) => value != null).sort((a, b) => a - b);
+  const sent = samples.length;
+  if (!sent) return { sent: 0, avg: null, p95: null, max: null, lossPct: null };
+  const p95 = received.length ? received[Math.min(received.length, Math.ceil(received.length * 0.95)) - 1] : null;
+  return {
+    sent,
+    avg: received.length ? received.reduce((sum, value) => sum + value, 0) / received.length : null,
+    p95,
+    max: received.length ? received[received.length - 1] : null,
+    lossPct: Math.round(((sent - received.length) * 100) / sent),
+  };
+}

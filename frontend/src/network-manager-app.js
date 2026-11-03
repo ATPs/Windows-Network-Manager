@@ -14,6 +14,7 @@ import {
   routeIdentity,
 } from "./format.js";
 import { icon } from "./icons.js";
+import { formatByteRate, formatRate } from "./charts.js";
 import { spinner } from "./ui.js";
 import { renderOverview } from "./views/overview.js";
 import { renderAdapters } from "./views/adapters.js";
@@ -26,7 +27,7 @@ import { renderIpDrawer } from "./views/ip-editor.js";
 import { renderHosts } from "./views/hosts.js";
 import { renderApps, normalizeProgramEntry, appRuleErrors } from "./views/apps.js";
 import { renderMaintenance } from "./views/maintenance.js";
-import { renderSettings } from "./views/settings.js";
+import { FONT_SIZES, renderSettings } from "./views/settings.js";
 
 export const views = [
   "overview",
@@ -56,6 +57,17 @@ const viewRenderers = {
 };
 const TOAST_TIMEOUT = { success: 4000, info: 5000 };
 const MONITOR_POLL_MS = 2000;
+const HISTORY_POLL_MS = 60000;
+export const MONITOR_RANGES = ["live", "1h", "24h", "7d", "30d"];
+export const defaultMonitorCards = { traffic: true, latency: true, signal: true, daily: true, events: true, notifications: true };
+export const defaultMonitorSettings = {
+  historyEnabled: true,
+  retentionDays: 30,
+  latencyEnabled: true,
+  latencyIntervalSeconds: 10,
+  latencyPublicDns: false,
+  folder: null,
+};
 export const defaultNotifications = {
   enabled: false,
   adapters: true,
@@ -104,9 +116,11 @@ export class NetworkManagerApp extends LitElement {
     this.settings = {
       language: "en",
       theme: readStorage("wnm-theme") || "system",
+      fontSize: "default",
       showSystemInterfaces: false,
       showAllRoutes: false,
       notifications: { ...defaultNotifications },
+      monitor: { ...defaultMonitorSettings },
     };
     this.network = {
       overview: null,
@@ -156,6 +170,10 @@ export class NetworkManagerApp extends LitElement {
     this.expandedAdapters = new Set();
     this.defaultsSelection = null;
     this.defaultsRemoveRoutes = true;
+    this.backups = null;
+    this.backupTab = "manual";
+    this.backupDetails = new Set();
+    this.backupInclude = { ip: true, metric: true, category: true, routes: true, hosts: true };
     this.diagnostics = null;
     this.coexistence = null;
     this.tools = {
@@ -169,13 +187,21 @@ export class NetworkManagerApp extends LitElement {
       wifiScan: null,
     };
     this.toolEventUnlisten = [];
+    const monitorPrefs = readJson("wnm-monitor-prefs") || {};
     this.monitor = {
       snapshot: null,
       events: null,
       eventFilters: { kind: "all", tunnels: false },
       hover: null,
+      range: MONITOR_RANGES.includes(monitorPrefs.range) ? monitorPrefs.range : "live",
+      selected: Array.isArray(monitorPrefs.selected) ? monitorPrefs.selected.slice(0, 16) : [],
+      cards: { ...defaultMonitorCards, ...(monitorPrefs.cards || {}) },
+      rateUnit: monitorPrefs.rateUnit === "bytes" ? "bytes" : "bits",
+      history: null,
+      storage: null,
     };
     this.monitorTimer = null;
+    this.historyTimer = null;
     this.startup = null;
     this.ipEditor = null;
     this.pendingRevert = null;
@@ -279,6 +305,7 @@ export class NetworkManagerApp extends LitElement {
       if (bootstrap.cachedNetworkState)
         this.applyNetwork(bootstrap.cachedNetworkState);
       this.settings.notifications = { ...defaultNotifications, ...(this.settings.notifications || {}) };
+      this.settings.monitor = { ...defaultMonitorSettings, ...(this.settings.monitor || {}) };
       this.applyTheme();
       this.requestUpdate();
       this.syncMonitorPolling();
@@ -616,6 +643,8 @@ export class NetworkManagerApp extends LitElement {
     this.syncMonitorPolling();
     if (view === "hosts" && !this.hosts) this.loadHosts();
     if (view === "apps" && !this.appRules) this.loadAppRules();
+    if (view === "maintenance") this.loadBackups();
+    if (view === "settings") this.loadMonitorStorage();
     this.requestUpdate();
     this.updateComplete.then(() =>
       this.querySelector("main")?.scrollTo?.({ top: 0 }),
@@ -648,6 +677,11 @@ export class NetworkManagerApp extends LitElement {
       return;
     }
     if (this.anyDialogOpen()) return;
+    if (event.ctrlKey && !event.altKey && ["=", "+", "-", "0"].includes(event.key)) {
+      event.preventDefault();
+      this.stepFontSize(event.key === "0" ? 0 : event.key === "-" ? -1 : 1);
+      return;
+    }
     if (event.ctrlKey && !event.altKey && /^[1-9]$/.test(event.key)) {
       event.preventDefault();
       this.setView(views[Number(event.key) - 1]);
@@ -660,6 +694,13 @@ export class NetworkManagerApp extends LitElement {
         search.focus();
       }
     }
+  }
+
+  /** Moves the text size one step (+1/-1), or back to default (0). */
+  stepFontSize(step) {
+    const current = Math.max(0, FONT_SIZES.indexOf(this.settings.fontSize));
+    const next = step === 0 ? "default" : FONT_SIZES[Math.min(FONT_SIZES.length - 1, Math.max(0, current + step))];
+    if (next !== this.settings.fontSize) this.updateSettings({ fontSize: next });
   }
 
   async goToAdapter(item) {
@@ -1213,8 +1254,8 @@ export class NetworkManagerApp extends LitElement {
 
   // ---- Backups ------------------------------------------------------------
 
-  openNameDialog(kind) {
-    this.nameDialog = { kind, value: "" };
+  openNameDialog(kind, value = "", id = null) {
+    this.nameDialog = { kind, value, id };
     this.requestUpdate();
   }
   closeNameDialog() {
@@ -1223,9 +1264,13 @@ export class NetworkManagerApp extends LitElement {
   }
   async saveNamed(event) {
     event.preventDefault();
-    const name = new FormData(event.currentTarget).get("name")?.trim();
+    const name = new FormData(event.currentTarget).get("name")?.trim() || "";
+    const { kind, id } = this.nameDialog;
+    if (kind === "backup" || kind === "renameBackup") {
+      this.closeNameDialog();
+      return kind === "backup" ? this.createBackup(name) : this.renameBackup(id, name);
+    }
     if (!name) return;
-    const kind = this.nameDialog.kind;
     this.closeNameDialog();
     if (kind === "snapshot")
       await this.run("snapshot", () => api.recentSnapshot(name), [
@@ -1249,8 +1294,27 @@ export class NetworkManagerApp extends LitElement {
   }
 
   restoreChangeRows(changes = []) {
-    return changes.map((change) => {
+    return changes.flatMap((change) => {
       switch (change.kind) {
+        case "ip": {
+          const alias = change.alias || `#${change.interfaceIndex}`;
+          return [
+            change.target?.ipv4
+              ? { label: `${alias} · IPv4`, before: this.describeIpv4(change.before?.ipv4), after: this.describeIpv4(change.target.ipv4) }
+              : null,
+            change.target?.dns
+              ? { label: `${alias} · DNS`, before: this.describeDns(change.before?.dns), after: this.describeDns(change.target.dns) }
+              : null,
+          ].filter(Boolean);
+        }
+        case "category":
+          return {
+            label: `${change.alias} · ${this.t("networkCategory")}`,
+            before: this.t(`category${change.before}`),
+            after: this.t(`category${change.after}`),
+          };
+        case "hosts":
+          return { label: this.t("hosts"), after: this.t("hostsReplaced") };
         case "metric": {
           const describe = (value) =>
             value?.automatic
@@ -1321,6 +1385,96 @@ export class NetworkManagerApp extends LitElement {
         note: preview.unchangedCount
           ? this.tf("restoreUnchangedCount", { count: preview.unchangedCount })
           : "",
+      },
+    );
+  }
+
+  // ---- Network backups (Recovery) ---------------------------------------
+
+  async loadBackups() {
+    try {
+      this.backups = await api.backups();
+    } catch (error) {
+      this.backups = this.backups || { backups: [], limits: { manual: 50, automatic: 20 } };
+      this.notify(errorMessage(error), "error");
+    }
+    this.requestUpdate();
+  }
+
+  backupLabel(item) {
+    if (item.name) return item.name;
+    if (item.reason) return this.msg(item.reason);
+    return this.t("unnamedBackup");
+  }
+
+  async createBackup(name) {
+    const result = await this.run("backup:create", () => api.createBackup(name), [], `${this.t("createBackup")}${name ? ` · ${name}` : ""}`);
+    if (result) await this.loadBackups();
+  }
+
+  async renameBackup(id, name) {
+    const result = await this.run(`backup:rename:${id}`, () => api.renameBackup(id, name), [], this.t("renameBackup"));
+    if (result) await this.loadBackups();
+  }
+
+  async keepBackup(item) {
+    const result = await this.run(`backup:keep:${item.id}`, () => api.keepBackup(item.id), [], `${this.t("keepBackup")} · ${this.backupLabel(item)}`);
+    if (result) await this.loadBackups();
+  }
+
+  deleteBackup(item) {
+    this.requestConfirmation(
+      [this.backupLabel(item), formatTime(item.createdAt, this.settings.language), this.t("deleteBackupHelp")],
+      async () => {
+        const result = await this.run(`backup:delete:${item.id}`, () => api.deleteBackup(item.id), [], `${this.t("actDelete")} · ${this.backupLabel(item)}`);
+        if (result) await this.loadBackups();
+      },
+      true,
+      { title: this.t("confirmDeleteTitle"), confirmLabel: this.t("delete") },
+    );
+  }
+
+  toggleBackupDetails(item) {
+    this.backupDetails.has(item.id) ? this.backupDetails.delete(item.id) : this.backupDetails.add(item.id);
+    this.requestUpdate();
+  }
+
+  setBackupInclude(key, value) {
+    this.backupInclude = { ...this.backupInclude, [key]: value };
+    this.requestUpdate();
+  }
+
+  async restoreBackup(item) {
+    const key = `backup:restore:${item.id}`;
+    const include = { ...this.backupInclude };
+    const preview = await this.preview(`${key}:preview`, () => api.previewBackupRestore(item.id, include));
+    if (!preview) return;
+    const skipped = (preview.skipped || []).map((skip) => ({ label: skip.alias || this.t("changeSkipped"), after: this.msg(skip), kind: "skip" }));
+    if (!preview.changes?.length) {
+      this.notify(this.t("backupNoDifferences"));
+      return;
+    }
+    const label = `${this.t("restoreBackup")} · ${this.backupLabel(item)}`;
+    this.requestConfirmation(
+      [
+        `${this.backupLabel(item)} · ${formatTime(item.createdAt, this.settings.language)}`,
+        this.t("backupRestoreIntro"),
+        ...this.warningsOf(preview),
+      ],
+      async () => {
+        const result = await this.run(key, () => api.applyBackupRestore(item.id, include, preview.confirmationToken), ["interfaces", "routes"], label);
+        if (result) {
+          this.startRevertCountdown(result.revert, label);
+          this.loadBackups();
+        }
+      },
+      true,
+      {
+        title: this.t("confirmBackupRestoreTitle"),
+        confirmLabel: this.t("restore"),
+        rows: [...this.restoreChangeRows(preview.changes), ...skipped],
+        note: preview.unchangedCount ? this.tf("restoreUnchangedCount", { count: preview.unchangedCount }) : "",
+        acknowledge: this.t("backupRestoreAcknowledge"),
       },
     );
   }
@@ -2143,11 +2297,160 @@ export class NetworkManagerApp extends LitElement {
     } else if (!wanted) {
       this.stopMonitorPolling();
     }
+    this.syncHistoryPolling();
+  }
+
+  /** Saved history reloads once a minute while a history range is shown. */
+  syncHistoryPolling() {
+    const wanted = this.view === "monitor" && !globalThis.document?.hidden && this.monitor.range !== "live";
+    if (wanted && !this.historyTimer) {
+      this.loadMonitorHistory();
+      this.historyTimer = setInterval(() => this.loadMonitorHistory(), HISTORY_POLL_MS);
+    } else if (!wanted && this.historyTimer) {
+      clearInterval(this.historyTimer);
+      this.historyTimer = null;
+    }
   }
 
   stopMonitorPolling() {
     clearInterval(this.monitorTimer);
     this.monitorTimer = null;
+    clearInterval(this.historyTimer);
+    this.historyTimer = null;
+  }
+
+  saveMonitorPrefs() {
+    const { range, selected, cards, rateUnit } = this.monitor;
+    writeStorage("wnm-monitor-prefs", JSON.stringify({ range, selected, cards, rateUnit }));
+  }
+
+  setMonitorRange(range) {
+    if (!MONITOR_RANGES.includes(range) || range === this.monitor.range) return;
+    this.monitor.range = range;
+    this.monitor.history = null;
+    this.monitor.hover = null;
+    this.saveMonitorPrefs();
+    clearInterval(this.historyTimer);
+    this.historyTimer = null;
+    this.syncHistoryPolling();
+    this.requestUpdate();
+  }
+
+  toggleMonitorInterface(key) {
+    const selected = new Set(this.monitor.selected);
+    selected.has(key) ? selected.delete(key) : selected.add(key);
+    this.monitor.selected = [...selected].slice(0, 16);
+    this.saveMonitorPrefs();
+    if (this.monitor.range !== "live") this.loadMonitorHistory();
+    this.requestUpdate();
+  }
+
+  setMonitorCard(card, visible) {
+    this.monitor.cards = { ...this.monitor.cards, [card]: visible };
+    this.saveMonitorPrefs();
+    this.requestUpdate();
+  }
+
+  setRateUnit(unit) {
+    this.monitor.rateUnit = unit === "bytes" ? "bytes" : "bits";
+    this.saveMonitorPrefs();
+    this.requestUpdate();
+  }
+
+  async loadMonitorHistory() {
+    const range = this.monitor.range;
+    if (range === "live") return;
+    try {
+      const history = await api.monitorHistory({ range, interfaces: this.monitor.selected });
+      if (this.monitor.range === range) this.monitor.history = history;
+    } catch (error) {
+      this.notify(errorMessage(error), "error");
+    }
+    this.requestUpdate();
+  }
+
+  // ---- Monitor history settings -------------------------------------------
+
+  async loadMonitorStorage() {
+    try {
+      this.monitor.storage = await api.monitorStorage();
+      this.requestUpdate();
+    } catch {
+      // Storage details are unavailable outside the Tauri runtime.
+    }
+  }
+
+  async updateMonitorSettings(change) {
+    const current = { ...defaultMonitorSettings, ...(this.settings.monitor || {}) };
+    const apply = async () => {
+      await this.updateSettings({ monitor: { ...current, ...change } });
+      await this.loadMonitorStorage();
+    };
+    if (change.retentionDays && change.retentionDays < current.retentionDays) {
+      this.requestConfirmation(
+        [this.tf("retentionShorterHelp", { days: change.retentionDays })],
+        apply,
+        true,
+        { title: this.t("retentionShorterTitle"), confirmLabel: this.t("apply") },
+      );
+      return;
+    }
+    await apply();
+  }
+
+  async chooseMonitorFolder() {
+    const result = await this.preview("monitor:folder", () => api.chooseMonitorFolder());
+    if (!result || result.cancelled) return;
+    const candidate = result.candidate || {};
+    this.requestConfirmation(
+      [
+        candidate.path,
+        candidate.days ? this.tf("folderHasHistory", { days: candidate.days }) : "",
+        this.t("folderCopyHelp"),
+      ],
+      async () => {
+        const changed = await this.run("monitor:folder:set", () => api.setMonitorFolder(result.confirmationToken, true), [], this.t("changeFolder"));
+        if (changed) this.applySettingsResult(changed);
+      },
+      false,
+      { title: this.t("useThisFolderTitle"), confirmLabel: this.t("useThisFolder") },
+    );
+  }
+
+  async resetMonitorFolder() {
+    const changed = await this.run("monitor:folder:reset", () => api.resetMonitorFolder(), [], this.t("useDefaultFolder"));
+    if (changed) this.applySettingsResult(changed);
+  }
+
+  applySettingsResult(result) {
+    if (result.settings) this.settings = { ...this.settings, ...result.settings };
+    if (result.storage) this.monitor.storage = result.storage;
+    this.requestUpdate();
+  }
+
+  clearMonitorHistory() {
+    const storage = this.monitor.storage;
+    this.requestConfirmation(
+      [storage?.path || "", this.tf("clearMonitorHistoryHelp", { days: storage?.days ?? 0 })],
+      async () => {
+        const result = await this.run("monitor:history:clear", () => api.clearMonitorHistory(), [], this.t("clearMonitorHistory"));
+        if (result?.storage) this.monitor.storage = result.storage;
+        this.monitor.history = null;
+        this.loadMonitorHistory();
+        this.requestUpdate();
+      },
+      true,
+      { title: this.t("clearMonitorHistory"), confirmLabel: this.t("delete") },
+    );
+  }
+
+  async openMonitorFolder() {
+    await this.preview("monitor:folder:open", () => api.openMonitorFolder());
+  }
+
+  /** Bits or bytes per second, as chosen on the Monitor page. */
+  formatRate(value) {
+    return this.monitor.rateUnit === "bytes" ? formatByteRate(value) : formatRate(value);
   }
 
   async loadMonitorSnapshot() {
@@ -2549,24 +2852,32 @@ export class NetworkManagerApp extends LitElement {
   }
 
   renderNameDialog() {
-    const snapshot = this.nameDialog.kind === "snapshot";
+    const kind = this.nameDialog.kind;
+    const backup = kind === "backup" || kind === "renameBackup";
+    const text = {
+      snapshot: ["save", "saveSnapshot", "snapshotHelp", "snapshotName"],
+      profile: ["profiles", "saveProfile", "profileHelp", "configurationName"],
+      backup: ["save", "createBackup", "createBackupHelp", "backupName"],
+      renameBackup: ["edit", "renameBackup", "renameBackupHelp", "backupName"],
+    }[kind] || ["profiles", "saveProfile", "profileHelp", "configurationName"];
+    const [iconName, title, help, label] = text;
     return html`<form class="dialog-body" @submit=${this.saveNamed}>
-      <h2 id="dialog-heading" class="dialog-title">
-        ${icon(snapshot ? "save" : "profiles")}${snapshot ? this.t("saveSnapshot") : this.t("saveProfile")}
-      </h2>
-      <p class="help-text">${snapshot ? this.t("snapshotHelp") : this.t("profileHelp")}</p>
+      <h2 id="dialog-heading" class="dialog-title">${icon(iconName)}${this.t(title)}</h2>
+      <p class="help-text">${this.t(help)}</p>
       <label class="field"
-        >${snapshot ? this.t("snapshotName") : this.t("configurationName")}<input
+        >${this.t(label)}<input
           name="name"
-          required
+          ?required=${!backup}
           maxlength="80"
+          .value=${this.nameDialog.value || ""}
+          placeholder=${backup ? this.t("backupNamePlaceholder") : ""}
           data-autofocus
       /></label>
       <div class="dialog-actions">
         <button type="button" class="standard" @click=${() => this.closeNameDialog()}>
           ${this.t("cancel")}
         </button>
-        <button type="submit" class="accent">${this.t("save")}</button>
+        <button type="submit" class="accent">${this.t(kind === "backup" ? "createBackup" : "save")}</button>
       </div>
     </form>`;
   }

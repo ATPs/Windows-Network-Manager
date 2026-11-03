@@ -119,6 +119,10 @@ export function renderProfiles(app) {
   const profiles = app.config.profiles || [];
   const recent = app.config.recentSnapshots || [];
   return html`<div class="stack">
+    <p class="notice">
+      ${icon("info")}<span>${app.t("profilesVsBackups")}</span>
+      <button class="link-button" @click=${() => app.setView("maintenance")}>${app.t("openNetworkBackups")}</button>
+    </p>
     <div class="toolbar">
       <button
         class="accent"

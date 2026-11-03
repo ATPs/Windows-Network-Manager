@@ -506,6 +506,14 @@ pub fn scope_items(
             format!("Changed domain routes for {domain}."),
         ));
     }
+    if let Some(item) = scope.get("backupRestore") {
+        let name = field_string(item, "name");
+        items.push(notice(
+            "scope.backupRestore",
+            json!({"name":name}),
+            format!("Restored network backup \"{name}\" (undo re-applies the backup taken just before it)."),
+        ));
+    }
     if scope.get("hosts").is_some() {
         items.push(notice("scope.hosts", json!({}), "Edited the hosts file (restored from the backup taken before the edit)."));
     }

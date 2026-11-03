@@ -12,6 +12,7 @@ import {
   sortAdapters,
 } from "../format.js";
 import {
+  actionWithHelp,
   buttonContent,
   chip,
   copyButton,
@@ -356,19 +357,22 @@ function renderConfigControls(app, item) {
   const id = `category-${item.interfaceIndex}`;
   return html`<div class="config-controls">
     ${app.canEditIp(item)
-      ? html`<button
-          class="standard"
-          ?disabled=${!app.privilege.isAdmin || app.isBusyPrefix(`ip:`)}
-          title=${app.privilege.isAdmin ? "" : app.t("permissionHelp")}
-          @click=${() => app.openIpEditor(item)}
-        >
-          ${buttonContent(app.isBusy(`ip:load:${item.interfaceIndex}`), "edit", app.t("editIpSettings"))}
-        </button>`
+      ? actionWithHelp(
+          html`<button
+            class="standard"
+            ?disabled=${!app.privilege.isAdmin || app.isBusyPrefix(`ip:`)}
+            title=${app.privilege.isAdmin ? "" : app.t("permissionHelp")}
+            @click=${() => app.openIpEditor(item)}
+          >
+            ${buttonContent(app.isBusy(`ip:load:${item.interfaceIndex}`), "edit", app.t("editIpSettings"))}
+          </button>`,
+          app.t("editIpHelp"),
+        )
       : item.managedBy
         ? html`<small class="muted">${app.tf("ipProtectedHelp", { owner: app.ownerLabel(item.managedBy) })}</small>`
         : nothing}
     ${editableCategory
-      ? html`<span class="inline-control">
+      ? html`<div class="action-with-help"><span class="inline-control">
           <label for=${id}>${app.t("networkCategory")}</label>
           <select id=${id} ?disabled=${categoryBusy}>
             ${["Private", "Public"].map(
@@ -376,13 +380,13 @@ function renderConfigControls(app, item) {
             )}
           </select>
           <button
-            class="subtle compact"
+            class="standard compact"
             ?disabled=${!app.privilege.isAdmin || categoryBusy}
             @click=${() => app.changeNetworkCategory(item, app.querySelector(`#${id}`)?.value)}
           >
             ${buttonContent(categoryBusy, null, app.t("apply"))}
           </button>
-        </span>`
+        </span><small class="field-help">${app.t("categoryApplyHelp")}</small></div>`
       : nothing}
   </div>`;
 }
@@ -442,18 +446,19 @@ function renderSavedNetworks(app, item) {
 }
 
 function renderQuickFixes(app, item) {
-  const fixButton = (action, iconName) => {
+  const fixButton = (action, iconName, disabled = false) => {
     const key = `fix:${action}:${item.interfaceIndex}`;
     const busy = app.isBusy(key) || app.isBusy(`${key}:preview`);
-    return html`<button class="standard" ?disabled=${!app.privilege.isAdmin || busy} @click=${() => app.quickFix(action, item)}>
+    return html`<button class="standard" ?disabled=${disabled || !app.privilege.isAdmin || busy} @click=${() => app.quickFix(action, item)}>
       ${buttonContent(busy, iconName, app.t(action))}
     </button>`;
   };
   return html`<div class="advanced-row">
     <p class="help-text">${app.t("quickFixHelp")}</p>
-    <span class="button-row">
-      ${item.dhcpEnabled ? fixButton("renewDhcp", "refresh") : nothing} ${fixButton("restartAdapter", "power")}
-    </span>
+    <div class="action-list">
+      ${actionWithHelp(fixButton("renewDhcp", "refresh", !item.dhcpEnabled), app.t(item.dhcpEnabled ? "renewDhcpHelp" : "renewDhcpStatic"))}
+      ${actionWithHelp(fixButton("restartAdapter", "power"), app.t("restartAdapterHelp"))}
+    </div>
   </div>`;
 }
 

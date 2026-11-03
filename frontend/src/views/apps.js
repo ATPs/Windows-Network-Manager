@@ -61,17 +61,11 @@ function renderRule(app, rule) {
     </span>
     ${chip(targetLabel(app, rule), rule.target === "block" ? "" : "accent")}
     <span class="row-buttons">
-      <button class="icon-button subtle" title=${app.t("edit")} aria-label=${`${app.t("edit")} ${rule.name}`} ?disabled=${busy} @click=${() => app.editAppRule(rule)}>
-        ${icon("edit")}
+      <button class="standard compact" aria-label=${`${app.t("edit")} ${rule.name}`} ?disabled=${busy} @click=${() => app.editAppRule(rule)}>
+        ${icon("edit")}${app.t("edit")}
       </button>
-      <button
-        class="icon-button subtle danger-text"
-        title=${app.t("remove")}
-        aria-label=${`${app.t("remove")} ${rule.name}`}
-        ?disabled=${busy}
-        @click=${() => app.removeAppRule(rule)}
-      >
-        ${icon("trash")}
+      <button class="danger compact" aria-label=${`${app.t("remove")} ${rule.name}`} ?disabled=${busy} @click=${() => app.removeAppRule(rule)}>
+        ${icon("trash")}${app.t("remove")}
       </button>
     </span>
   </div>`;
@@ -114,17 +108,12 @@ function renderEditor(app) {
                 </span>
                 <span class="row-buttons">
                   ${program.includes("/") && !program.endsWith("/")
-                    ? html`<button class="subtle compact" title=${app.t("useFolderHelp")} @click=${() => app.useProgramFolder(program)}>
+                    ? html`<button class="standard compact" title=${app.t("useFolderHelp")} @click=${() => app.useProgramFolder(program)}>
                         ${app.t("useFolder")}
                       </button>`
                     : nothing}
-                  <button
-                    class="icon-button subtle danger-text"
-                    title=${app.t("remove")}
-                    aria-label=${`${app.t("remove")} ${program}`}
-                    @click=${() => app.removeAppRuleProgram(program)}
-                  >
-                    ${icon("close")}
+                  <button class="danger compact" aria-label=${`${app.t("remove")} ${program}`} @click=${() => app.removeAppRuleProgram(program)}>
+                    ${icon("close")}${app.t("remove")}
                   </button>
                 </span>
               </div>`,
@@ -164,7 +153,7 @@ function renderEditor(app) {
               ${running.map((item) => html`<option value=${item.path}>${item.name} — ${item.path}</option>`)}
             </select>`
           : nothing}
-        <button class="subtle compact" type="button" ?disabled=${app.isBusy("apps:running")} @click=${() => app.loadRunningPrograms()}>
+        <button class="standard compact" type="button" ?disabled=${app.isBusy("apps:running")} @click=${() => app.loadRunningPrograms()}>
           ${buttonContent(app.isBusy("apps:running"), "refresh", app.t(running ? "refreshRunningPrograms" : "showRunningPrograms"))}
         </button>
       </div>
@@ -232,7 +221,7 @@ function renderServerStep(app, server) {
     return html`<li>
       ${app.tf("v2raynStepSocks", { remark: server.remark })}
       <div class="copy-row"><code class="mono">${server.link}</code>
-        <button class="subtle compact" @click=${() => app.copyText(server.link)}>${icon("copy")}${app.t("copy")}</button>
+        <button class="standard compact" @click=${() => app.copyText(server.link)}>${icon("copy")}${app.t("copy")}</button>
       </div>
     </li>`;
   return html`<li>${app.tf("v2raynStepHttp", { remark: server.remark, host: server.host, port: server.port })}</li>`;

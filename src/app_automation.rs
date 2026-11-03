@@ -7,7 +7,7 @@
 
 use crate::{
     blocking, config, consume_confirmation, err, err_with, fingerprint, issue_confirmation, mutate_auto_rules,
-    network_insights::notice, normalized_wifi_guid, persist, valid_theme, wifi_auto_connect, AppResult, AppState,
+    network_insights::notice, normalized_wifi_guid, persist, sanitize_settings, wifi_auto_connect, AppResult, AppState,
     Settings,
 };
 use serde_json::{json, Map, Value};
@@ -131,10 +131,17 @@ pub fn export_document(cfg: &crate::AppConfig, app_version: &str, now: &str) -> 
         "formatVersion":1,
         "appVersion":app_version,
         "exportedAt":now,
-        "settings":cfg.settings,
+        "settings":exported_settings(&cfg.settings),
         "profiles":cfg.profiles,
         "wifiAutoConnect":cfg.wifi_auto_connect,
     })
+}
+
+/// Settings without machine-specific paths (the monitor history folder).
+fn exported_settings(settings: &Settings) -> Settings {
+    let mut settings = settings.clone();
+    settings.monitor.folder = None;
+    settings
 }
 
 fn bounded_string(value: Option<&Value>, max: usize) -> Option<String> {
@@ -199,8 +206,7 @@ pub fn validate_import(document: &Value) -> Result<Value, String> {
             if settings.language != "en" && settings.language != "zh-CN" {
                 return Err("The exported language is not supported.".into());
             }
-            valid_theme(&settings.theme).map_err(|e| e.message)?;
-            Some(settings)
+            Some(sanitize_settings(settings, &Settings::default()).map_err(|e| e.message)?)
         }
         None => None,
     };
@@ -330,7 +336,7 @@ pub async fn import_config_apply(app: AppHandle, input: Value) -> AppResult<Valu
         consume_confirmation(&state, token, "import-config", &import)?;
         let mut cfg = config(&state);
         if let Ok(settings) = serde_json::from_value::<Settings>(import["settings"].clone()) {
-            cfg.settings = settings;
+            cfg.settings = sanitize_settings(settings, &cfg.settings)?;
         }
         for profile in import["profiles"].as_array().cloned().unwrap_or_default() {
             let id = profile["id"].as_str().unwrap_or_default().to_string();
@@ -338,6 +344,7 @@ pub async fn import_config_apply(app: AppHandle, input: Value) -> AppResult<Valu
             cfg.profiles.push(profile);
         }
         persist(&state, &cfg)?;
+        crate::apply_font_size(&app, &cfg.settings.font_size);
         let rules: Vec<wifi_auto_connect::AutoConnectRule> =
             serde_json::from_value(import["wifiAutoConnect"].clone()).unwrap_or_default();
         if !rules.is_empty() {

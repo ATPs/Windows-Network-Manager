@@ -1,9 +1,12 @@
 mod advanced;
 mod app_rules;
 mod app_automation;
+mod backups;
 mod coexistence;
 mod config_edit;
+mod latency;
 mod monitor;
+mod monitor_history;
 mod net_tools;
 mod network_insights;
 mod quick_fixes;
@@ -98,12 +101,16 @@ struct Settings {
     language: String,
     #[serde(default = "default_theme")]
     theme: String,
+    #[serde(default = "default_font_size")]
+    font_size: String,
     #[serde(default)]
     show_system_interfaces: bool,
     #[serde(default)]
     show_all_routes: bool,
     #[serde(default)]
     notifications: monitor::NotificationSettings,
+    #[serde(default)]
+    monitor: monitor_history::MonitorSettings,
 }
 fn default_language() -> String {
     "en".into()
@@ -111,14 +118,19 @@ fn default_language() -> String {
 fn default_theme() -> String {
     "system".into()
 }
+fn default_font_size() -> String {
+    "default".into()
+}
 impl Default for Settings {
     fn default() -> Self {
         Self {
             language: default_language(),
             theme: default_theme(),
+            font_size: default_font_size(),
             show_system_interfaces: false,
             show_all_routes: false,
             notifications: monitor::NotificationSettings::default(),
+            monitor: monitor_history::MonitorSettings::default(),
         }
     }
 }
@@ -205,6 +217,9 @@ struct AppState {
     confirmations: Mutex<HashMap<String, Confirmation>>,
     discovery: Mutex<Option<DiscoveryCache>>,
     config_lock: Mutex<()>,
+    backups_lock: Mutex<()>,
+    /// A folder chosen in the picker, waiting for confirmation: (token, folder).
+    pending_monitor_folder: Mutex<Option<(String, PathBuf)>>,
     tray_items: Mutex<Option<TrayItems>>,
     wifi_auto_supervisor: Arc<AutoConnectSupervisor>,
     monitor: Arc<monitor::Monitor>,
@@ -409,7 +424,9 @@ pub fn run() {
             fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
             let config_path = config_dir.join(CONFIG_FILE);
             let cache_path = config_dir.join(CACHE_FILE);
-            let network_monitor = monitor::Monitor::new(config_dir.join(EVENTS_FILE));
+            let exe_dir = std::env::current_exe().ok().and_then(|path| path.parent().map(Path::to_path_buf));
+            let history = monitor_history::History::new(config_dir.clone(), exe_dir, config_from_path(&config_path).settings.monitor);
+            let network_monitor = monitor::Monitor::new(config_dir.join(EVENTS_FILE), history);
             let initial_rules = wifi_auto_rules(&config_from_path(&config_path)).unwrap_or_default();
             let event_app = app.handle().clone();
             let supervisor = AutoConnectSupervisor::new(Arc::new(wifi_windows::WindowsWifi), move |status| {
@@ -422,6 +439,8 @@ pub fn run() {
                 confirmations: Mutex::new(HashMap::new()),
                 discovery: Mutex::new(None),
                 config_lock: Mutex::new(()),
+                backups_lock: Mutex::new(()),
+                pending_monitor_folder: Mutex::new(None),
                 tray_items: Mutex::new(None),
                 wifi_auto_supervisor: supervisor,
                 monitor: network_monitor.clone(),
@@ -430,7 +449,9 @@ pub fn run() {
             network_monitor
                 .spawn(move |events| on_network_events(&monitor_app, events))
                 .map_err(|e| e.to_string())?;
-            let language = config_from_path(&app.state::<AppState>().config_path).settings.language;
+            let startup_settings = config_from_path(&app.state::<AppState>().config_path).settings;
+            apply_font_size(app.handle(), &startup_settings.font_size);
+            let language = startup_settings.language;
             let (open_label, quit_label) = tray_labels(&language);
             let open = MenuItem::with_id(app, "tray-open", open_label, true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "tray-quit", quit_label, true, None::<&str>)?;
@@ -521,6 +542,13 @@ pub fn run() {
             get_monitor_snapshot,
             get_network_events,
             clear_network_events,
+            get_monitor_history,
+            get_monitor_storage,
+            choose_monitor_folder,
+            set_monitor_folder,
+            reset_monitor_folder,
+            clear_monitor_history,
+            open_monitor_folder,
             quick_fixes::preview_quick_fix,
             quick_fixes::apply_quick_fix,
             app_automation::get_startup_status,
@@ -558,6 +586,13 @@ pub fn run() {
             app_rules::check_local_proxy,
             advanced::preview_hosts_change,
             advanced::apply_hosts_change,
+            backups::list_network_backups,
+            backups::create_network_backup,
+            backups::rename_network_backup,
+            backups::keep_network_backup,
+            backups::delete_network_backup,
+            backups::preview_backup_restore,
+            backups::apply_backup_restore,
             restart_as_administrator
         ])
         .run(tauri::generate_context!())
@@ -1152,6 +1187,46 @@ fn valid_theme(value: &str) -> AppResult<&str> {
         Err(err("VALIDATION_ERROR", "Unsupported theme."))
     }
 }
+fn valid_font_size(value: &str) -> AppResult<&str> {
+    if ["small", "default", "large", "xlarge"].contains(&value) {
+        Ok(value)
+    } else {
+        Err(err("VALIDATION_ERROR", "Unsupported font size."))
+    }
+}
+/// Webview zoom for a font size setting. Zoom scales text, controls and
+/// layout breakpoints together, so every page keeps its proportions.
+fn font_zoom(size: &str) -> f64 {
+    match size {
+        "small" => 0.9,
+        "large" => 1.15,
+        "xlarge" => 1.3,
+        _ => 1.0,
+    }
+}
+fn apply_font_size(app: &AppHandle, size: &str) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_zoom(font_zoom(size));
+    }
+}
+/// Validate settings sent by the UI or an import. Fields only Rust may change
+/// are copied from `current` so a caller can never set them.
+fn sanitize_settings(incoming: Settings, current: &Settings) -> AppResult<Settings> {
+    if incoming.language != "en" && incoming.language != "zh-CN" {
+        return Err(err("VALIDATION_ERROR", "Unsupported language."));
+    }
+    monitor_history::validate_settings(&incoming.monitor).map_err(|message| err("VALIDATION_ERROR", message))?;
+    let monitor = monitor_history::MonitorSettings { folder: current.monitor.folder.clone(), ..incoming.monitor };
+    Ok(Settings {
+        monitor,
+        theme: valid_theme(&incoming.theme)?.to_string(),
+        font_size: valid_font_size(&incoming.font_size)?.to_string(),
+        language: incoming.language,
+        show_system_interfaces: incoming.show_system_interfaces,
+        show_all_routes: incoming.show_all_routes,
+        notifications: incoming.notifications,
+    })
+}
 
 fn config_from_path(path: &Path) -> AppConfig {
     match fs::read_to_string(path) {
@@ -1712,7 +1787,29 @@ fn route_payload(input: &Value) -> AppResult<Value> {
     )
 }
 fn capture_baseline(state: &State<AppState>, scope: Value) -> AppResult<()> {
+    capture_baseline_with_backup(state, scope).map(|_| ())
+}
+/// Record the undo point for a change. For settings a network backup covers,
+/// an automatic backup is saved first and its id returned; if it cannot be
+/// saved, the change is refused.
+fn capture_baseline_with_backup(state: &State<AppState>, mut scope: Value) -> AppResult<Option<String>> {
     let snapshot_state = current_snapshot(state)?;
+    let backup_id = match backups::auto_reason(&scope) {
+        Some(reason) => {
+            let backup = backups::create(state, &snapshot_state, "automatic", String::new(), Some(reason)).map_err(|error| {
+                err_with(
+                    "BACKUP_FAILED",
+                    "The automatic backup could not be saved, so the change was not made.",
+                    json!({"reason":error.message}),
+                )
+            })?;
+            if let Some(item) = scope.get_mut("backupRestore") {
+                item["preBackupId"] = json!(backup.id);
+            }
+            Some(backup.id)
+        }
+        None => None,
+    };
     let now = Utc::now().to_rfc3339();
     let snapshot = Snapshot {
         id: Uuid::new_v4().to_string(),
@@ -1725,7 +1822,15 @@ fn capture_baseline(state: &State<AppState>, scope: Value) -> AppResult<()> {
     };
     let mut cfg = config(state);
     cfg.baseline = Some(Baseline { snapshot, scope });
-    persist(state, &cfg)
+    persist(state, &cfg)?;
+    Ok(backup_id)
+}
+/// Undo a change whose keep-or-revert time ran out or that the user reverted.
+fn run_revert(app: &AppHandle, scope: &Value) -> Vec<Value> {
+    match scope.get("backupRevert") {
+        Some(item) => backups::revert(&app.state::<AppState>(), item),
+        None => config_edit::restore_scope(scope),
+    }
 }
 fn ps_set_metric(payload: &Value) -> AppResult<Value> {
     let script = r#"$p=@{InterfaceIndex=[int]$InputData.interfaceIndex;AddressFamily=[string]$InputData.addressFamily;AutomaticMetric=$(if($InputData.automatic){'Enabled'}else{'Disabled'});Confirm=$false};if(-not $InputData.automatic){$p.InterfaceMetric=[int]$InputData.metric};Set-NetIPInterface @p -ErrorAction Stop;$r=Get-NetIPInterface -InterfaceIndex ([int]$InputData.interfaceIndex) -AddressFamily ([string]$InputData.addressFamily);[PSCustomObject]@{interfaceIndex=[int]$r.InterfaceIndex;addressFamily=[string]$r.AddressFamily;automaticMetric=([string]$r.AutomaticMetric -eq 'Enabled');interfaceMetric=[long]$r.InterfaceMetric}|ConvertTo-Json -Compress"#;
@@ -2405,19 +2510,11 @@ fn refresh_network_state(
 }
 #[tauri::command]
 fn update_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> AppResult<Settings> {
-    if settings.language != "en" && settings.language != "zh-CN" {
-        return Err(err("VALIDATION_ERROR", "Unsupported language."));
-    }
-    let theme = valid_theme(&settings.theme)?.to_string();
     let mut cfg = config(&state);
-    cfg.settings = Settings {
-        language: settings.language,
-        theme,
-        show_system_interfaces: settings.show_system_interfaces,
-        show_all_routes: settings.show_all_routes,
-        notifications: settings.notifications,
-    };
+    cfg.settings = sanitize_settings(settings, &cfg.settings)?;
     persist(&state, &cfg)?;
+    apply_font_size(&app, &cfg.settings.font_size);
+    state.monitor.apply_settings(&cfg.settings.monitor);
     if let Ok(items) = state.tray_items.lock() {
         if let Some(items) = items.as_ref() {
             let (open, quit) = tray_labels(&cfg.settings.language);
@@ -2964,6 +3061,7 @@ fn reset_apply(state: State<AppState>, input: Value) -> AppResult<Value> {
     let mut config_items = config_edit::restore_scope(&baseline.scope);
     config_items.extend(advanced::restore_domain_scope(&baseline.scope)?);
     config_items.extend(advanced::restore_hosts_scope(&state, &baseline.scope));
+    config_items.extend(backups::restore_baseline_scope(&state, &baseline.scope));
     let config_result = json!(config_items);
     let complete = !has_failed_result(&result) && !has_failed_result(&route_result) && !has_failed_result(&config_result);
     let message = if complete {
@@ -3187,6 +3285,134 @@ fn get_network_events(state: State<AppState>) -> Value {
 fn clear_network_events(state: State<AppState>) -> Value {
     state.monitor.clear_events();
     json!({"cleared":true})
+}
+
+/// Saved monitor history for "1h", "24h", "7d" or "30d". Per-interface
+/// points are returned for the selected interface keys (at most 64).
+#[tauri::command]
+async fn get_monitor_history(app: AppHandle, query: Value) -> AppResult<Value> {
+    blocking(move || {
+        let range = field_string(&query, "range");
+        let selected = arrays(query.get("interfaces"))
+            .iter()
+            .filter_map(Value::as_str)
+            .take(64)
+            .map(network_insights::normalized_guid_key)
+            .filter(|key| key.len() == 36 && key.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+            .collect::<Vec<_>>();
+        app.state::<AppState>()
+            .monitor
+            .query_history(&range, &selected)
+            .ok_or_else(|| err("VALIDATION_ERROR", "Unsupported history range."))
+    })
+    .await
+}
+
+#[tauri::command]
+fn get_monitor_storage(state: State<AppState>) -> Value {
+    state.monitor.storage_info()
+}
+
+/// Local drives only: a network share could stall the sampler.
+fn local_folder(path: &Path) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    if text.starts_with(r"\\") || bytes.len() < 3 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    let root = format!("{}:\\", bytes[0] as char).encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    // DRIVE_REMOVABLE = 2, DRIVE_FIXED = 3
+    matches!(unsafe { GetDriveTypeW(root.as_ptr()) }, 2 | 3)
+}
+
+/// Pick a folder for monitor history. The chosen path stays in Rust; the UI
+/// only confirms it with the returned token.
+#[tauri::command]
+async fn choose_monitor_folder(app: AppHandle) -> AppResult<Value> {
+    blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        let mut dialog = app.dialog().file();
+        if let Some(window) = app.get_webview_window("main") {
+            dialog = dialog.set_parent(&window);
+        }
+        let Some(picked) = dialog.blocking_pick_folder() else { return Ok(json!({"cancelled":true})) };
+        let folder = picked.into_path().map_err(|_| err("VALIDATION_ERROR", "Choose a folder on this PC."))?;
+        if !local_folder(&folder) {
+            return Err(err("VALIDATION_ERROR", "Choose a folder on a local or removable drive, not a network location."));
+        }
+        if monitor_history::is_protected_dir(&folder) {
+            return Err(err("VALIDATION_ERROR", "Windows and Program Files folders cannot be used; choose a folder you own."));
+        }
+        let data = folder.join(monitor_history::DATA_DIR);
+        if !monitor_history::probe_writable(&data) {
+            return Err(err("VALIDATION_ERROR", "This folder cannot be written. Choose another folder."));
+        }
+        let token = Uuid::new_v4().to_string();
+        let state = app.state::<AppState>();
+        *state.pending_monitor_folder.lock().map_err(|_| err("STATE_ERROR", "Cannot choose the folder."))? = Some((token.clone(), folder));
+        let info = monitor_history::storage_info(
+            &monitor_history::Storage { path: data.clone(), source: "custom", fallback_reason: None },
+            &data,
+            config(&state).settings.monitor.retention_days,
+        );
+        Ok(json!({"candidate":info,"confirmationToken":token}))
+    })
+    .await
+}
+
+fn set_monitor_folder_setting(state: &State<AppState>, folder: Option<String>) -> AppResult<Value> {
+    let mut cfg = config(state);
+    cfg.settings.monitor.folder = folder;
+    persist(state, &cfg)?;
+    state.monitor.apply_settings(&cfg.settings.monitor);
+    Ok(json!({"settings":cfg.settings,"storage":state.monitor.storage_info()}))
+}
+
+// Configuration-only write; existing history files are copied, never moved
+// or deleted.
+#[tauri::command]
+fn set_monitor_folder(state: State<AppState>, input: Value) -> AppResult<Value> {
+    let token = field_string(&input, "confirmationToken");
+    let folder = state
+        .pending_monitor_folder
+        .lock()
+        .map_err(|_| err("STATE_ERROR", "Cannot change the folder."))?
+        .take()
+        .filter(|(pending, _)| *pending == token)
+        .map(|(_, folder)| folder)
+        .ok_or_else(|| err("CONFIRMATION_EXPIRED", "Choose the folder again."))?;
+    let old = state.monitor.history_dir();
+    let copied = match (old.as_ref(), field_bool(&input, "copyExisting")) {
+        (Some(old), true) => monitor_history::copy_days(old, &folder.join(monitor_history::DATA_DIR)),
+        _ => 0,
+    };
+    let mut result = set_monitor_folder_setting(&state, Some(folder.display().to_string()))?;
+    result["copied"] = json!(copied);
+    result["previousPath"] = json!(old.map(|path| path.display().to_string()));
+    Ok(result)
+}
+
+#[tauri::command]
+fn reset_monitor_folder(state: State<AppState>) -> AppResult<Value> {
+    set_monitor_folder_setting(&state, None)
+}
+
+// Deletes only YYYY-MM-DD.jsonl files in the history folder (UI confirms first).
+#[tauri::command]
+fn clear_monitor_history(state: State<AppState>) -> AppResult<Value> {
+    let dir = state.monitor.history_dir().ok_or_else(|| err("STATE_ERROR", "The history folder is unavailable."))?;
+    let removed = monitor_history::clear(&dir);
+    Ok(json!({"removed":removed,"storage":state.monitor.storage_info()}))
+}
+
+/// Show the history folder Rust resolved in File Explorer.
+#[tauri::command]
+fn open_monitor_folder(state: State<AppState>) -> AppResult<Value> {
+    let dir = state.monitor.history_dir().ok_or_else(|| err("STATE_ERROR", "The history folder is unavailable."))?;
+    fs::create_dir_all(&dir).map_err(|_| err("COMMAND_FAILED", "The history folder cannot be created."))?;
+    Command::new("explorer.exe").arg(&dir).spawn().map_err(|_| err("COMMAND_FAILED", "File Explorer could not be opened."))?;
+    Ok(json!({"opened":true}))
 }
 
 #[tauri::command]
@@ -3595,6 +3821,41 @@ function New-NetRoute {
         assert!(valid_theme("blue").is_err());
         assert!(valid_interface_name("Wi-Fi\nname").is_err());
         assert_eq!(Settings::default().theme, "system");
+    }
+    #[test]
+    fn font_size_is_validated_and_defaults_for_old_configs() {
+        assert_eq!(valid_font_size("xlarge").unwrap(), "xlarge");
+        assert_eq!(font_zoom("default"), 1.0);
+        assert_eq!(font_zoom("xlarge"), 1.3);
+        assert_eq!(font_zoom("unknown"), 1.0);
+        assert!(valid_font_size("huge").is_err());
+        assert_eq!(Settings::default().font_size, "default");
+        let old: Settings = serde_json::from_value(json!({"language":"en","theme":"dark"})).unwrap();
+        assert_eq!(old.font_size, "default");
+        let mut bad = Settings::default();
+        bad.font_size = "200%".into();
+        assert!(sanitize_settings(bad, &Settings::default()).is_err());
+        let mut good = Settings::default();
+        good.font_size = "large".into();
+        assert_eq!(sanitize_settings(good, &Settings::default()).unwrap().font_size, "large");
+    }
+    #[test]
+    fn the_history_folder_can_only_be_set_by_rust() {
+        let mut current = Settings::default();
+        current.monitor.folder = Some(r"D:\Logs".into());
+        let mut incoming = Settings::default();
+        incoming.monitor.folder = Some(r"C:\Windows".into());
+        incoming.monitor.retention_days = 7;
+        let saved = sanitize_settings(incoming, &current).unwrap();
+        assert_eq!(saved.monitor.folder.as_deref(), Some(r"D:\Logs"));
+        assert_eq!(saved.monitor.retention_days, 7);
+        let mut bad = Settings::default();
+        bad.monitor.retention_days = 0;
+        assert!(sanitize_settings(bad, &current).is_err());
+        let mut cfg = AppConfig::default();
+        cfg.settings.monitor.folder = Some(r"D:\Logs".into());
+        let exported = app_automation::export_document(&cfg, "3.2.0", "now");
+        assert!(exported["settings"]["monitor"]["folder"].is_null());
     }
     #[test]
     fn adapter_control_validation_is_strict() {

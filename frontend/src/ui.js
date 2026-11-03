@@ -103,3 +103,16 @@ export function segmented(options, value, onChange, label) {
     )}
   </div>`;
 }
+
+/** A button with a visible one-line explanation under it. */
+export const actionWithHelp = (button, help) =>
+  html`<div class="action-with-help">${button}<small class="field-help">${help}</small></div>`;
+
+/** "What it does / When to use it / What it does not change" for a recovery action. */
+export const explainer = (app, { what, when, notChanged }) =>
+  html`<dl class="explain">
+    <dt>${app.t("explainWhat")}</dt>
+    <dd>${what}</dd>
+    ${when ? html`<dt>${app.t("explainWhen")}</dt><dd>${when}</dd>` : nothing}
+    ${notChanged ? html`<dt>${app.t("explainNotChanged")}</dt><dd>${notChanged}</dd>` : nothing}
+  </dl>`;

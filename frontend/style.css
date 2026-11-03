@@ -28,6 +28,7 @@
   --warning-soft: light-dark(#fff4ce, #433519);
   --danger: light-dark(#c42b1c, #ff99a4);
   --danger-soft: light-dark(#fde7e9, #442726);
+  --danger-hover: light-dark(#b3271a, #ffb3bb);
   --info: light-dark(#005fb8, #60cdff);
   --info-soft: light-dark(#e6f0fa, #1f3347);
   --shadow-card: light-dark(0 1px 2px #0000000d, 0 1px 2px #00000040);
@@ -158,23 +159,25 @@ button:disabled {
 .danger {
   color: var(--danger);
 }
-.accent,
-.danger-fill {
+/* Filled buttons are scoped to button so container color rules can never override their text. */
+button.accent,
+button.danger-fill {
   background: var(--accent);
   border-color: var(--accent);
   color: var(--on-accent);
   font-weight: 600;
 }
-.accent:hover:not(:disabled) {
+button.accent:hover:not(:disabled) {
   background: var(--accent-hover);
 }
-.danger-fill {
+button.danger-fill {
   background: var(--danger);
   border-color: var(--danger);
   color: light-dark(#fff, #000);
 }
-.danger-fill:hover:not(:disabled) {
-  filter: brightness(1.08);
+button.danger-fill:hover:not(:disabled) {
+  background: var(--danger-hover);
+  border-color: var(--danger-hover);
 }
 .subtle:hover:not(:disabled),
 .icon-button:hover:not(:disabled) {
@@ -740,7 +743,8 @@ main {
   display: flex;
   gap: 4px;
 }
-.card-actions button {
+/* Zero-specificity: tints only plain header buttons, never filled, danger or disabled ones. */
+:where(.card-actions) button:where(.subtle, .icon-button) {
   color: var(--accent);
 }
 .status-pill,
@@ -1494,6 +1498,60 @@ td.chips .chip {
   stroke-width: 1;
   vector-effect: non-scaling-stroke;
 }
+.bar-chart .bar.series-1 { fill: var(--series-1); }
+.bar-chart .bar.series-2 { fill: var(--series-2); }
+.chart-title {
+  margin: 0 0 4px;
+  color: var(--text-2);
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+.monitor-toolbar {
+  display: grid;
+  gap: 10px;
+}
+.monitor-customize summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 0.93rem;
+}
+.monitor-customize .check-row {
+  margin-top: 8px;
+}
+.stat-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr));
+  gap: 12px;
+}
+.stat-tile {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  box-shadow: var(--shadow-card);
+}
+.stat-tile small {
+  color: var(--text-2);
+  font-size: 0.8rem;
+}
+.stat-tile strong {
+  font-size: 1rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+}
+.stat-tile span {
+  color: var(--text-2);
+  font-size: 0.8rem;
+}
+.storage-row {
+  flex-wrap: wrap;
+}
+.storage-row small.mono {
+  word-break: break-all;
+}
 .key {
   display: inline-block;
   width: 12px;
@@ -1571,9 +1629,12 @@ td.chips .chip {
 .config-controls {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
-  gap: 12px;
+  align-items: flex-start;
+  gap: 12px 24px;
   margin-top: 12px;
+}
+.config-controls .action-with-help {
+  flex: 1 1 18rem;
 }
 .inline-control {
   display: inline-flex;
@@ -1737,6 +1798,88 @@ details summary {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--layer);
+}
+
+/* ---- Explanations next to actions ---------------------------------------- */
+.action-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 12px 20px;
+  align-items: start;
+}
+.action-with-help {
+  display: grid;
+  justify-items: start;
+  gap: 4px;
+}
+.action-with-help .field-help {
+  color: var(--text-2);
+}
+.explain {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 14px;
+  margin: 0 0 12px;
+  font-size: 0.93rem;
+}
+.explain dt {
+  font-weight: 600;
+}
+.explain dd {
+  margin: 0;
+  color: var(--text-2);
+}
+@media (max-width: 800px) {
+  .explain {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .explain dd {
+    margin-bottom: 6px;
+  }
+}
+
+/* ---- Recovery: network backups ------------------------------------------ */
+.notice.recovery-intro {
+  align-items: flex-start;
+}
+.notice.recovery-intro .icon {
+  margin-top: 2px;
+}
+.recovery-steps {
+  margin: 4px 0 0;
+  padding-left: 1.4rem;
+  color: var(--text);
+}
+.check-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+}
+.backup-row + .backup-row {
+  border-top: 1px solid var(--border);
+}
+.backup-row .list-row {
+  flex-wrap: wrap;
+}
+.backup-details {
+  padding: 0 12px 12px 40px;
+}
+.backup-details ul {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 6px;
+  padding: 0;
+  list-style: none;
+}
+.backup-details li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+.backup-details li small {
+  flex-basis: 100%;
+  color: var(--text-2);
 }
 
 /* ---- Settings ------------------------------------------------------------ */
@@ -2124,6 +2267,34 @@ dialog.drawer[open] {
   }
   .freshness {
     display: none;
+  }
+}
+/* Large text sizes zoom the webview, so a minimum-size window can be ~700 CSS px wide and ~500 tall. */
+@media (max-width: 800px) {
+  .setting-row,
+  .app-header,
+  .card-header {
+    flex-wrap: wrap;
+  }
+  .app-header {
+    padding: 16px 16px 10px;
+  }
+  .view {
+    padding: 4px 16px 24px;
+  }
+  .search-box {
+    min-width: 100%;
+  }
+  .segmented {
+    flex-wrap: wrap;
+  }
+}
+@media (max-height: 620px) {
+  .sidebar {
+    overflow-y: auto;
+  }
+  .brand {
+    padding-bottom: 8px;
   }
 }
 @media (prefers-reduced-motion: reduce) {
